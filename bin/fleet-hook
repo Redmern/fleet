@@ -48,6 +48,14 @@ if str(hook_input.get("hook_event_name") or "") == "SubagentStop":
 if hook_input.get("agent_id") and action in ("idle", "release"):
     raise SystemExit(0)
 
+# Notification fires both for permission prompts (truly blocked) and for
+# "Claude is waiting for your input" idle reminders after a finished turn.
+# Only the former should show as blocked; idle reminders stay idle.
+if str(hook_input.get("hook_event_name") or "") == "Notification" and action == "blocked":
+    msg = str(hook_input.get("message") or "").lower()
+    if "waiting for" in msg and "permission" not in msg:
+        action = "idle"
+
 params = {
     "pane_id": pane,
     "source": "fleet:claude",
