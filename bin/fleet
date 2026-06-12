@@ -259,10 +259,12 @@ sync_main_tiles() { # (re)build the tile column next to the orchestrator
   local orch
   orch=$(tmux list-panes -t "$win" -F '#{pane_id}' | head -1)
 
-  # one tile per agent pane (skip agents living in the main window itself)
-  local first=1 last="" pane_id agent_win
-  while IFS=$'\t' read -r _ _ _ agent_win _ _ pane_id; do
+  # one tile per agent pane — only agents of THIS session, and not the
+  # main window's own orchestrator
+  local first=1 last="" pane_id agent_win agent_sess
+  while IFS=$'\t' read -r _ _ agent_sess agent_win _ _ pane_id; do
     [ -n "$pane_id" ] || continue
+    [ "$agent_sess" = "$sess" ] || continue
     [ "$agent_win" = "$win" ] && continue
     if [ "$first" = 1 ]; then
       last=$(tmux split-window -P -F '#{pane_id}' -h -t "$orch" -l '55%' \
@@ -345,9 +347,14 @@ cmd_up() {
 
   if ! tmux has-session -t "=$name" 2>/dev/null; then
     if command -v tmuxinator >/dev/null && tmuxinator list -n 2>/dev/null | grep -qx "$name"; then
-      tmuxinator start "$name" --no-attach 2>/dev/null || tmux new-session -d -s "$name" -c "$root"
-    else
-      tmux new-session -d -s "$name" -c "$root"
+      tmuxinator start "$name" --no-attach 2>/dev/null || true
+    fi
+    if ! tmux has-session -t "=$name" 2>/dev/null; then
+      # fresh session: main IS the first window, orchestrator runs in it —
+      # no placeholder shell window
+      local claude_bin
+      claude_bin=$(command -v claude-profile || command -v claude) || die "claude not found"
+      tmux new-session -d -s "$name" -c "$root" -n main "$claude_bin"
     fi
   fi
 
