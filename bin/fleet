@@ -158,13 +158,13 @@ cmd_new() {
   local repo_base; repo_base=$(resolve_repo "$root" "$repo") || die "repo '$repo' not found under $root"
 
   local branchdir="${branch//\//_}" dir anchor=""
-  local bare; bare=$(git -C "$repo_base" rev-parse --is-bare-repository 2>/dev/null)
-  if [ -e "$repo_base/.git" ] && [ "$bare" != "true" ]; then
+  local is_bare_repo; is_bare_repo=$(git -C "$repo_base" rev-parse --is-bare-repository 2>/dev/null)
+  if [ -e "$repo_base/.git" ] && [ "$is_bare_repo" != "true" ]; then
     dir="$repo_base"   # plain working repo, no worktree layout
   else
     dir="$repo_base/$branchdir"
     if [ ! -d "$dir" ]; then
-      if [ "$bare" = "true" ]; then
+      if [ "$is_bare_repo" = "true" ]; then
         anchor="$repo_base"   # container holds a bare repo (.git) + worktree subdirs
       else
         local sub
