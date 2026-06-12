@@ -1,0 +1,433 @@
+#!/usr/bin/env bash
+# fleet — standalone agent fleet manager for tmux + nvim + Claude Code.
+# Subcommands: up new ls pick send main status doctor
+# Design rule: fleet only *calls* tmux/nvim/git/claude. Every integration is
+# fail-silent: if the daemon, tmux, or nvim plumbing is missing, each command
+# degrades to a working subset instead of erroring out.
+
+set -u
+
+FLEET_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)"
+RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
+SOCK="$RUNTIME_DIR/fleet.sock"
+CONF_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/fleet"
+
+die() { echo "fleet: $*" >&2; exit 1; }
+
+# ---- daemon RPC --------------------------------------------------------------
+
+rpc() { # rpc <method> [params-json]  → result json on stdout, rc 1 if daemon down
+  [ -S "$SOCK" ] || return 1
+  python3 - "$SOCK" "$1" "${2:-{}}" <<'PY' 2>/dev/null
+import json, socket, sys
+sock_path, method, params = sys.argv[1], sys.argv[2], json.loads(sys.argv[3])
+c = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+c.settimeout(2)
+c.connect(sock_path)
+c.sendall((json.dumps({"id": "cli", "method": method, "params": params}) + "\n").encode())
+buf = b""
+while b"\n" not in buf:
+    chunk = c.recv(65536)
+    if not chunk:
+        break
+    buf += chunk
+resp = json.loads(buf.decode().splitlines()[0])
+if not resp.get("ok"):
+    sys.exit(1)
+print(json.dumps(resp.get("result", {})))
+PY
+}
+
+# ---- project resolution -------------------------------------------------------
+
+session_name() { # FLEET_SESSION overrides (used by `fleet up` cross-session)
+  [ -n "${FLEET_SESSION:-}" ] && { echo "$FLEET_SESSION"; return 0; }
+  tmux display -p '#{session_name}' 2>/dev/null
+}
+
+fleet_root() { # project root for the current session
+  local s; s=$(session_name) || return 1
+  local r; r=$(tmux show -t "$s" -v @fleet_root 2>/dev/null)
+  [ -n "$r" ] && { echo "$r"; return 0; }
+  [ -n "${FLEET_ROOT:-}" ] && { echo "$FLEET_ROOT"; return 0; }
+  pwd
+}
+
+discover_repos() { # discover_repos <root> → "name<TAB>path" lines
+  local root="$1" d sub
+  for d in "$root"/*/; do
+    [ -d "$d" ] || continue
+    d="${d%/}"
+    if [ -e "$d/.git" ]; then
+      printf '%s\t%s\n' "$(basename "$d")" "$d"
+    else
+      # worktree container: a dir whose subdirs are git checkouts
+      for sub in "$d"/*/; do
+        [ -e "${sub%/}/.git" ] && { printf '%s\t%s\n' "$(basename "$d")" "$d"; break; }
+      done
+    fi
+  done
+}
+
+resolve_repo() { # resolve_repo <root> <name> → path
+  local root="$1" want="$2" line name path match=""
+  while IFS=$'\t' read -r name path; do
+    [ "${name,,}" = "${want,,}" ] && { echo "$path"; return 0; }
+    case "${name,,}" in *"${want,,}"*) match="$path" ;; esac
+  done < <(discover_repos "$root")
+  [ -n "$match" ] && { echo "$match"; return 0; }
+  return 1
+}
+
+agent_label() { # last two path components
+  local p="$1"; p="${p%/}"
+  local b="${p##*/}" parent="${p%/*}"
+  echo "${parent##*/}/$b"
+}
+
+# ---- ls -----------------------------------------------------------------------
+
+agents_tsv() { # state<TAB>label<TAB>session<TAB>window_id<TAB>window_name<TAB>since<TAB>pane_id
+  local json
+  if json=$(rpc fleet.list); then
+    python3 - "$json" <<'PY'
+import json, sys, time
+for a in json.loads(sys.argv[1]).get("agents", []):
+    cwd = (a.get("cwd") or "").rstrip("/")
+    label = "/".join(cwd.split("/")[-2:]) if cwd else a.get("window_name", "?")
+    age = int(time.time() - a.get("since", time.time()))
+    print("\t".join([a.get("state","?"), label, a.get("session",""),
+                     a.get("window_id",""), a.get("window_name",""),
+                     f"{age//60}m{age%60:02d}s", a.get("pane_id","")]))
+PY
+  else
+    # daemon down: fall back to window options mirrored earlier (may be stale)
+    tmux list-panes -a -F $'#{?@agent_state,#{@agent_state}\t#{pane_current_path}\t#{session_name}\t#{window_id}\t#{window_name}\t-\t#{pane_id},}' 2>/dev/null \
+      | sed '/^$/d' \
+      | while IFS=$'\t' read -r st path rest; do
+          printf '%s\t%s\t%s\n' "$st" "$(agent_label "$path")" "$rest"
+        done
+  fi
+}
+
+cmd_ls() {
+  local out; out=$(agents_tsv)
+  [ -n "$out" ] || { echo "no agents registered"; return 0; }
+  printf 'STATE\tAGENT\tWINDOW\tIN-STATE\n'
+  echo "$out" | sort -t$'\t' -k1,1 | awk -F'\t' '{printf "%s\t%s\t%s:%s\t%s\n", $1, $2, $3, $5, $6}'
+}
+
+# ---- pick ---------------------------------------------------------------------
+
+cmd_pick() {
+  command -v fzf >/dev/null || die "fzf not installed"
+  local rows
+  rows=$(agents_tsv | sort -t$'\t' -k1,1 | awk -F'\t' '
+    $1=="blocked"{c="\033[31m"; o=0}
+    $1=="idle"   {c="\033[32m"; o=1}
+    $1=="working"{c="\033[34m"; o=2}
+    {printf "%d\t%s\t%s\t%s● %-8s\033[0m %-40s %s:%s  %s\n", o, $3, $4, c, $1, $2, $3, $5, $6}' \
+    | sort -n | cut -f2-)
+  [ -n "$rows" ] || { echo "no agents to pick"; return 0; }
+  local choice
+  choice=$(echo "$rows" | fzf --ansi --delimiter='\t' --with-nth=3 \
+            --no-sort --prompt='agent> ' --height=100%) || return 0
+  local sess win
+  sess=$(echo "$choice" | cut -f1)
+  win=$(echo "$choice" | cut -f2)
+  tmux switch-client -t "$sess" 2>/dev/null
+  tmux select-window -t "$win" 2>/dev/null
+}
+
+# ---- new ----------------------------------------------------------------------
+
+cmd_new() {
+  local repo="" branch="" prompt="" bare=0 base=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      -p) prompt="$2"; shift 2 ;;
+      --bare) bare=1; shift ;;
+      --base) base="$2"; shift 2 ;;
+      -*) die "unknown flag $1" ;;
+      *) if [ -z "$repo" ]; then repo="$1"; elif [ -z "$branch" ]; then branch="$1"; else die "extra arg $1"; fi; shift ;;
+    esac
+  done
+  [ -n "$repo" ] && [ -n "$branch" ] || die "usage: fleet new <repo> <branch> [-p prompt] [--bare] [--base branch]"
+
+  local root; root=$(fleet_root) || die "not inside tmux"
+  local repo_base; repo_base=$(resolve_repo "$root" "$repo") || die "repo '$repo' not found under $root"
+
+  local branchdir="${branch//\//_}" dir anchor=""
+  local bare; bare=$(git -C "$repo_base" rev-parse --is-bare-repository 2>/dev/null)
+  if [ -e "$repo_base/.git" ] && [ "$bare" != "true" ]; then
+    dir="$repo_base"   # plain working repo, no worktree layout
+  else
+    dir="$repo_base/$branchdir"
+    if [ ! -d "$dir" ]; then
+      if [ "$bare" = "true" ]; then
+        anchor="$repo_base"   # container holds a bare repo (.git) + worktree subdirs
+      else
+        local sub
+        for sub in "$repo_base"/*/; do
+          [ -e "${sub%/}/.git" ] && { anchor="${sub%/}"; break; }
+        done
+      fi
+      [ -n "$anchor" ] || die "no git worktree found under $repo_base to anchor from"
+      echo "creating worktree $dir ($branch)..."
+      git -C "$anchor" fetch --quiet 2>/dev/null
+      if git -C "$anchor" rev-parse --verify --quiet "refs/heads/$branch" >/dev/null \
+         || git -C "$anchor" rev-parse --verify --quiet "refs/remotes/origin/$branch" >/dev/null; then
+        git -C "$anchor" worktree add "$dir" "$branch" || die "worktree add failed"
+      else
+        local from="${base:-$(git -C "$anchor" symbolic-ref --short refs/remotes/origin/HEAD 2>/dev/null | sed 's|origin/||')}"
+        from="${from:-main}"
+        git -C "$anchor" worktree add -b "$branch" "$dir" "origin/$from" \
+          || git -C "$anchor" worktree add -b "$branch" "$dir" "$from" \
+          || die "worktree add failed"
+      fi
+    fi
+  fi
+
+  local sess; sess=$(session_name) || die "not inside tmux"
+  local wname; wname="$(basename "$repo_base")/$branchdir"
+  local claude_bin
+  claude_bin=$(command -v claude-profile || command -v claude) || die "claude not found"
+
+  local win_id
+  if [ "$bare" = 1 ]; then
+    if [ -n "$prompt" ]; then
+      win_id=$(tmux new-window -P -F '#{window_id}' -t "$sess" -n "$wname" -c "$dir" \
+        "$claude_bin" "$prompt")
+    else
+      win_id=$(tmux new-window -P -F '#{window_id}' -t "$sess" -n "$wname" -c "$dir" \
+        "$claude_bin")
+    fi
+  else
+    local nsock="$RUNTIME_DIR/fleet/nvim-$(date +%s%N).sock"
+    mkdir -p "$RUNTIME_DIR/fleet"
+    win_id=$(tmux new-window -P -F '#{window_id}' -t "$sess" -n "$wname" -c "$dir" \
+      -e FLEET_AUTOCLAUDE=1 -e FLEET_PROMPT="$prompt" \
+      nvim . --cmd "lua pcall(dofile, '$FLEET_DIR/nvim/fleet.lua')" --listen "$nsock")
+    tmux set -w -t "$win_id" @fleet_nvim_sock "$nsock"
+  fi
+  echo "spawned $wname in window $win_id"
+  sync_main_tiles "$sess" 2>/dev/null || true
+}
+
+# ---- send ---------------------------------------------------------------------
+
+cmd_send() {
+  local target="${1:-}" text="${2:-}"
+  [ -n "$target" ] && [ -n "$text" ] || die "usage: fleet send <agent> \"message\""
+  local line
+  line=$(agents_tsv | awk -F'\t' -v t="$target" 'index($2,t)||index($5,t){print; exit}')
+  [ -n "$line" ] || die "no agent matching '$target' (try: fleet ls)"
+  local win pane
+  win=$(echo "$line" | cut -f4)
+  pane=$(echo "$line" | cut -f7)
+  local nsock; nsock=$(tmux show -w -t "$win" -v @fleet_nvim_sock 2>/dev/null)
+  if [ -n "$nsock" ] && [ -S "$nsock" ]; then
+    local res
+    res=$(nvim --server "$nsock" --remote-expr "v:lua.FleetSend(\"$(printf '%s' "$text" | sed 's/[\\"]/\\&/g')\")" 2>/dev/null)
+    case "$res" in
+      sent|opening) echo "delivered via nvim ($res)"; return 0 ;;
+    esac
+    echo "nvim RPC failed ($res), falling back to send-keys" >&2
+  fi
+  tmux send-keys -t "$pane" -l "$text" && tmux send-keys -t "$pane" Enter \
+    && echo "delivered via send-keys (focus-dependent for nvim agents)"
+}
+
+# ---- main window / command center ---------------------------------------------
+
+main_window_id() { # find existing main window in session
+  tmux list-windows -t "$1" -F $'#{window_id}\t#{window_name}' 2>/dev/null \
+    | awk -F'\t' '$2=="main"{print $1; exit}'
+}
+
+sync_main_tiles() { # (re)build the tile column next to the orchestrator
+  local sess="$1"
+  local win; win=$(main_window_id "$sess")
+  [ -n "$win" ] || return 1
+
+  # drop old tiles (panes flagged @fleet_tile)
+  local p
+  for p in $(tmux list-panes -t "$win" -F $'#{pane_id}\t#{@fleet_tile}' | awk -F'\t' '$2=="1"{print $1}'); do
+    tmux kill-pane -t "$p" 2>/dev/null
+  done
+
+  local orch
+  orch=$(tmux list-panes -t "$win" -F '#{pane_id}' | head -1)
+
+  # one tile per agent pane (skip agents living in the main window itself)
+  local first=1 last="" pane_id agent_win
+  while IFS=$'\t' read -r _ _ _ agent_win _ _ pane_id; do
+    [ -n "$pane_id" ] || continue
+    [ "$agent_win" = "$win" ] && continue
+    if [ "$first" = 1 ]; then
+      last=$(tmux split-window -P -F '#{pane_id}' -h -t "$orch" -l '55%' \
+        "$FLEET_DIR/bin/fleet-tile" "$pane_id")
+      first=0
+    else
+      last=$(tmux split-window -P -F '#{pane_id}' -v -t "$last" \
+        "$FLEET_DIR/bin/fleet-tile" "$pane_id")
+    fi
+    tmux set -p -t "$last" @fleet_tile 1
+  done < <(agents_tsv)
+  if [ -n "$last" ]; then
+    tmux set -w -t "$win" main-pane-width '45%'
+    tmux select-layout -t "$win" main-vertical 2>/dev/null
+  fi
+  tmux select-pane -t "$orch" 2>/dev/null
+}
+
+cmd_main() {
+  local sess; sess=$(session_name) || die "not inside tmux"
+  local root; root=$(fleet_root)
+  local win; win=$(main_window_id "$sess")
+  if [ -z "$win" ]; then
+    local claude_bin
+    claude_bin=$(command -v claude-profile || command -v claude) || die "claude not found"
+    win=$(tmux new-window -P -F '#{window_id}' -t "$sess" -n main -c "$root" "$claude_bin")
+    tmux move-window -t "$sess" -s "$win" 2>/dev/null || true
+  fi
+  sync_main_tiles "$sess"
+  tmux select-window -t "$win"
+  echo "command center ready (window 'main')"
+}
+
+# ---- up -----------------------------------------------------------------------
+
+ensure_daemon() {
+  [ -S "$SOCK" ] && rpc fleet.ping >/dev/null 2>&1 && return 0
+  systemctl --user start fleetd 2>/dev/null && sleep 0.3 && [ -S "$SOCK" ] && return 0
+  if command -v fleetd >/dev/null; then
+    nohup fleetd >/dev/null 2>&1 &
+  else
+    nohup "$FLEET_DIR/bin/fleetd" >/dev/null 2>&1 &
+  fi
+  sleep 0.3
+}
+
+inject_status_format() { # append agent glyph to window-status formats.
+  # window-status-* are window options — tmux has no per-session scope for
+  # them, so inject into the runtime GLOBAL value (never the config file).
+  # Theme switches that regenerate pills wipe this; fleetd re-injects on its
+  # sweep, fleet up on every run.
+  local fmt opt
+  for opt in window-status-format window-status-current-format; do
+    fmt=$(tmux show -g -v "$opt" 2>/dev/null)
+    [ -n "$fmt" ] || continue
+    case "$fmt" in *@agent_glyph*) ;; *) tmux set -g "$opt" "$fmt#{?@agent_glyph, #{@agent_glyph},}" ;; esac
+  done
+}
+
+cmd_up() {
+  local arg="${1:-}" root name
+  if [ -n "$arg" ] && [ -d "$arg" ]; then
+    root=$(readlink -f "$arg")
+    name=$(basename "$root" | tr -cd 'a-zA-Z0-9_-')
+  elif [ -n "$arg" ]; then
+    name="$arg"
+    local yml="$CONF_DIR/projects/$arg.yml"
+    if [ -f "$yml" ]; then
+      root=$(awk -F': *' '$1=="root"{print $2; exit}' "$yml")
+      root="${root/#\~/$HOME}"
+    fi
+    [ -n "${root:-}" ] || root="$PWD"
+  else
+    root="$PWD"
+    name=$(basename "$root" | tr -cd 'a-zA-Z0-9_-')
+  fi
+  [ -d "$root" ] || die "project root $root does not exist"
+
+  ensure_daemon
+
+  if ! tmux has-session -t "=$name" 2>/dev/null; then
+    if command -v tmuxinator >/dev/null && tmuxinator list -n 2>/dev/null | grep -qx "$name"; then
+      tmuxinator start "$name" --no-attach 2>/dev/null || tmux new-session -d -s "$name" -c "$root"
+    else
+      tmux new-session -d -s "$name" -c "$root"
+    fi
+  fi
+
+  tmux set -t "$name" @fleet_root "$root"
+  inject_status_format "$name"
+  # runtime keybind (tmux bindings are server-global; re-applied each `up`,
+  # never written to tmux.conf)
+  tmux bind-key a display-popup -E -w 80% -h 60% "$FLEET_DIR/bin/fleet pick"
+
+  # offer FLEET.md to the orchestrator
+  if [ -f "$root/CLAUDE.md" ] && ! grep -q "fleet new" "$root/CLAUDE.md" 2>/dev/null; then
+    echo "tip: append $FLEET_DIR/FLEET.md to $root/CLAUDE.md so the orchestrator knows fleet commands"
+  elif [ ! -f "$root/CLAUDE.md" ]; then
+    cp "$FLEET_DIR/FLEET.md" "$root/CLAUDE.md" 2>/dev/null \
+      && echo "installed orchestrator instructions at $root/CLAUDE.md"
+  fi
+
+  # build command center, explicitly targeting the project session
+  FLEET_SESSION="$name" FLEET_ROOT="$root" cmd_main || true
+
+  if [ -t 0 ]; then
+    if [ -n "${TMUX:-}" ]; then tmux switch-client -t "$name"; else tmux attach -t "$name"; fi
+  else
+    echo "session '$name' ready — attach with: tmux attach -t $name"
+  fi
+}
+
+# ---- status / doctor ------------------------------------------------------------
+
+cmd_status() {
+  if rpc fleet.ping >/dev/null 2>&1; then
+    local n; n=$(rpc fleet.list | python3 -c 'import json,sys; print(len(json.load(sys.stdin)["agents"]))' 2>/dev/null)
+    echo "fleetd: running ($SOCK), agents: ${n:-?}"
+  else
+    echo "fleetd: NOT running"
+  fi
+}
+
+cmd_doctor() {
+  local ok=0
+  for dep in tmux nvim git python3 fzf; do
+    if command -v "$dep" >/dev/null; then echo "ok   $dep"; else echo "MISS $dep"; ok=1; fi
+  done
+  command -v notify-send >/dev/null && echo "ok   notify-send" || echo "warn notify-send missing (no desktop notifications)"
+  command -v tmuxinator >/dev/null && echo "ok   tmuxinator (optional)" || echo "warn tmuxinator missing (fleet up builds sessions itself)"
+  command -v claude-profile >/dev/null && echo "ok   claude-profile" \
+    || { command -v claude >/dev/null && echo "ok   claude (no profile wrapper)" || { echo "MISS claude"; ok=1; }; }
+  [ -S "$SOCK" ] && rpc fleet.ping >/dev/null 2>&1 && echo "ok   fleetd socket" || echo "warn fleetd not running (fleet up starts it)"
+  local prof hooked
+  for prof in "$HOME/.claude" "$HOME/.claude_personal"; do
+    [ -f "$prof/settings.json" ] || continue
+    hooked=$(grep -c fleet-hook "$prof/settings.json" 2>/dev/null || true)
+    if [ "${hooked:-0}" -gt 0 ]; then echo "ok   hooks wired in $prof"; else echo "warn hooks NOT wired in $prof (run install.sh)"; fi
+  done
+  systemctl --user is-enabled fleetd >/dev/null 2>&1 && echo "ok   fleetd.service enabled" || echo "warn fleetd.service not enabled"
+  return $ok
+}
+
+# ---- dispatch -------------------------------------------------------------------
+
+case "${1:-}" in
+  up)      shift; cmd_up "$@" ;;
+  new)     shift; cmd_new "$@" ;;
+  ls)      shift; cmd_ls "$@" ;;
+  pick)    shift; cmd_pick "$@" ;;
+  send)    shift; cmd_send "$@" ;;
+  main)    shift; cmd_main "$@" ;;
+  status)  shift; cmd_status "$@" ;;
+  doctor)  shift; cmd_doctor "$@" ;;
+  *) cat <<EOF
+fleet — agent fleet manager (tmux + nvim + Claude Code)
+
+  fleet up [name|path]   boot project session + daemon + command center
+  fleet new <repo> <br>  spawn agent (worktree + window + claude) [-p prompt] [--bare] [--base br]
+  fleet ls               list agents and states
+  fleet pick             fzf jump-to-agent (bound to prefix+a by fleet up)
+  fleet send <a> "msg"   send message to an agent's claude
+  fleet main             (re)build command center window
+  fleet status           daemon status
+  fleet doctor           dependency / wiring check
+EOF
+  ;;
+esac

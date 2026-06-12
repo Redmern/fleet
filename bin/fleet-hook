@@ -1,0 +1,85 @@
+#!/bin/sh
+# fleet-hook — Claude Code hook → fleetd state reporter.
+# Wired into settings.json as: fleet-hook <working|blocked|idle|release>
+# MUST be fail-silent and fast: if fleet isn't running, exit 0 in ~1ms.
+# Subagent filtering ported from the old herdr integration: SubagentStop and
+# subagent idle/release must never mark the parent pane done early.
+
+set -eu
+
+action="${1:-}"
+case "$action" in
+  working|blocked|idle|release) ;;
+  *) exit 0 ;;
+esac
+
+[ -n "${TMUX_PANE:-}" ] || exit 0
+SOCK="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/fleet.sock"
+[ -S "$SOCK" ] || exit 0
+command -v python3 >/dev/null 2>&1 || exit 0
+
+hook_input_file="$(mktemp "${TMPDIR:-/tmp}/fleet-hook.XXXXXX")" || exit 0
+trap 'rm -f "$hook_input_file"' EXIT HUP INT TERM
+cat >"$hook_input_file" 2>/dev/null || true
+
+FLEET_ACTION="$action" FLEET_SOCK="$SOCK" FLEET_PANE="$TMUX_PANE" \
+FLEET_HOOK_INPUT_FILE="$hook_input_file" python3 - <<'PY' || exit 0
+import json, os, socket, time
+
+action = os.environ["FLEET_ACTION"]
+pane = os.environ["FLEET_PANE"]
+sock_path = os.environ["FLEET_SOCK"]
+
+hook_input = {}
+try:
+    with open(os.environ["FLEET_HOOK_INPUT_FILE"], encoding="utf-8") as fh:
+        content = fh.read()
+    if content.strip():
+        hook_input = json.loads(content)
+except Exception:
+    hook_input = {}
+
+# Subagent guards (herdr learnings, keep verbatim):
+# - SubagentStop can fire after the main turn already stopped; never let it
+#   revive or change an idle pane.
+# - A subagent finishing must not make the parent pane look done early.
+if str(hook_input.get("hook_event_name") or "") == "SubagentStop":
+    raise SystemExit(0)
+if hook_input.get("agent_id") and action in ("idle", "release"):
+    raise SystemExit(0)
+
+params = {
+    "pane_id": pane,
+    "source": "fleet:claude",
+    "agent": "claude",
+    "seq": time.time_ns(),
+}
+sid = hook_input.get("session_id")
+if isinstance(sid, str) and sid:
+    params["session_id"] = sid
+cwd = hook_input.get("cwd")
+if isinstance(cwd, str) and cwd:
+    params["cwd"] = cwd
+
+if action == "release":
+    method = "agent.release"
+else:
+    method = "agent.report"
+    params["state"] = action
+
+request = {"id": f"fleet:{params['seq']}", "method": method, "params": params}
+
+try:
+    client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    client.settimeout(0.5)
+    client.connect(sock_path)
+    client.sendall((json.dumps(request) + "\n").encode())
+    try:
+        client.recv(4096)
+    except Exception:
+        pass
+    client.close()
+except Exception:
+    pass
+PY
+exit 0

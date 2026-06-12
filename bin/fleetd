@@ -1,0 +1,294 @@
+#!/usr/bin/env python3
+"""fleetd — tiny agent-state daemon for the fleet tmux agent manager.
+
+Listens on $XDG_RUNTIME_DIR/fleet.sock (ndjson request/response).
+Tracks Claude Code agent state per tmux pane, mirrors it into tmux
+user options (@agent_state/@agent_since/@agent_glyph), and sends
+desktop notifications when an unfocused agent blocks or finishes.
+
+Stdlib only. Every tmux/notify failure is swallowed — fleetd must
+never take anything else down with it.
+"""
+
+import json
+import os
+import selectors
+import socket
+import subprocess
+import time
+
+RUNTIME_DIR = os.environ.get("XDG_RUNTIME_DIR") or f"/run/user/{os.getuid()}"
+SOCKET_PATH = os.path.join(RUNTIME_DIR, "fleet.sock")
+
+SEVERITY = {"blocked": 3, "working": 2, "idle": 1}
+GLYPH_COLOR = {"working": "colour4", "blocked": "colour1", "idle": "colour2"}
+
+SWEEP_INTERVAL = 60
+NOTIFY_COOLDOWN = 30
+IDLE_FLAP_GUARD = 2.0
+
+
+def tmux(*args):
+    try:
+        out = subprocess.run(
+            ("tmux",) + args, capture_output=True, text=True, timeout=5
+        )
+        return out.stdout if out.returncode == 0 else None
+    except Exception:
+        return None
+
+
+class Fleet:
+    def __init__(self):
+        # panes[pane_id][session_id] = {state, since, seq, cwd}
+        self.panes = {}
+        self.effective = {}  # pane_id -> state currently mirrored to tmux
+        self.last_notify = {}  # (pane_id, state) -> ts
+        self.last_working = {}  # pane_id -> ts of last working report
+        self.last_sweep = 0.0
+
+    # ---- state ingestion -------------------------------------------------
+
+    def report(self, p):
+        pane, sid = p.get("pane_id"), p.get("session_id") or "_"
+        state, seq = p.get("state"), p.get("seq") or 0
+        if not pane or state not in SEVERITY:
+            return {"error": "bad params"}
+        sessions = self.panes.setdefault(pane, {})
+        cur = sessions.get(sid)
+        if cur and seq <= cur["seq"]:
+            return {"dropped": "stale seq"}
+        if state == "idle" and cur and cur["state"] == "working":
+            lw = self.last_working.get(pane, 0)
+            if time.time() - lw < IDLE_FLAP_GUARD and seq - cur["seq"] < int(
+                IDLE_FLAP_GUARD * 1e9
+            ):
+                pass  # keep the idle report; flap guard applies to notify only
+        sessions[sid] = {
+            "state": state,
+            "since": time.time(),
+            "seq": seq,
+            "cwd": p.get("cwd") or (cur or {}).get("cwd"),
+        }
+        if state == "working":
+            self.last_working[pane] = time.time()
+        self.refresh_pane(pane)
+        return {"ok": True}
+
+    def release(self, p):
+        pane, sid = p.get("pane_id"), p.get("session_id") or "_"
+        sessions = self.panes.get(pane)
+        if sessions:
+            sessions.pop(sid, None)
+            if not sessions:
+                self.panes.pop(pane, None)
+        self.refresh_pane(pane)
+        return {"ok": True}
+
+    # ---- effective state + tmux mirroring --------------------------------
+
+    def pane_state(self, pane):
+        sessions = self.panes.get(pane) or {}
+        if not sessions:
+            return None
+        return max(sessions.values(), key=lambda s: SEVERITY[s["state"]])
+
+    def refresh_pane(self, pane):
+        cur = self.pane_state(pane)
+        prev = self.effective.get(pane)
+        if cur is None:
+            self.effective.pop(pane, None)
+            tmux("set", "-w", "-t", pane, "-u", "@agent_state")
+            tmux("set", "-w", "-t", pane, "-u", "@agent_since")
+            tmux("set", "-w", "-t", pane, "-u", "@agent_glyph")
+        else:
+            state = cur["state"]
+            self.effective[pane] = state
+            tmux("set", "-w", "-t", pane, "@agent_state", state)
+            tmux("set", "-w", "-t", pane, "@agent_since", str(int(cur["since"])))
+            tmux(
+                "set", "-w", "-t", pane, "@agent_glyph",
+                f"#[fg={GLYPH_COLOR[state]},bg=default]●#[default]",
+            )
+            if prev == "working" and state in ("blocked", "idle"):
+                self.maybe_notify(pane, state, cur)
+        tmux("refresh-client", "-S")
+
+    # ---- notifications ----------------------------------------------------
+
+    def maybe_notify(self, pane, state, cur):
+        now = time.time()
+        if state == "idle" and now - self.last_working.get(pane, 0) < IDLE_FLAP_GUARD:
+            return
+        key = (pane, state)
+        if now - self.last_notify.get(key, 0) < NOTIFY_COOLDOWN:
+            return
+        focus = tmux(
+            "display", "-p", "-t", pane, "#{window_active}#{session_attached}"
+        )
+        if focus is not None and focus.strip().startswith("11"):
+            return  # window active in an attached session — user is looking at it
+        self.last_notify[key] = now
+        label = agent_label(cur.get("cwd") or pane)
+        title, urgency = (
+            ("Agent blocked", "critical") if state == "blocked" else ("Agent done", "normal")
+        )
+        body = f"{label} — " + (
+            "waiting for permission/input" if state == "blocked" else "turn finished"
+        )
+        try:
+            subprocess.run(
+                ["notify-send", "-a", "fleet", "-u", urgency, title, body],
+                timeout=5, capture_output=True,
+            )
+        except Exception:
+            pass
+
+    # ---- liveness ----------------------------------------------------------
+
+    def sweep(self, force=False):
+        now = time.time()
+        if not force and now - self.last_sweep < SWEEP_INTERVAL:
+            return
+        self.last_sweep = now
+        out = tmux("list-panes", "-a", "-F", "#{pane_id}")
+        if out is None:
+            # tmux server gone: pane ids reset across restarts — drop everything
+            if self.panes:
+                self.panes.clear()
+                self.effective.clear()
+            return
+        alive = set(out.split())
+        for pane in [p for p in self.panes if p not in alive]:
+            self.panes.pop(pane, None)
+            self.effective.pop(pane, None)
+        if self.panes:
+            self.heal_status_format()
+
+    def heal_status_format(self):
+        # Theme switches regenerate omarchy's pill formats and drop our glyph;
+        # re-append it to the runtime global value (config files untouched).
+        for opt in ("window-status-format", "window-status-current-format"):
+            fmt = tmux("show", "-g", "-v", opt)
+            if fmt is None:
+                continue
+            fmt = fmt.rstrip("\n")
+            if fmt and "@agent_glyph" not in fmt:
+                tmux("set", "-g", opt, fmt + "#{?@agent_glyph, #{@agent_glyph},}")
+
+    # ---- queries -----------------------------------------------------------
+
+    def list_agents(self):
+        self.sweep(force=True)
+        out = tmux(
+            "list-panes", "-a", "-F",
+            "#{pane_id}\t#{window_id}\t#{session_name}\t#{window_name}\t#{pane_current_path}",
+        ) or ""
+        meta = {}
+        for line in out.splitlines():
+            parts = line.split("\t")
+            if len(parts) == 5:
+                meta[parts[0]] = parts[1:]
+        agents = []
+        for pane, sessions in self.panes.items():
+            cur = self.pane_state(pane)
+            if not cur:
+                continue
+            window_id, session, window_name, path = meta.get(
+                pane, ("", "", "", "")
+            )
+            agents.append(
+                {
+                    "pane_id": pane,
+                    "window_id": window_id,
+                    "session": session,
+                    "window_name": window_name,
+                    "state": cur["state"],
+                    "since": cur["since"],
+                    "cwd": cur.get("cwd") or path,
+                }
+            )
+        return {"agents": agents}
+
+
+def agent_label(cwd):
+    parts = [p for p in cwd.split("/") if p]
+    return "/".join(parts[-2:]) if len(parts) >= 2 else cwd
+
+
+# ---- server loop ------------------------------------------------------------
+
+
+def handle_request(fleet, line):
+    try:
+        req = json.loads(line)
+    except Exception:
+        return {"ok": False, "error": "bad json"}
+    method = req.get("method", "")
+    params = req.get("params") or {}
+    rid = req.get("id")
+    if method in ("agent.report", "pane.report_agent"):
+        result = fleet.report(params)
+    elif method in ("agent.release", "pane.release_agent"):
+        result = fleet.release(params)
+    elif method == "fleet.list":
+        result = fleet.list_agents()
+    elif method == "fleet.ping":
+        result = {"pong": True}
+    else:
+        return {"id": rid, "ok": False, "error": f"unknown method {method}"}
+    return {"id": rid, "ok": True, "result": result}
+
+
+def main():
+    try:
+        os.unlink(SOCKET_PATH)
+    except FileNotFoundError:
+        pass
+    server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    server.bind(SOCKET_PATH)
+    os.chmod(SOCKET_PATH, 0o600)
+    server.listen(16)
+    server.setblocking(False)
+
+    sel = selectors.DefaultSelector()
+    sel.register(server, selectors.EVENT_READ, None)
+    fleet = Fleet()
+    buffers = {}
+
+    while True:
+        for key, _ in sel.select(timeout=SWEEP_INTERVAL):
+            if key.data is None:
+                try:
+                    conn, _ = server.accept()
+                except OSError:
+                    continue
+                conn.setblocking(False)
+                sel.register(conn, selectors.EVENT_READ, "client")
+                buffers[conn] = b""
+            else:
+                conn = key.fileobj
+                try:
+                    data = conn.recv(65536)
+                except OSError:
+                    data = b""
+                if not data:
+                    sel.unregister(conn)
+                    buffers.pop(conn, None)
+                    conn.close()
+                    continue
+                buffers[conn] += data
+                while b"\n" in buffers[conn]:
+                    line, buffers[conn] = buffers[conn].split(b"\n", 1)
+                    if not line.strip():
+                        continue
+                    resp = handle_request(fleet, line)
+                    try:
+                        conn.sendall((json.dumps(resp) + "\n").encode())
+                    except OSError:
+                        pass
+        fleet.sweep()
+
+
+if __name__ == "__main__":
+    main()

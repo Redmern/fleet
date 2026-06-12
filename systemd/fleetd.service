@@ -1,0 +1,10 @@
+[Unit]
+Description=fleet agent-state daemon
+
+[Service]
+ExecStart=%h/.local/bin/fleetd
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=default.target
