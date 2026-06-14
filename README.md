@@ -23,6 +23,24 @@ fail-silent — if the daemon or any app is down, the rest keeps working.
 - **Orchestration** — the orchestrator (or you) can `fleet ls`, `fleet new`,
   and `fleet send <agent> "msg"` (delivered via nvim RPC into the claude
   terminal). See `FLEET.md` for the orchestrator instructions.
+- **Feature menu + keybinds** — `prefix+F` opens a rounded tmux menu listing
+  every feature with its key; pick an entry to run it, or "Change a keybind" to
+  rebind live. Keys are stored in `~/.config/fleet/keybinds.conf` and
+  re-applied on every `fleet up`. `fleet keys` prints them; `fleet rebind`
+  changes one from the CLI.
+
+## Keybinds (under tmux prefix)
+
+| Key | Feature |
+|---|---|
+| `F` | Feature menu |
+| `a` | Pick / jump to agent |
+| `n` | New agent (prompts for `repo branch`) |
+| `m` | Rebuild command center |
+| `l` | List agents |
+
+All defaults; override any in `~/.config/fleet/keybinds.conf` (`action=key`) or
+via the menu.
 
 ## Install
 
@@ -39,7 +57,7 @@ fleet up ~/path/to/project-root     # boot a project (any root folder of repos)
 | Path | What |
 |---|---|
 | `bin/fleetd` | unix-socket daemon (`$XDG_RUNTIME_DIR/fleet.sock`), state + tmux mirroring + notifications |
-| `bin/fleet` | CLI: `up new ls pick send main status doctor` |
+| `bin/fleet` | CLI: `up new ls pick send main menu keys rebind status doctor` |
 | `bin/fleet-hook` | Claude Code hook → daemon reporter (fail-silent, ~1ms when fleet is down) |
 | `bin/fleet-tile` | live tile renderer for the command center |
 | `nvim/fleet.lua` | loaded into spawned nvim via `--cmd` — claude autostart + `FleetSend()` |

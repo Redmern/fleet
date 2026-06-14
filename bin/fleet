@@ -131,7 +131,7 @@ cmd_pick() {
   [ -n "$rows" ] || { echo "no agents to pick"; return 0; }
   local choice
   choice=$(echo "$rows" | fzf --ansi --delimiter='\t' --with-nth=3 \
-            --no-sort --prompt='agent> ' --height=100%) || return 0
+            --no-sort --prompt='agent> ' --height=100% --border=rounded) || return 0
   local sess win
   sess=$(echo "$choice" | cut -f1)
   win=$(echo "$choice" | cut -f2)
@@ -324,6 +324,123 @@ inject_status_format() { # append agent glyph to window-status formats.
   done
 }
 
+# ---- keybinds -----------------------------------------------------------------
+# Keys are bound under the tmux prefix and stored in keybinds.conf as
+# `action=key` lines. Bindings are server-global and re-applied on every
+# `fleet up`, never written to tmux.conf. The menu (and `fleet rebind`) edit
+# this file and re-apply live.
+
+KEYBINDS_CONF="$CONF_DIR/keybinds.conf"
+
+# action|default-key|menu label|description
+fleet_actions() {
+  cat <<'EOF'
+menu|F|Feature menu|Open this menu
+pick|a|Pick / jump to agent|fzf popup of all agents, Enter jumps
+new|n|New agent|Prompt for "repo branch", spawn agent
+main|m|Rebuild command center|Re-tile the main window
+ls|l|List agents|Show agent states in a popup
+EOF
+}
+
+keybind_for() { # keybind_for <action> → key (config override or default)
+  local action="$1" key=""
+  if [ -f "$KEYBINDS_CONF" ]; then
+    key=$(awk -F= -v a="$action" '$1==a{print $2; exit}' "$KEYBINDS_CONF")
+  fi
+  [ -n "$key" ] && { echo "$key"; return; }
+  fleet_actions | awk -F'|' -v a="$action" '$1==a{print $2; exit}'
+}
+
+action_tmux_command() { # tmux command string run when an action's key is pressed
+  local action="$1" self="$FLEET_DIR/bin/fleet"
+  case "$action" in
+    menu) echo "run-shell '$self menu'" ;;
+    pick) echo "display-popup -E -b rounded -w 80% -h 60% '$self pick'" ;;
+    new)  echo "command-prompt -p 'fleet new (repo branch):' \"run-shell '$self new %%'\"" ;;
+    main) echo "run-shell '$self main'" ;;
+    ls)   echo "display-popup -E -b rounded -w 70% -h 60% \"$self ls; echo; read -n1 -r -p 'press any key'\"" ;;
+  esac
+}
+
+apply_keybinds() {
+  local action key cmd
+  while IFS='|' read -r action _ _ _; do
+    key=$(keybind_for "$action")
+    cmd=$(action_tmux_command "$action")
+    [ -n "$key" ] && [ -n "$cmd" ] || continue
+    eval "tmux bind-key '$key' $cmd"
+  done < <(fleet_actions)
+}
+
+cmd_menu() {
+  local args=() action key label
+  while IFS='|' read -r action key_default label _; do
+    key=$(keybind_for "$action")
+    args+=("$label  (prefix $key)" "$key" "$(action_tmux_command "$action")")
+  done < <(fleet_actions)
+  tmux display-menu -b rounded -T "#[align=centre]󰭹 Fleet" -x C -y C \
+    "${args[@]}" \
+    "" \
+    "Change a keybind" "c" "run-shell '$FLEET_DIR/bin/fleet rebind'" \
+    "Close" "q" ""
+}
+
+cmd_rebind() {
+  local args=() action key label
+  while IFS='|' read -r action key_default label _; do
+    key=$(keybind_for "$action")
+    args+=("$label  [$key]" "" \
+      "command-prompt -1 -p 'new key for $action:' \"run-shell '$FLEET_DIR/bin/fleet rebind-set $action %%'\"")
+  done < <(fleet_actions)
+  tmux display-menu -b rounded -T "#[align=centre]Rebind which feature?" -x C -y C "${args[@]}"
+}
+
+cmd_rebind_set() { # rebind-set <action> <key>
+  local action="$1" key="$2"
+  [ -n "$action" ] && [ -n "$key" ] || return 0
+  mkdir -p "$CONF_DIR"
+  touch "$KEYBINDS_CONF"
+  # release the action's previous key unless another action still uses it
+  local oldkey; oldkey=$(keybind_for "$action")
+  if [ -n "$oldkey" ] && [ "$oldkey" != "$key" ]; then
+    local still=""
+    while IFS='|' read -r a _ _ _; do
+      [ "$a" = "$action" ] && continue
+      [ "$(keybind_for "$a")" = "$oldkey" ] && still=1
+    done < <(fleet_actions)
+    [ -z "$still" ] && tmux unbind-key "$oldkey" 2>/dev/null
+  fi
+  # warn (don't block) if the key already drives another fleet action
+  local clash; clash=$(
+    while IFS='|' read -r a _ _ _; do
+      [ "$a" = "$action" ] && continue
+      [ "$(keybind_for "$a")" = "$key" ] && echo "$a"
+    done < <(fleet_actions)
+  )
+  local tmp; tmp=$(mktemp)
+  awk -F= -v a="$action" '$1!=a' "$KEYBINDS_CONF" > "$tmp"
+  echo "$action=$key" >> "$tmp"
+  mv "$tmp" "$KEYBINDS_CONF"
+  apply_keybinds
+  if [ -n "$clash" ]; then
+    tmux display-message "fleet: $action → prefix $key (also bound: $clash)"
+  else
+    tmux display-message "fleet: $action → prefix $key"
+  fi
+}
+
+cmd_keys() { # plain text listing
+  printf 'ACTION\tKEY\tDESCRIPTION\n'
+  local action key label desc
+  while IFS='|' read -r action key_default label desc; do
+    key=$(keybind_for "$action")
+    printf '%s\tprefix %s\t%s\n' "$action" "$key" "$desc"
+  done < <(fleet_actions)
+  echo
+  echo "config: $KEYBINDS_CONF  (edit or use the menu / 'fleet rebind')"
+}
+
 cmd_up() {
   local arg="${1:-}" root name
   if [ -n "$arg" ] && [ -d "$arg" ]; then
@@ -360,9 +477,8 @@ cmd_up() {
 
   tmux set -t "$name" @fleet_root "$root"
   inject_status_format "$name"
-  # runtime keybind (tmux bindings are server-global; re-applied each `up`,
-  # never written to tmux.conf)
-  tmux bind-key a display-popup -E -w 80% -h 60% "$FLEET_DIR/bin/fleet pick"
+  # runtime keybinds (server-global; re-applied each `up`, never in tmux.conf)
+  apply_keybinds
 
   # offer FLEET.md to the orchestrator
   if [ -f "$root/CLAUDE.md" ] && ! grep -q "fleet new" "$root/CLAUDE.md" 2>/dev/null; then
@@ -421,18 +537,25 @@ case "${1:-}" in
   ls)      shift; cmd_ls "$@" ;;
   pick)    shift; cmd_pick "$@" ;;
   send)    shift; cmd_send "$@" ;;
-  main)    shift; cmd_main "$@" ;;
-  status)  shift; cmd_status "$@" ;;
-  doctor)  shift; cmd_doctor "$@" ;;
-  *) cat <<EOF
+  main)       shift; cmd_main "$@" ;;
+  menu)       shift; cmd_menu "$@" ;;
+  keys)       shift; cmd_keys "$@" ;;
+  rebind)     shift; cmd_rebind "$@" ;;
+  rebind-set) shift; cmd_rebind_set "$@" ;;
+  status)     shift; cmd_status "$@" ;;
+  doctor)     shift; cmd_doctor "$@" ;;
+  *) menu_key=$(keybind_for menu); cat <<EOF
 fleet — agent fleet manager (tmux + nvim + Claude Code)
 
   fleet up [name|path]   boot project session + daemon + command center
   fleet new <repo> <br>  spawn agent (worktree + window + claude) [-p prompt] [--bare] [--base br]
   fleet ls               list agents and states
-  fleet pick             fzf jump-to-agent (bound to prefix+a by fleet up)
+  fleet pick             fzf jump-to-agent
   fleet send <a> "msg"   send message to an agent's claude
   fleet main             (re)build command center window
+  fleet menu             feature menu (bound to prefix+$menu_key by fleet up)
+  fleet keys             list feature keybinds
+  fleet rebind           change a keybind interactively
   fleet status           daemon status
   fleet doctor           dependency / wiring check
 EOF
