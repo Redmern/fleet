@@ -11,7 +11,8 @@ set -u
 SESS="${1:-}"
 [ -n "$SESS" ] || { echo "usage: fleet-dash <session>"; exit 1; }
 
-FLEET_BIN="$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/fleet"
+SELF="$(readlink -f "${BASH_SOURCE[0]}")"   # this script, for in-place self-reload
+FLEET_BIN="$(dirname "$SELF")/fleet"
 CLIP_PCT="${FLEET_TILE_CLIP:-32}"        # right-column % kept for nvim panes
 REFRESH="${FLEET_DASH_REFRESH:-1}"        # idle refresh interval, seconds
 MODES=(default accept-edits auto plan bypass)   # selectable permission modes
@@ -291,7 +292,7 @@ render() {
   # bottom border with key hints (or a transient status)
   local hint
   if [ -n "$status" ]; then hint="$status"
-  else hint="j/k move · Ent jump · v diff · m mode · s send · n new · d close · r"; fi
+  else hint="j/k · Ent jump · v diff · m mode · s send · n new · d close · r/R refresh/reload"; fi
   tput cup $(( rows - 1 )) 0 2>/dev/null
   printf '\033[2m%s\033[0m\033[K' "$(hrule '╰' '╯' "$inner" "$hint")"
 }
@@ -657,6 +658,7 @@ while :; do
     g) sel=0 ;;
     G) (( N > 0 )) && sel=$((N - 1)) ;;
     r) status="" ;;
+    R) cleanup; exec "$SELF" "$SESS" ;;   # reload the dashboard with fresh code
     $'\n'|$'\r')   # jump to selected agent's window
       (( N == 0 )) && continue
       tmux select-window -t "$(field "$sel" 3)" 2>/dev/null ;;

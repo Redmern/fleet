@@ -90,7 +90,12 @@ fail-silent — if the daemon or any app is down, the rest keeps working.
 | `a` | Pick / jump to agent |
 | `n` | New agent (prompts for `repo branch`) |
 | `m` | Rebuild command center |
+| `R` | Reload the dashboard pane in place (picks up new code, no Claude involved) |
 | `l` | List agents |
+
+`prefix+R` works from any pane — handy when the orchestrator Claude is busy and
+you don't want to queue `fleet main --reload` behind its work. (The dashboard
+pane itself also has an `R` key that self-reloads.)
 
 All defaults; override any in `~/.config/fleet/keybinds.conf` (`action=key`) or
 via the menu.

@@ -462,6 +462,7 @@ menu|F|Feature menu|Open this menu
 pick|a|Pick / jump to agent|fzf popup of all agents, Enter jumps
 new|n|New agent|Prompt for "repo branch", spawn agent
 main|m|Rebuild command center|Re-tile the main window
+reload|R|Reload dashboard|Restart the dashboard pane in place (picks up new code)
 ls|l|List agents|Show agent states in a popup
 EOF
 }
@@ -481,8 +482,9 @@ action_tmux_command() { # tmux command string run when an action's key is presse
     menu) echo "run-shell '$self menu'" ;;
     pick) echo "display-popup -E -b rounded -w 80% -h 60% '$self pick'" ;;
     new)  echo "command-prompt -p 'fleet new (repo branch):' \"run-shell '$self new %%'\"" ;;
-    main) echo "run-shell '$self main'" ;;
-    ls)   echo "display-popup -E -b rounded -w 70% -h 60% \"$self ls; echo; read -n1 -r -p 'press any key'\"" ;;
+    main)   echo "run-shell '$self main'" ;;
+    reload) echo "run-shell '$self main --reload'" ;;
+    ls)     echo "display-popup -E -b rounded -w 70% -h 60% \"$self ls; echo; read -n1 -r -p 'press any key'\"" ;;
   esac
 }
 
