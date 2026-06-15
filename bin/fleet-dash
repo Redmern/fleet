@@ -14,7 +14,7 @@ SESS="${1:-}"
 FLEET_BIN="$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/fleet"
 CLIP_PCT="${FLEET_TILE_CLIP:-32}"        # right-column % kept for nvim panes
 REFRESH="${FLEET_DASH_REFRESH:-1}"        # idle refresh interval, seconds
-MODES=()                                  # discovered permission-mode list (cached)
+MODES=(default accept-edits auto plan bypass)   # selectable permission modes
 SELF_PANE="${TMUX_PANE:-}"                 # this dashboard's own tmux pane id
 declare -A GIT_RAW GIT_TS                  # per-pane git status cache (4s TTL)
 
@@ -341,6 +341,12 @@ mode_desc() { # short hint per known mode
   esac
 }
 
+# pane -> true if claude is idle at its input prompt (the only state where
+# Shift+Tab actually cycles the permission mode — not busy, not in a dialog).
+agent_at_prompt() {
+  tmux capture-pane -p -t "$1" 2>/dev/null | grep -qE '\? for shortcuts|shift\+tab to cycle'
+}
+
 msg_box() { # title line -> small centred notice box (drawn to /dev/tty)
   local title="$1" line="$2" R C bw=46
   read -r R C < <(tsize)
@@ -359,39 +365,29 @@ settle_read() { # pane prev -> the mode once it has changed from prev AND is
   printf '%s' "$cur"                    # gave up (~2.5s) — return latest
 }
 
-discover_modes() { # pane label -> fills global MODES (cycle order); restores agent
-  local pane="$1" label="$2" start cur prev i
-  MODES=()
-  start=$(mode_label "$pane"); MODES+=("$start"); prev="$start"
-  for (( i=0; i<8; i++ )); do
-    "$FLEET_BIN" mode "$label" >/dev/null 2>&1
-    cur=$(settle_read "$pane" "$prev")
-    [ "$cur" = "$start" ] && return 0     # full loop done — agent back at start
-    MODES+=("$cur"); prev="$cur"
-  done
-  return 0
-}
 
-apply_mode() { # pane label target -> Shift+Tab until claude reports target
-  local pane="$1" label="$2" target="$3" cur i
-  cur=$(mode_label "$pane")
-  for (( i=0; i<=${#MODES[@]}; i++ )); do
+# apply_mode pane label target -> Shift+Tab toward target. Robust: stops if the
+# cycle loops back to start (target not reachable) or the agent isn't responding,
+# and restores the agent to its original mode on failure (bounded keystrokes).
+apply_mode() {
+  local pane="$1" label="$2" target="$3" start cur n=0
+  start=$(mode_label "$pane"); cur="$start"
+  [ "$cur" = "$target" ] && return 0
+  while (( n < 8 )); do
+    "$FLEET_BIN" mode "$label" >/dev/null 2>&1
+    cur=$(settle_read "$pane" "$cur"); (( n++ ))
     [ "$cur" = "$target" ] && return 0
-    "$FLEET_BIN" mode "$label" >/dev/null 2>&1
-    cur=$(settle_read "$pane" "$cur")
+    [ "$cur" = "$start" ] && break          # full loop, or no change (stuck) → give up
   done
-  [ "$cur" = "$target" ]
+  while [ "$(mode_label "$pane")" != "$start" ] && (( n < 16 )); do
+    "$FLEET_BIN" mode "$label" >/dev/null 2>&1; cur=$(settle_read "$pane" "$cur"); (( n++ ))
+  done
+  return 1
 }
 
-# pick_mode <pane> <label> -> sets global `status`. Runs in the main shell (not a
-# subshell) so the discovered MODES cache survives between presses.
+# pick_mode <pane> <label> -> centred mode picker; sets global `status`.
 pick_mode() {
   local pane="$1" label="$2" k r R C bw=46
-  if (( ${#MODES[@]} == 0 )); then
-    msg_box "Permission mode" "reading available modes..."
-    discover_modes "$pane" "$label"
-  fi
-  (( ${#MODES[@]} == 0 )) && { status="no modes found ($label)"; return; }
   local cur n=${#MODES[@]} mi=0 i
   cur=$(mode_label "$pane")
   for (( i=0; i<n; i++ )); do [ "${MODES[i]}" = "$cur" ] && mi=$i; done
@@ -415,9 +411,14 @@ pick_mode() {
       $'\n'|$'\r')
         local target="${MODES[mi]}"
         if [ "$target" = "$cur" ]; then status="mode: $target ($label)"; return; fi
+        # Claude only cycles permission mode at its idle prompt — never poke a
+        # busy agent or a permission dialog with Shift+Tab.
+        if ! agent_at_prompt "$pane"; then
+          status="$label is busy — set mode when it's idle at its prompt"; return
+        fi
         msg_box "Permission mode" "setting $target ..."
         if apply_mode "$pane" "$label" "$target"; then status="mode -> $target ($label)"
-        else status="couldn't set $target ($label)"; fi
+        else status="couldn't reach $target — $label may lack that mode"; fi
         return ;;
       q) return ;;
     esac
