@@ -138,6 +138,7 @@ PILL_L=$''   # left semicircle (Nerd Font / powerline-extra)
 PILL_R=$''   # right semicircle
 PILL_W=7      # fixed inner text width — every pill is the same size
 PILL_GAP=3    # spaces between row items (state · label · git · mode)
+ROW_GAP=1     # blank rows between agents
 
 pill_center() { # text -> centred/truncated to exactly PILL_W chars
   local t="$1" len=${#1} pad l
@@ -274,6 +275,10 @@ render() {
         printf '\033[2m│\033[0m%s%b%s\033[2m│\033[0m\033[K\n' "$ins" "$content" "$ins"
       fi
       (( drawn++ ))
+      local gi                                  # vertical gap between agents
+      for (( gi=0; gi<ROW_GAP && i<N-1 && drawn<slots; gi++ )); do
+        printf '\033[2m│%s│\033[0m\033[K\n' "$blank"; (( drawn++ ))
+      done
     done
   fi
 
