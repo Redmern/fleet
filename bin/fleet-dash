@@ -136,12 +136,23 @@ gitcolor() { # "D A B" -> SGR (behind=red, dirty=yellow, ahead=cyan, clean=green
 # --- pills (rounded nerd-font capsules, like the omarchy status bar) -----------
 PILL_L=$''   # left semicircle (Nerd Font / powerline-extra)
 PILL_R=$''   # right semicircle
-pill() { # text color256 -> rounded pill; display width = len(text) + 4
-  local t="$1" c="$2" tf=0
+PILL_W=7      # fixed inner text width — every pill is the same size
+
+pill_center() { # text -> centred/truncated to exactly PILL_W chars
+  local t="$1" len=${#1} pad l
+  (( len >= PILL_W )) && { printf '%.*s' "$PILL_W" "$t"; return; }
+  pad=$(( PILL_W - len )); l=$(( pad / 2 ))
+  printf '%*s%s%*s' "$l" '' "$t" "$(( pad - l ))" ''
+}
+
+pill() { # text color256 -> fixed-width rounded pill (display width = PILL_W + 4)
+  local t c="$2" tf=0
   [ "$c" = 8 ] && tf=15                       # white text on the grey pill
+  t=$(pill_center "$1")
   printf '\033[38;5;%s;49m%s\033[48;5;%s;38;5;%sm %s \033[49;38;5;%sm%s\033[0m' \
     "$c" "$PILL_L" "$c" "$tf" "$t" "$c" "$PILL_R"
 }
+mode_short() { case "$1" in accept-edits) echo accept ;; *) echo "$1" ;; esac; }
 state_pcol() { case "$1" in blocked) echo 1;; working) echo 4;; idle) echo 2;; *) echo 8;; esac; }
 mode_pcol()  { case "$1" in *bypass*) echo 1;; *plan*) echo 3;; *accept*|*edit*|*auto*) echo 6;; *) echo 8;; esac; }
 git_pcol()   { # "D A B" -> pill colour
@@ -236,22 +247,23 @@ render() {
     # Row: <state pill>  repo/branch  <git pill>  <mode pill>. The label is the
     # flexible filler; pills (rounded capsules) have width len(text)+4. Content
     # width is kept exactly = cw so the right rail stays aligned.
-    local state label pane mode g gt content lblsgr sw gw mw LW git_show mode_show
+    # every pill is the same display width (PW); the label is the flexible filler
+    local PW=$(( PILL_W + 4 ))
+    local state label pane mode g gt content lblsgr LW git_show mode_show
     for (( i=0; i<N && drawn<slots; i++ )); do
       state=$(field "$i" 1); label=$(field "$i" 2); pane=$(field "$i" 6)
       g=$(git_cached "$pane"); gt=$(gitfmt "$g")
       mode=$(mode_label "$pane")
-      sw=$(( ${#state} + 4 )); gw=$(( ${#gt} + 4 )); mw=$(( ${#mode} + 4 ))
       git_show=1; mode_show=1
-      LW=$(( cw - sw - gw - mw - 3 ))          # 3 separators
-      (( LW < 1 )) && { mode_show=0; LW=$(( cw - sw - gw - 2 )); }
-      (( LW < 1 )) && { git_show=0; LW=$(( cw - sw - 1 )); }
+      LW=$(( cw - 3*PW - 3 ))                   # 3 pills + 3 separators
+      (( LW < 1 )) && { mode_show=0; LW=$(( cw - 2*PW - 2 )); }
+      (( LW < 1 )) && { git_show=0; LW=$(( cw - PW - 1 )); }
       (( LW < 0 )) && LW=0
       (( i == sel )) && lblsgr='\033[1m' || lblsgr='\033[2m'
       content=$(pill "$state" "$(state_pcol "$state")")
       content+=$(printf " ${lblsgr}%b\033[22m" "$(fit_left "$label" "$LW")")
       (( git_show )) && content+=" $(pill "$gt" "$(git_pcol "$g")")"
-      (( mode_show )) && content+=" $(pill "$mode" "$(mode_pcol "$mode")")"
+      (( mode_show )) && content+=" $(pill "$(mode_short "$mode")" "$(mode_pcol "$mode")")"
       if (( i == sel )); then   # focus-coloured marker bar marks the selection
         printf '\033[2m│\033[0m%b▌\033[0m%s%b%s\033[2m│\033[0m\033[K\n' \
           "$markc" "$ins1" "$content" "$ins"
