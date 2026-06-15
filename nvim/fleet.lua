@@ -37,7 +37,12 @@ function FleetSend(text)
       if name:match("claude") then
         local chan = vim.bo[buf].channel
         if chan and chan > 0 then
-          vim.api.nvim_chan_send(chan, text .. "\r")
+          -- Send text and the submit CR as SEPARATE writes. A single
+          -- combined write reads as a bracketed paste and the TUI buffers
+          -- the trailing CR instead of submitting; a delayed standalone CR
+          -- is seen as a distinct Enter keypress.
+          vim.api.nvim_chan_send(chan, text)
+          vim.defer_fn(function() vim.api.nvim_chan_send(chan, "\r") end, 80)
           return "sent"
         end
       end
@@ -49,6 +54,25 @@ function FleetSend(text)
     pcall(terminal.open, {})
     vim.defer_fn(function() FleetSend(text) end, 1500)
     return "opening"
+  end
+  return "no-claude-terminal"
+end
+
+-- FleetCycleMode(): inject Shift+Tab (\27[Z) into the claude terminal to cycle
+-- its permission mode (default → accept-edits → plan → bypass). Same focus-
+-- independent path as FleetSend — straight to the terminal channel.
+function FleetCycleMode()
+  for _, buf in ipairs(vim.api.nvim_list_bufs()) do
+    if vim.api.nvim_buf_is_loaded(buf) and vim.bo[buf].buftype == "terminal" then
+      local name = vim.api.nvim_buf_get_name(buf)
+      if name:match("claude") then
+        local chan = vim.bo[buf].channel
+        if chan and chan > 0 then
+          vim.api.nvim_chan_send(chan, "\27[Z")
+          return "sent"
+        end
+      end
+    end
   end
   return "no-claude-terminal"
 end

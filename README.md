@@ -18,11 +18,37 @@ fail-silent — if the daemon or any app is down, the rest keeps working.
 - **Desktop notifications** — notify-send when an agent blocks or finishes
   while its window isn't focused (30s cooldown, flap guard).
 - **Command center** — `fleet main`: orchestrator claude at the project root on
-  the left, live read-only tiles of every agent on the right (capture-pane
-  polling, nvim panes clipped to the claude split).
+  the left, an interactive **agent dashboard** on the right (`fleet-dash`),
+  framed in a rounded box and redrawn in place (no flicker on refresh). One row
+  per agent — state glyph · repo/branch · time-in-state · live permission mode ·
+  last activity — sorted by urgency, self-refreshing ~2s, columns adapt to pane
+  width. Drive it from the keyboard:
+
+  | Key | Action |
+  |---|---|
+  | `j`/`k` (or ↑/↓) | move selection (`g`/`G` = first/last) |
+  | `⏎` | jump to the selected agent's window |
+  | `m` | open the permission-mode popup for the selected agent |
+  | `s` | send a message to the selected agent |
+  | `n` | open the new-agent form (Repo / Branch / Prompt / Bare fields) |
+  | `r` | refresh now |
+
+  The permission-mode column and the `m` popup read the mode live from claude's
+  own footer (the `… on (shift+tab to cycle)` line), so they're authoritative.
+  Because claude only exposes mode *cycling* (Shift+Tab), not "set mode X", the
+  `m` popup **discovers** the available modes the first time it's used — cycling
+  the agent one full loop, recording each mode, and returning it to where it
+  started — then caches that list for the session and presents it as a pick-list
+  (`j`/`k`, `Enter`). Selecting a mode drives the agent to it. Works regardless
+  of how many modes that claude version has or what they're called.
+
+  `fleet main --reload` restarts just the dashboard process in place (same pane,
+  size, and position) — handy after editing `fleet-dash`. The orchestrator pane
+  and every agent window keep running; no work is lost.
 - **Orchestration** — the orchestrator (or you) can `fleet ls`, `fleet new`,
-  and `fleet send <agent> "msg"` (delivered via nvim RPC into the claude
-  terminal). See `FLEET.md` for the orchestrator instructions.
+  `fleet send <agent> "msg"` (delivered via nvim RPC into the claude terminal),
+  and `fleet mode <agent>` to cycle an agent's permission mode. See `FLEET.md`
+  for the orchestrator instructions.
 - **Feature menu + keybinds** — `prefix+F` opens a rounded tmux menu listing
   every feature with its key; pick an entry to run it, or "Change a keybind" to
   rebind live. Keys are stored in `~/.config/fleet/keybinds.conf` and
@@ -57,10 +83,11 @@ fleet up ~/path/to/project-root     # boot a project (any root folder of repos)
 | Path | What |
 |---|---|
 | `bin/fleetd` | unix-socket daemon (`$XDG_RUNTIME_DIR/fleet.sock`), state + tmux mirroring + notifications |
-| `bin/fleet` | CLI: `up new ls pick send main menu keys rebind status doctor` |
+| `bin/fleet` | CLI: `up new ls pick send mode main menu keys rebind status doctor` |
 | `bin/fleet-hook` | Claude Code hook → daemon reporter (fail-silent, ~1ms when fleet is down) |
-| `bin/fleet-tile` | live tile renderer for the command center |
-| `nvim/fleet.lua` | loaded into spawned nvim via `--cmd` — claude autostart + `FleetSend()` |
+| `bin/fleet-dash` | interactive agent dashboard for the command center (the right pane of `main`) |
+| `bin/fleet-tile` | legacy single-pane tile renderer — no longer used by `main`, kept for a future preview pane |
+| `nvim/fleet.lua` | loaded into spawned nvim via `--cmd` — claude autostart + `FleetSend()` + `FleetCycleMode()` |
 | `FLEET.md` | orchestrator instructions, copied to project `CLAUDE.md` by `fleet up` |
 
 Projects are any root folder containing repos; repos are auto-discovered

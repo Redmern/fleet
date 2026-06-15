@@ -10,6 +10,8 @@ in other tmux windows of this project with the `fleet` CLI:
   it with the `-p` prompt. `<repo>` is a repo name/alias in this project root.
 - `fleet send <agent> "message"` — send a follow-up message to a running
   agent's claude input. `<agent>` matches window name or repo/branch.
+- `fleet mode <agent>` — cycle that agent's Claude permission mode (default →
+  accept-edits → plan → bypass), one step per call (sends Shift+Tab).
 
 Delegation pattern: split the user's request into per-repo tasks, `fleet new`
 one agent per task with a precise prompt, then poll `fleet ls` and `fleet send`

@@ -228,7 +228,7 @@ cmd_send() {
   local nsock; nsock=$(tmux show -w -t "$win" -v @fleet_nvim_sock 2>/dev/null)
   if [ -n "$nsock" ] && [ -S "$nsock" ]; then
     local res
-    res=$(nvim --server "$nsock" --remote-expr "v:lua.FleetSend(\"$(printf '%s' "$text" | sed 's/[\\"]/\\&/g')\")" 2>/dev/null)
+    res=$(nvim --headless --server "$nsock" --remote-expr "v:lua.FleetSend(\"$(printf '%s' "$text" | sed 's/[\\"]/\\&/g')\")" 2>/dev/null)
     case "$res" in
       sent|opening) echo "delivered via nvim ($res)"; return 0 ;;
     esac
@@ -238,6 +238,42 @@ cmd_send() {
     && echo "delivered via send-keys (focus-dependent for nvim agents)"
 }
 
+# ---- mode ---------------------------------------------------------------------
+# Cycle an agent's Claude permission mode by injecting Shift+Tab into its claude.
+# claude cycles default → accept-edits → plan → bypass on each press, and prints
+# the current mode in its footer (the dash reads that back authoritatively).
+
+cmd_mode() {
+  local target="${1:-}"
+  [ -n "$target" ] || die "usage: fleet mode <agent>"
+  local line
+  line=$(agents_tsv | awk -F'\t' -v t="$target" 'index($2,t)||index($5,t){print; exit}')
+  [ -n "$line" ] || die "no agent matching '$target' (try: fleet ls)"
+  local win pane nsock
+  win=$(echo "$line" | cut -f4)
+  pane=$(echo "$line" | cut -f7)
+  nsock=$(tmux show -w -t "$win" -v @fleet_nvim_sock 2>/dev/null)
+  if [ -n "$nsock" ] && [ -S "$nsock" ]; then
+    # (Re)source the current fleet.lua first, then call — so this works even for
+    # agents whose nvim started before FleetCycleMode existed. Inline lua avoids
+    # single quotes (the luaeval string is VimL-single-quoted); _A = the path.
+    local res
+    # --headless: without it, nvim --remote-expr launched from inside a terminal
+    # (e.g. the dashboard pane) starts a TUI and the result comes back wrapped in
+    # escape codes — so the "sent" check failed and we double-tapped via fallback.
+    res=$(nvim --headless --server "$nsock" --remote-expr \
+      "luaeval('(function() dofile(_A) return (_G.FleetCycleMode and _G.FleetCycleMode()) or 0 end)()', '$FLEET_DIR/nvim/fleet.lua')" \
+      2>/dev/null)
+    case "$res" in
+      sent|opening) echo "cycled mode via nvim ($res)"; return 0 ;;
+    esac
+    echo "nvim RPC failed ($res), falling back to send-keys" >&2
+  fi
+  # BTab is tmux's name for Shift+Tab (emits \x1b[Z).
+  tmux send-keys -t "$pane" BTab \
+    && echo "cycled mode via send-keys (focus-dependent for nvim agents)"
+}
+
 # ---- main window / command center ---------------------------------------------
 
 main_window_id() { # find existing main window in session
@@ -245,45 +281,63 @@ main_window_id() { # find existing main window in session
     | awk -F'\t' '$2=="main"{print $1; exit}'
 }
 
-sync_main_tiles() { # (re)build the tile column next to the orchestrator
+sync_main_tiles() { # ensure exactly one fleet-dash pane next to the orchestrator
   local sess="$1"
   local win; win=$(main_window_id "$sess")
   [ -n "$win" ] || return 1
 
-  # drop old tiles (panes flagged @fleet_tile)
+  # Migrate: kill any legacy per-agent tile panes (old @fleet_tile layout).
   local p
-  for p in $(tmux list-panes -t "$win" -F $'#{pane_id}\t#{@fleet_tile}' | awk -F'\t' '$2=="1"{print $1}'); do
+  for p in $(tmux list-panes -t "$win" -F $'#{pane_id}\t#{@fleet_tile}' \
+              | awk -F'\t' '$2=="1"{print $1}'); do
     tmux kill-pane -t "$p" 2>/dev/null
   done
 
-  local orch
-  orch=$(tmux list-panes -t "$win" -F '#{pane_id}' | head -1)
-
-  # one tile per agent pane — only agents of THIS session, and not the
-  # main window's own orchestrator
-  local first=1 last="" pane_id agent_win agent_sess
-  while IFS=$'\t' read -r _ _ agent_sess agent_win _ _ pane_id; do
-    [ -n "$pane_id" ] || continue
-    [ "$agent_sess" = "$sess" ] || continue
-    [ "$agent_win" = "$win" ] && continue
-    if [ "$first" = 1 ]; then
-      last=$(tmux split-window -P -F '#{pane_id}' -h -t "$orch" -l '55%' \
-        "$FLEET_DIR/bin/fleet-tile" "$pane_id")
-      first=0
-    else
-      last=$(tmux split-window -P -F '#{pane_id}' -v -t "$last" \
-        "$FLEET_DIR/bin/fleet-tile" "$pane_id")
-    fi
-    tmux set -p -t "$last" @fleet_tile 1
-  done < <(agents_tsv)
-  if [ -n "$last" ]; then
-    tmux set -w -t "$win" main-pane-width '45%'
-    tmux select-layout -t "$win" main-vertical 2>/dev/null
+  # The dash self-refreshes its whole agent list, so we only ever need one and
+  # it should survive across fleet new/main calls — flagged @fleet_dash.
+  local dash
+  dash=$(tmux list-panes -t "$win" -F $'#{pane_id}\t#{@fleet_dash}' \
+          | awk -F'\t' '$2=="1"{print $1; exit}')
+  if [ -z "$dash" ]; then
+    local orch
+    orch=$(tmux list-panes -t "$win" -F '#{pane_id}' | head -1)
+    dash=$(tmux split-window -P -F '#{pane_id}' -h -t "$orch" -l '40%' \
+      "$FLEET_DIR/bin/fleet-dash" "$sess")
+    tmux set -p -t "$dash" @fleet_dash 1
+    tmux set -w -t "$win" main-pane-width '60%'
+    tmux select-pane -t "$orch" 2>/dev/null
   fi
-  tmux select-pane -t "$orch" 2>/dev/null
+  # uncoloured pane divider — the active-pane border shouldn't light up between
+  # the orchestrator and the dashboard. Match active to inactive (dim grey).
+  tmux set -w -t "$win" pane-border-style 'fg=colour238' 2>/dev/null
+  tmux set -w -t "$win" pane-active-border-style 'fg=colour238' 2>/dev/null
+}
+
+dash_pane_id() { # pane_id of the dashboard in the session's main window, if any
+  local win; win=$(main_window_id "$1") || return 1
+  [ -n "$win" ] || return 1
+  tmux list-panes -t "$win" -F $'#{pane_id}\t#{@fleet_dash}' 2>/dev/null \
+    | awk -F'\t' '$2=="1"{print $1; exit}'
+}
+
+reload_dash() { # restart the dash process in place — keeps pane size/position;
+  local sess="$1"                       # orchestrator + agent windows untouched.
+  local dash; dash=$(dash_pane_id "$sess")
+  if [ -n "$dash" ]; then
+    tmux respawn-pane -k -t "$dash" "$FLEET_DIR/bin/fleet-dash" "$sess"
+    echo "dashboard reloaded ($dash)"
+  else
+    sync_main_tiles "$sess"             # none yet (or legacy tiles) — build fresh
+    echo "dashboard built"
+  fi
 }
 
 cmd_main() {
+  if [ "${1:-}" = "--reload" ] || [ "${1:-}" = "reload" ]; then
+    local sess; sess=$(session_name) || die "not inside tmux"
+    reload_dash "$sess"
+    return
+  fi
   local sess; sess=$(session_name) || die "not inside tmux"
   local root; root=$(fleet_root)
   local win; win=$(main_window_id "$sess")
@@ -535,8 +589,10 @@ case "${1:-}" in
   up)      shift; cmd_up "$@" ;;
   new)     shift; cmd_new "$@" ;;
   ls)      shift; cmd_ls "$@" ;;
+  agents)  shift; agents_tsv "$@" ;;   # raw TSV, consumed by fleet-dash
   pick)    shift; cmd_pick "$@" ;;
   send)    shift; cmd_send "$@" ;;
+  mode)    shift; cmd_mode "$@" ;;
   main)       shift; cmd_main "$@" ;;
   menu)       shift; cmd_menu "$@" ;;
   keys)       shift; cmd_keys "$@" ;;
@@ -552,7 +608,8 @@ fleet — agent fleet manager (tmux + nvim + Claude Code)
   fleet ls               list agents and states
   fleet pick             fzf jump-to-agent
   fleet send <a> "msg"   send message to an agent's claude
-  fleet main             (re)build command center window
+  fleet mode <a>         cycle an agent's Claude permission mode (Shift+Tab)
+  fleet main [--reload]  (re)build command center window (--reload restarts just the dashboard)
   fleet menu             feature menu (bound to prefix+$menu_key by fleet up)
   fleet keys             list feature keybinds
   fleet rebind           change a keybind interactively

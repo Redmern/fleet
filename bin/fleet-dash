@@ -1,0 +1,446 @@
+#!/usr/bin/env bash
+# fleet-dash <session> — interactive agent dashboard for the command center.
+# One row per agent (state · repo/branch · time-in-state · mode · last activity),
+# sorted by urgency. Self-refreshes ~2s. Keyboard control: select / jump / cycle
+# permission mode / send / new. Replaces the old per-agent fleet-tile column.
+#
+# Runs as the right-hand pane of the "main" window, inside the project session,
+# so the fleet sub-commands it shells out to resolve session/root from $TMUX.
+
+set -u
+SESS="${1:-}"
+[ -n "$SESS" ] || { echo "usage: fleet-dash <session>"; exit 1; }
+
+FLEET_BIN="$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/fleet"
+CLIP_PCT="${FLEET_TILE_CLIP:-32}"        # right-column % kept for nvim panes
+MODES=()                                  # discovered permission-mode list (cached)
+
+sel=0                                     # selected row index
+status=""                                 # transient status line
+
+# --- terminal setup ----------------------------------------------------------
+cleanup() { tput rmcup 2>/dev/null; tput cnorm 2>/dev/null; }
+trap cleanup EXIT INT TERM
+tput smcup 2>/dev/null                    # alternate screen
+tput civis 2>/dev/null                    # hide cursor
+
+# --- helpers -----------------------------------------------------------------
+glyph_color() { # state -> SGR color
+  case "$1" in
+    blocked) printf '\033[31m' ;;        # red
+    working) printf '\033[34m' ;;        # blue
+    idle)    printf '\033[32m' ;;        # green
+    *)       printf '\033[90m' ;;        # grey
+  esac
+}
+
+fit_left() { # fit to exactly w *display chars* (char-aware, avoids printf's byte
+  local s="$1" w="$2" pad   # precision); left-ellipsis keeps the branch tail visible
+  (( w <= 0 )) && return
+  (( ${#s} > w )) && s="…${s: -$((w - 1))}"
+  pad=$(( w - ${#s} )); (( pad < 0 )) && pad=0
+  printf '%s%*s' "$s" "$pad" ''
+}
+
+last_line() { # pane_id -> last non-blank line of its claude view, trimmed
+  local pane="$1" info cmd width cap
+  info=$(tmux display -p -t "$pane" '#{pane_current_command}'$'\t''#{pane_width}' 2>/dev/null) || return 0
+  cmd=${info%%$'\t'*}; width=${info##*$'\t'}
+  cap=$(tmux capture-pane -p -t "$pane" 2>/dev/null) || return 0
+  case "$cmd" in
+    nvim|vi|vim)                          # keep the rightmost CLIP_PCT% (claude split);
+      local keep start                    # drop nvim's full-width statusline/cmdline rows
+      keep=$((width * CLIP_PCT / 100)); start=$((width - keep + 1))
+      [ "$start" -lt 1 ] && start=1
+      cap=$(printf '%s\n' "$cap" | head -n -2 | cut -c"$start"-) ;;
+  esac
+  # last line with real text (skip blanks and pure box-drawing/border rows).
+  # Reduce to ASCII so its display width is predictable — the boxed layout pads
+  # to a fixed column count and wide/unicode glyphs would break the right border.
+  printf '%s\n' "$cap" | awk '/[A-Za-z0-9]/{l=$0} END{print l}' \
+    | LC_ALL=C sed -E 's/[^ -~]//g; s/  +/ /g; s/^ +//; s/ +$//'
+}
+
+mode_label() { # pane_id -> the agent's REAL permission mode, read from claude's
+  local m   # footer "<glyph> <mode> on (shift+tab to cycle)". The glyph varies
+            # per mode (⏵⏵ auto/accept, ⏸ plan, …), so match on the suffix and
+            # take the mode words before it — never key off the glyph.
+  m=$(tmux capture-pane -p -t "$1" 2>/dev/null \
+      | grep -oE '[A-Za-z][A-Za-z ]*on \(shift\+tab to cycle\)' | tail -1 \
+      | sed -E 's/ *on \(shift.*//; s/ +$//')
+  # default (normal) mode prints no such line. Normalise to short labels.
+  case "$m" in
+    *bypass*|*Bypass*) printf 'bypass' ;;
+    *plan*|*Plan*)     printf 'plan' ;;
+    *accept*|*edit*)   printf 'accept-edits' ;;
+    *auto*)            printf 'auto' ;;
+    "")                printf 'default' ;;
+    *)                 printf '%s' "$m" ;;
+  esac
+}
+
+mode_color() { # mode text -> SGR (non-default modes stand out)
+  case "$1" in
+    *bypass*)       printf '\033[31m' ;;   # red — dangerous
+    *plan*)         printf '\033[33m' ;;   # yellow
+    *edit*|*auto*)  printf '\033[36m' ;;   # cyan
+    *)              printf '\033[2m'  ;;   # dim — default
+  esac
+}
+
+# --- data --------------------------------------------------------------------
+# ROWS[] entries: state \t label \t window_id \t window_name \t since \t pane_id
+load_rows() {
+  ROWS=()
+  local line state label sess win wname since pane order
+  while IFS=$'\t' read -r state label sess win wname since pane; do
+    [ -n "$pane" ] || continue
+    [ "$sess" = "$SESS" ] || continue     # this project only
+    [ "$wname" = "main" ] && continue     # skip the orchestrator itself
+    ROWS+=("$state"$'\t'"$label"$'\t'"$win"$'\t'"$wname"$'\t'"$since"$'\t'"$pane")
+  done < <("$FLEET_BIN" agents 2>/dev/null | sort -t$'\t' -k1,1 \
+            | awk -F'\t' '
+                $1=="blocked"{o=0} $1=="idle"{o=1} $1=="working"{o=2} $1!~/blocked|idle|working/{o=3}
+                {print o"\t"$0}' | sort -n | cut -f2-)
+  N=${#ROWS[@]}
+  (( N == 0 )) && sel=0
+  (( sel >= N )) && sel=$((N - 1))
+  (( sel < 0 )) && sel=0
+}
+
+field() { printf '%s' "${ROWS[$1]}" | cut -f"$2"; }  # field <rowidx> <col>
+
+# --- render ------------------------------------------------------------------
+# Rounded box drawn inside the pane (tmux pane borders can't be rounded). Redraw
+# in place (cursor-home, clear-to-EOL per line) so the pane never flashes.
+# Border row helpers embed a title/hint label into a ─ rule between corners.
+hrule() { # hrule <left-corner> <right-corner> <inner-width> [label]
+  local l="$1" r="$2" w="$3" label="${4:-}" fill
+  if [ -n "$label" ]; then
+    # between the corners must be exactly w cols: "─" + lab + fill(n) = w.
+    # Truncate an over-long label so the line can't wrap (which would scroll).
+    local lab=" $label " avail=$(( w - 1 ))
+    (( avail < 0 )) && avail=0
+    (( ${#lab} > avail )) && lab="${lab:0:avail}"
+    local n=$(( avail - ${#lab} )); (( n < 0 )) && n=0
+    fill=$(printf '%.0s─' $(seq 1 "$n"))
+    printf '%s─%s%s%s' "$l" "$lab" "$fill" "$r"
+  else
+    fill=$(printf '%.0s─' $(seq 1 "$w"))
+    printf '%s%s%s' "$l" "$fill" "$r"
+  fi
+}
+
+PAD_X=2          # blank columns inset on each side, inside the rails
+PAD_Y=1          # blank rows of inset below the top border / above the bottom
+
+render() {
+  local cols rows; cols=$(tput cols); rows=$(tput lines)
+  local inner=$(( cols - 2 ))                 # columns between the │ │ rails
+  local slots=$(( rows - 2 ))                 # content rows between the borders
+  local cw=$(( inner - 2 * PAD_X ))           # usable width after horizontal pad
+  (( cw < 0 )) && cw=0
+  local ins; ins=$(printf '%*s' "$PAD_X" '')  # left/right inset spaces
+  local blank; blank=$(printf '%*s' "$inner" '')
+  # Responsive column widths: everything except label+activity is 33 cols of
+  # fixed fields/separators; share the rest between label (≤30) and activity,
+  # dropping activity entirely when the pane is too narrow for it.
+  local budget=$(( cw - 33 )); (( budget < 0 )) && budget=0
+  local lab_w act_w
+  if   (( budget >= 56 )); then lab_w=30; act_w=$(( budget - 30 ))
+  elif (( budget >= 31 )); then lab_w=26; act_w=$(( budget - 26 ))
+  else lab_w=$budget; act_w=0; fi             # narrow: label only, no activity
+  tput cup 0 0 2>/dev/null
+
+  # top border with title. Keep label text to width-1 glyphs only (box-drawing
+  # chars and · are reliable; wide/ambiguous glyphs like ⏎ or nerd icons break
+  # the char-count = display-width assumption hrule relies on).
+  printf '\033[2m%s\033[0m\033[K\n' \
+    "$(hrule '╭' '╮' "$inner" "FLEET · $SESS · $N agent$([ "$N" = 1 ] || echo s)")"
+
+  local drawn=0 i
+  for (( i=0; i<PAD_Y && drawn<slots; i++ )); do   # top padding rows
+    printf '\033[2m│%s│\033[0m\033[K\n' "$blank"; (( drawn++ ))
+  done
+
+  if (( N == 0 )); then
+    (( drawn < slots )) && { printf '\033[2m│\033[0m%s%-*s%s\033[2m│\033[0m\033[K\n' \
+      "$ins" "$cw" "no agents yet — press n to spawn one" "$ins"; (( drawn++ )); }
+  else
+    local state label since pane c act mode mc content
+    for (( i=0; i<N && drawn<slots; i++ )); do
+      state=$(field "$i" 1); label=$(field "$i" 2)
+      since=$(field "$i" 5); pane=$(field "$i" 6)
+      c=$(glyph_color "$state")
+      mode=$(mode_label "$pane"); mc=$(mode_color "$mode")
+      # content display width = cw exactly (lab_w + act_w + 32 fixed cols)
+      if (( act_w > 0 )); then
+        act=$(last_line "$pane"); act=${act:0:act_w}
+        content=$(printf ' %b●\033[0m %b%-8s\033[0m %s \033[2m%6.6s\033[0m %b%-12.12s\033[0m \033[2m%-*.*s\033[0m' \
+          "$c" "$c" "$state" "$(fit_left "$label" "$lab_w")" "$since" "$mc" "$mode" "$act_w" "$act_w" "$act")
+      else
+        content=$(printf ' %b●\033[0m %b%-8s\033[0m %s \033[2m%6.6s\033[0m %b%-12.12s\033[0m ' \
+          "$c" "$c" "$state" "$(fit_left "$label" "$lab_w")" "$since" "$mc" "$mode")
+      fi
+      if (( i == sel )); then
+        printf '\033[2m│\033[0m\033[7m%s%b%s\033[0m\033[2m│\033[0m\033[K\n' "$ins" "$content" "$ins"
+      else
+        printf '\033[2m│\033[0m%s%b%s\033[2m│\033[0m\033[K\n' "$ins" "$content" "$ins"
+      fi
+      (( drawn++ ))
+    done
+  fi
+
+  # empty side rails fill the box down to the bottom border (also = bottom pad)
+  while (( drawn < slots )); do
+    printf '\033[2m│%s│\033[0m\033[K\n' "$blank"
+    (( drawn++ ))
+  done
+
+  # bottom border with key hints (or a transient status)
+  local hint
+  if [ -n "$status" ]; then hint="$status"
+  else hint="j/k move · Ent jump · m mode · s send · n new · r refresh"; fi
+  tput cup $(( rows - 1 )) 0 2>/dev/null
+  printf '\033[2m%s\033[0m\033[K' "$(hrule '╰' '╯' "$inner" "$hint")"
+  printf '\033[J'
+}
+
+# read one line from the user at the bottom, cursor shown
+ask() { # ask "prompt> " -> echoes reply
+  local reply; local rows; rows=$(tput lines)
+  tput cnorm 2>/dev/null
+  tput cup $((rows - 1)) 0 2>/dev/null; tput el 2>/dev/null
+  IFS= read -rep "$1" reply
+  tput civis 2>/dev/null
+  printf '%s' "$reply"
+}
+
+# --- modal popups -------------------------------------------------------------
+# These draw a centred rounded box directly to /dev/tty and read keys from
+# /dev/tty, so they can run inside $(...) and return only their result on stdout.
+tsize() { stty size </dev/tty 2>/dev/null || echo "24 80"; }   # -> "rows cols"
+at()  { printf '\033[%d;%dH' $(( $1 + 1 )) $(( $2 + 1 )) >/dev/tty; }   # cup row col (0-based)
+mtop() { at "$1" "$2"; printf '\033[2m%s\033[0m' "$(hrule '╭' '╮' $(( $3 - 2 )) "$4")" >/dev/tty; }
+mbot() { at "$1" "$2"; printf '\033[2m%s\033[0m' "$(hrule '╰' '╯' $(( $3 - 2 )) "")" >/dev/tty; }
+mrow() { # row col width text [selected]
+  local r="$1" x="$2" w="$3" t="$4" s="${5:-}"
+  at "$r" "$x"
+  if [ -n "$s" ]; then
+    printf '\033[2m│\033[0m\033[7m %-*.*s \033[0m\033[2m│\033[0m' $(( w-4 )) $(( w-4 )) "$t" >/dev/tty
+  else
+    printf '\033[2m│\033[0m %-*.*s \033[2m│\033[0m' $(( w-4 )) $(( w-4 )) "$t" >/dev/tty
+  fi
+}
+
+# --- permission-mode selection ------------------------------------------------
+# Claude only exposes mode *cycling* (Shift+Tab), not "set mode X", and the set
+# of modes / their order varies by version. So we DISCOVER the real list once by
+# cycling a full loop (recording each mode from claude's footer, ending back at
+# the start), cache it for the session, then present it as a pick-list and drive
+# the agent to the chosen mode.
+
+mode_desc() { # short hint per known mode
+  case "$1" in
+    default)      echo "prompt for each tool" ;;
+    auto)         echo "auto mode" ;;
+    accept-edits) echo "auto-accept edits" ;;
+    plan)         echo "read-only planning" ;;
+    bypass)       echo "skip all permission prompts" ;;
+    *)            echo "" ;;
+  esac
+}
+
+msg_box() { # title line -> small centred notice box (drawn to /dev/tty)
+  local title="$1" line="$2" R C bw=46
+  read -r R C < <(tsize)
+  local bx=$(( (C - bw) / 2 )) by=$(( (R - 3) / 2 ))
+  (( bx < 0 )) && bx=0; (( by < 1 )) && by=1
+  mtop "$by" "$bx" "$bw" "$title"; mrow $(( by+1 )) "$bx" "$bw" "  $line"; mbot $(( by+2 )) "$bx" "$bw"
+}
+
+settle_read() { # pane -> the mode after a Shift+Tab has fully settled. Reads the
+  local pane="$1" a b   # steady footer (polling mid-redraw catches transient
+  sleep 1.2             # frames and skips modes — a fixed settle + confirm is
+  a=$(mode_label "$pane")            # reliable, since steady reads never flicker).
+  sleep 0.4; b=$(mode_label "$pane")
+  [ "$a" = "$b" ] || { sleep 0.6; b=$(mode_label "$pane"); }
+  printf '%s' "$b"
+}
+
+discover_modes() { # pane label -> fills global MODES (cycle order); restores agent
+  local pane="$1" label="$2" start cur i
+  MODES=()
+  start=$(mode_label "$pane"); MODES+=("$start")
+  for (( i=0; i<8; i++ )); do
+    "$FLEET_BIN" mode "$label" >/dev/null 2>&1
+    cur=$(settle_read "$pane")
+    [ "$cur" = "$start" ] && return 0     # full loop done — agent back at start
+    MODES+=("$cur")
+  done
+  return 0
+}
+
+apply_mode() { # pane label target -> Shift+Tab until claude reports target
+  local pane="$1" label="$2" target="$3" cur i
+  cur=$(mode_label "$pane")
+  for (( i=0; i<=${#MODES[@]}; i++ )); do
+    [ "$cur" = "$target" ] && return 0
+    "$FLEET_BIN" mode "$label" >/dev/null 2>&1
+    cur=$(settle_read "$pane")
+  done
+  [ "$cur" = "$target" ]
+}
+
+# pick_mode <pane> <label> -> sets global `status`. Runs in the main shell (not a
+# subshell) so the discovered MODES cache survives between presses.
+pick_mode() {
+  local pane="$1" label="$2" k r R C bw=46
+  if (( ${#MODES[@]} == 0 )); then
+    msg_box "Permission mode" "reading available modes..."
+    discover_modes "$pane" "$label"
+  fi
+  (( ${#MODES[@]} == 0 )) && { status="no modes found ($label)"; return; }
+  local cur n=${#MODES[@]} mi=0 i
+  cur=$(mode_label "$pane")
+  for (( i=0; i<n; i++ )); do [ "${MODES[i]}" = "$cur" ] && mi=$i; done
+  read -r R C < <(tsize)
+  local bx=$(( (C - bw) / 2 )) by=$(( (R - (n + 2)) / 2 ))
+  (( bx < 0 )) && bx=0; (( by < 1 )) && by=1
+  while :; do
+    mtop "$by" "$bx" "$bw" "Select permission mode"
+    for (( i=0; i<n; i++ )); do
+      local txt; txt=$(printf '%-13s %s' "${MODES[i]}" "$(mode_desc "${MODES[i]}")")
+      if (( i == mi )); then mrow $(( by+1+i )) "$bx" "$bw" "$txt" 1
+      else mrow $(( by+1+i )) "$bx" "$bw" "$txt"; fi
+    done
+    mbot $(( by+1+n )) "$bx" "$bw"
+    IFS= read -rsN1 -t 120 k </dev/tty || return
+    case "$k" in
+      $'\e') IFS= read -rsN2 -t 0.01 r </dev/tty
+        case "$r" in '[A') (( mi>0 ))&&((mi--));; '[B') (( mi<n-1 ))&&((mi++));; *) return;; esac ;;
+      k) (( mi>0 ))&&((mi--)) ;;
+      j) (( mi<n-1 ))&&((mi++)) ;;
+      $'\n'|$'\r')
+        local target="${MODES[mi]}"
+        if [ "$target" = "$cur" ]; then status="mode: $target ($label)"; return; fi
+        msg_box "Permission mode" "setting $target ..."
+        if apply_mode "$pane" "$label" "$target"; then status="mode -> $target ($label)"
+        else status="couldn't set $target ($label)"; fi
+        return ;;
+      q) return ;;
+    esac
+  done
+}
+
+# new_agent_form -> centred in-box form (same style/position as the mode popup):
+# fields are edited inline, typing goes to the active field, ↑/↓ move between
+# them, Enter on "Create" spawns. Sets global `status`; all UI on /dev/tty.
+new_agent_form() {
+  local R C bw=56 repo="" branch="" prompt="" bare="no" ai=0 note="" k r
+  local nitems=5                  # 0 Repo, 1 Branch, 2 Prompt, 3 Bare, 4 Create
+  read -r R C < <(tsize)
+  local bx=$(( (C - bw) / 2 )) by=$(( (R - 12) / 2 ))
+  (( bx < 0 )) && bx=0; (( by < 1 )) && by=1
+
+  _field() { # rowoff idx label value [placeholder] — idx<3 are editable text
+    local off="$1" idx="$2" lbl="$3" v="$4" ph="${5:-}" disp txt
+    if (( ai == idx && idx < 3 )); then disp="${v}_"          # text caret
+    elif (( ai == idx )); then disp="$v"                       # toggle, no caret
+    else disp="${v:-$ph}"; fi
+    txt=$(printf '%-8s %s' "$lbl" "$disp")
+    if (( ai == idx )); then mrow $(( by+off )) "$bx" "$bw" "$txt" 1
+    else mrow $(( by+off )) "$bx" "$bw" "$txt"; fi
+  }
+  _draw() {
+    mtop "$by" "$bx" "$bw" "New fleet agent"
+    mrow $(( by+1 )) "$bx" "$bw" ""
+    _field 2 0 "Repo"   "$repo"   "<required>"
+    _field 3 1 "Branch" "$branch" "<required>"
+    _field 4 2 "Prompt" "$prompt" "(optional)"
+    _field 5 3 "Bare"   "$bare"
+    mrow $(( by+6 )) "$bx" "$bw" ""
+    if (( ai == 4 )); then mrow $(( by+7 )) "$bx" "$bw" "[ Create agent ]" 1
+    else mrow $(( by+7 )) "$bx" "$bw" "  Create agent"; fi
+    mrow $(( by+8 )) "$bx" "$bw" ""
+    mrow $(( by+9 )) "$bx" "$bw" "${note:-type to edit . up/down move . Esc cancel}"
+    mbot $(( by+10 )) "$bx" "$bw"
+  }
+
+  while :; do
+    _draw
+    IFS= read -rsN1 -t 300 k </dev/tty || return
+    case "$k" in
+      $'\e')   # arrows, or bare Esc = cancel
+        IFS= read -rsN2 -t 0.01 r </dev/tty || r=''
+        case "$r" in
+          '[A') (( ai>0 )) && ((ai--)) ;;
+          '[B') (( ai<nitems-1 )) && ((ai++)) ;;
+          '[C'|'[D') (( ai==3 )) && { [ "$bare" = no ] && bare=yes || bare=no; } ;;
+          '') return ;;
+        esac ;;
+      $'\t') ai=$(( (ai+1) % nitems )) ;;
+      $'\n'|$'\r')
+        if (( ai == 4 )); then
+          if [ -z "$repo" ] || [ -z "$branch" ]; then note="Repo and Branch are required"
+          else
+            msg_box "New fleet agent" "creating $repo / $branch ..."
+            local args=("$repo" "$branch")
+            [ -n "$prompt" ] && args+=(-p "$prompt")
+            [ "$bare" = yes ] && args+=(--bare)
+            if "$FLEET_BIN" new "${args[@]}" >/dev/null 2>&1; then status="spawned: $repo $branch"
+            else status="spawn failed: $repo $branch"; fi
+            return
+          fi
+        else (( ai<nitems-1 )) && ((ai++)); fi ;;
+      $'\177'|$'\b')   # backspace
+        case "$ai" in 0) repo="${repo%?}";; 1) branch="${branch%?}";; 2) prompt="${prompt%?}";; esac ;;
+      ' ')
+        if (( ai==3 )); then [ "$bare" = no ] && bare=yes || bare=no
+        else case "$ai" in 0) repo+=" ";; 1) branch+=" ";; 2) prompt+=" ";; esac; fi ;;
+      *)   # any other single printable char -> append to the active text field
+        case "$k" in
+          [[:print:]]) note=""; case "$ai" in 0) repo+="$k";; 1) branch+="$k";; 2) prompt+="$k";; esac ;;
+        esac ;;
+    esac
+  done
+}
+
+# --- main loop ---------------------------------------------------------------
+clear
+while :; do
+  load_rows
+  render
+
+  key=''
+  IFS= read -rsN1 -t 2 key || { status=""; continue; }   # timeout -> refresh
+  case "$key" in
+    $'\e')  # arrow keys: ESC [ A/B
+      IFS= read -rsN2 -t 0.01 rest || rest=''
+      case "$rest" in
+        '[A') (( sel > 0 )) && ((sel--)) ;;
+        '[B') (( sel < N-1 )) && ((sel++)) ;;
+      esac ;;
+    k) (( sel > 0 )) && ((sel--)) ;;
+    j) (( sel < N-1 )) && ((sel++)) ;;
+    g) sel=0 ;;
+    G) (( N > 0 )) && sel=$((N - 1)) ;;
+    r) status="" ;;
+    $'\n'|$'\r')   # jump to selected agent's window
+      (( N == 0 )) && continue
+      tmux select-window -t "$(field "$sel" 3)" 2>/dev/null ;;
+    m)             # permission-mode pick-list for the selected agent (sets status)
+      (( N == 0 )) && continue
+      label=$(field "$sel" 2); pane=$(field "$sel" 6)
+      pick_mode "$pane" "$label"; clear ;;
+    s)             # send a message to selected agent
+      (( N == 0 )) && continue
+      label=$(field "$sel" 2)
+      msg=$(ask "send to $label> "); clear   # repaint: read -e may have scrolled
+      [ -n "$msg" ] && { "$FLEET_BIN" send "$label" "$msg" >/dev/null 2>&1 \
+        && status="sent → $label" || status="send failed → $label"; } ;;
+    n)             # spawn a new agent via the in-box form (sets status)
+      new_agent_form; clear ;;
+    *) : ;;        # ignore everything else (no q — this is the persistent pane)
+  esac
+done
