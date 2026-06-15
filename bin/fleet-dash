@@ -200,7 +200,7 @@ render() {
   # bottom border with key hints (or a transient status)
   local hint
   if [ -n "$status" ]; then hint="$status"
-  else hint="j/k move · Ent jump · m mode · s send · n new · r refresh"; fi
+  else hint="j/k move · Ent jump · m mode · s send · n new · d close · r refresh"; fi
   tput cup $(( rows - 1 )) 0 2>/dev/null
   printf '\033[2m%s\033[0m\033[K' "$(hrule '╰' '╯' "$inner" "$hint")"
   printf '\033[J'
@@ -406,6 +406,67 @@ new_agent_form() {
   done
 }
 
+# --- teardown -----------------------------------------------------------------
+agent_wt() { # dir -> 1 if it's a linked git worktree (safe to `worktree remove`)
+  local gd; gd=$(git -C "$1" rev-parse --git-dir 2>/dev/null) || { echo 0; return; }
+  case "$gd" in *"/worktrees/"*) echo 1 ;; *) echo 0 ;; esac
+}
+
+# confirm_teardown <label> <win> <pane> <dir> -> centred confirm popup; closes
+# the agent window and optionally removes its worktree. Sets global `status`.
+confirm_teardown() {
+  local label="$1" win="$2" pane="$3" dir="$4"
+  local iswt=0; [ -n "$dir" ] && iswt=$(agent_wt "$dir")
+  local opts=() acts=()
+  opts+=("Close window (keep files)");                acts+=("close")
+  if (( iswt == 1 )); then
+    opts+=("Close + remove worktree");                acts+=("remove")
+    opts+=("Close + FORCE remove (discard changes)"); acts+=("force")
+  fi
+  opts+=("Cancel");                                   acts+=("cancel")
+  local n=${#opts[@]} mi=0 k r R C bw=54
+  read -r R C < <(tsize)
+  local bx=$(( (C - bw) / 2 )) by=$(( (R - (n + 4)) / 2 ))
+  (( bx < 0 )) && bx=0; (( by < 1 )) && by=1
+  while :; do
+    mtop "$by" "$bx" "$bw" "Close agent"
+    mrow $(( by+1 )) "$bx" "$bw" "  $label"
+    mrow $(( by+2 )) "$bx" "$bw" ""
+    local i
+    for (( i=0; i<n; i++ )); do
+      if (( i == mi )); then mrow $(( by+3+i )) "$bx" "$bw" "${opts[i]}" 1
+      else mrow $(( by+3+i )) "$bx" "$bw" "${opts[i]}"; fi
+    done
+    mbot $(( by+3+n )) "$bx" "$bw"
+    IFS= read -rsN1 -t 120 k </dev/tty || return
+    case "$k" in
+      $'\e') IFS= read -rsN2 -t 0.01 r </dev/tty
+        case "$r" in '[A') (( mi>0 ))&&((mi--));; '[B') (( mi<n-1 ))&&((mi++));; *) return;; esac ;;
+      k) (( mi>0 ))&&((mi--)) ;;
+      j) (( mi<n-1 ))&&((mi++)) ;;
+      $'\n'|$'\r')
+        [ -n "$win" ] || return
+        case "${acts[mi]}" in
+          cancel) return ;;
+          close) tmux kill-window -t "$win" 2>/dev/null; status="closed $label"; return ;;
+          remove|force)
+            local force="" main
+            [ "${acts[mi]}" = force ] && force="--force"
+            # main working tree (or bare container) to run `worktree remove` from
+            main=$(git -C "$dir" worktree list --porcelain 2>/dev/null | awk '/^worktree /{print $2; exit}')
+            tmux kill-window -t "$win" 2>/dev/null
+            if git -C "${main:-$dir}" worktree remove $force "$dir" 2>/dev/null; then
+              status="removed worktree: $label"
+            else
+              status="closed; worktree kept (uncommitted? use FORCE): $label"
+            fi
+            return ;;
+        esac ;;
+      q) return ;;
+    esac
+  done
+}
+
 # --- main loop ---------------------------------------------------------------
 clear
 while :; do
@@ -441,6 +502,11 @@ while :; do
         && status="sent → $label" || status="send failed → $label"; } ;;
     n)             # spawn a new agent via the in-box form (sets status)
       new_agent_form; clear ;;
+    d)             # close/teardown the selected agent (confirm popup)
+      (( N == 0 )) && continue
+      label=$(field "$sel" 2); win=$(field "$sel" 3); pane=$(field "$sel" 6)
+      dir=$(tmux display -p -t "$pane" '#{pane_current_path}' 2>/dev/null)
+      confirm_teardown "$label" "$win" "$pane" "$dir"; clear ;;
     *) : ;;        # ignore everything else (no q — this is the persistent pane)
   esac
 done

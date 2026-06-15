@@ -31,6 +31,7 @@ fail-silent — if the daemon or any app is down, the rest keeps working.
   | `m` | open the permission-mode popup for the selected agent |
   | `s` | send a message to the selected agent |
   | `n` | open the new-agent form (Repo / Branch / Prompt / Bare fields) |
+  | `d` | close the selected agent (confirm popup: close window / remove worktree / force) |
   | `r` | refresh now |
 
   The permission-mode column and the `m` popup read the mode live from claude's
@@ -41,6 +42,11 @@ fail-silent — if the daemon or any app is down, the rest keeps working.
   started — then caches that list for the session and presents it as a pick-list
   (`j`/`k`, `Enter`). Selecting a mode drives the agent to it. Works regardless
   of how many modes that claude version has or what they're called.
+
+  `d` tears down the selected agent: a confirm popup offers *close window*
+  (keep files), *remove worktree*, or *force remove*. Removing a worktree with
+  uncommitted/untracked changes is refused unless you pick force — the agent
+  window is still closed, the worktree is kept.
 
   `fleet main --reload` restarts just the dashboard process in place (same pane,
   size, and position) — handy after editing `fleet-dash`. The orchestrator pane
