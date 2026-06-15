@@ -14,6 +14,7 @@ SESS="${1:-}"
 FLEET_BIN="$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/fleet"
 CLIP_PCT="${FLEET_TILE_CLIP:-32}"        # right-column % kept for nvim panes
 MODES=()                                  # discovered permission-mode list (cached)
+SELF_PANE="${TMUX_PANE:-}"                 # this dashboard's own tmux pane id
 
 sel=0                                     # selected row index
 status=""                                 # transient status line
@@ -141,7 +142,14 @@ render() {
   local cw=$(( inner - 2 * PAD_X ))           # usable width after horizontal pad
   (( cw < 0 )) && cw=0
   local ins; ins=$(printf '%*s' "$PAD_X" '')  # left/right inset spaces
+  local ins1; ins1=$(printf '%*s' $(( PAD_X - 1 )) '')   # inset minus the marker col
   local blank; blank=$(printf '%*s' "$inner" '')
+  # Selection marker colour reflects keyboard focus: green when this dashboard
+  # pane is the active pane of the current window (keys land here), dim grey
+  # otherwise (focus is on the orchestrator/claude pane or another window).
+  local pa; pa=$(tmux display -p -t "$SELF_PANE" '#{pane_active}#{window_active}' 2>/dev/null)
+  local markc='\033[38;5;240m'                # unfocused: dim grey
+  [ "$pa" = "11" ] && markc='\033[1;32m'      # focused: green
   # Responsive column widths: everything except label+activity is 33 cols of
   # fixed fields/separators; share the rest between label (≤30) and activity,
   # dropping activity entirely when the pane is too narrow for it.
@@ -182,8 +190,9 @@ render() {
         content=$(printf ' %b●\033[0m %b%-8s\033[0m %s \033[2m%6.6s\033[0m %b%-12.12s\033[0m ' \
           "$c" "$c" "$state" "$(fit_left "$label" "$lab_w")" "$since" "$mc" "$mode")
       fi
-      if (( i == sel )); then
-        printf '\033[2m│\033[0m\033[7m%s%b%s\033[0m\033[2m│\033[0m\033[K\n' "$ins" "$content" "$ins"
+      if (( i == sel )); then   # focus-coloured marker bar + reverse-video row
+        printf '\033[2m│\033[0m%b▌\033[0m\033[7m%s%b%s\033[0m\033[2m│\033[0m\033[K\n' \
+          "$markc" "$ins1" "$content" "$ins"
       else
         printf '\033[2m│\033[0m%s%b%s\033[2m│\033[0m\033[K\n' "$ins" "$content" "$ins"
       fi

@@ -43,6 +43,11 @@ fail-silent — if the daemon or any app is down, the rest keeps working.
   (`j`/`k`, `Enter`). Selecting a mode drives the agent to it. Works regardless
   of how many modes that claude version has or what they're called.
 
+  The selected row's left marker bar is **green when the dashboard pane has
+  keyboard focus** and dim grey when focus is on the orchestrator/claude pane
+  or another window — so you can tell at a glance whether `j/k`/`m`/… will land
+  in the dashboard (updates within the ~2s refresh).
+
   The `n` form's **Repo** and **Base** are dropdowns: `←/→` cycles or `Enter`
   opens a scrollable picker. Repo lists the project's repos; Base lists that
   repo's branches (default branch first) — the new branch is created off it
