@@ -21,13 +21,16 @@ fail-silent — if the daemon or any app is down, the rest keeps working.
   the left, an interactive **agent dashboard** on the right (`fleet-dash`),
   framed in a rounded box and redrawn in place (no flicker on refresh). One row
   per agent — state glyph · repo/branch · time-in-state · live permission mode ·
-  last activity — sorted by urgency, self-refreshing ~2s, columns adapt to pane
-  width. Drive it from the keyboard:
+  git status (`*dirty +ahead -behind` vs upstream, `ok` when clean) · last
+  activity — sorted by urgency, self-refreshing ~2s, columns adapt to pane
+  width (git status and activity drop first when narrow). Drive it from the
+  keyboard:
 
   | Key | Action |
   |---|---|
   | `j`/`k` (or ↑/↓) | move selection (`g`/`G` = first/last) |
   | `⏎` | jump to the selected agent's window |
+  | `v` | view the selected agent's `git diff HEAD` in a popup pager |
   | `m` | open the permission-mode popup for the selected agent |
   | `s` | send a message to the selected agent |
   | `n` | open the new-agent form (Repo/Base dropdowns, Branch, Prompt, Bare) |

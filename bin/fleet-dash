@@ -15,6 +15,7 @@ FLEET_BIN="$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/fleet"
 CLIP_PCT="${FLEET_TILE_CLIP:-32}"        # right-column % kept for nvim panes
 MODES=()                                  # discovered permission-mode list (cached)
 SELF_PANE="${TMUX_PANE:-}"                 # this dashboard's own tmux pane id
+declare -A GIT_RAW GIT_TS                  # per-pane git status cache (4s TTL)
 
 sel=0                                     # selected row index
 status=""                                 # transient status line
@@ -94,6 +95,43 @@ mode_color() { # mode text -> SGR (non-default modes stand out)
   esac
 }
 
+git_status() { # worktree dir -> "DIRTY AHEAD BEHIND"; empty if not a git tree
+  git -C "$1" rev-parse --is-inside-work-tree >/dev/null 2>&1 || return
+  local d a b ab
+  d=$(git -C "$1" status --porcelain 2>/dev/null | grep -c .)
+  ab=$(git -C "$1" rev-list --left-right --count '@{upstream}...HEAD' 2>/dev/null)
+  b=${ab%%[	 ]*}; a=${ab##*[	 ]}        # rev-list prints "behind<TAB>ahead"
+  printf '%s %s %s' "${d:-0}" "${a:-0}" "${b:-0}"
+}
+
+git_cached() { # pane -> "DIRTY AHEAD BEHIND", recomputed at most every 4s
+  local pane="$1" dir
+  if [ -z "${GIT_TS[$pane]:-}" ] || (( SECONDS - GIT_TS[$pane] > 4 )); then
+    dir=$(tmux display -p -t "$pane" '#{pane_current_path}' 2>/dev/null)
+    GIT_RAW[$pane]=$(git_status "$dir"); GIT_TS[$pane]=$SECONDS
+  fi
+  printf '%s' "${GIT_RAW[$pane]}"
+}
+
+gitfmt() { # "D A B" -> compact ASCII (≤8 cols): *dirty +ahead -behind, or ok/-
+  [ -n "$1" ] || { printf -- '-'; return; }
+  local d a b s=""; read -r d a b <<<"$1"
+  (( ${d:-0} > 0 )) && s+="*$d "
+  (( ${a:-0} > 0 )) && s+="+$a "
+  (( ${b:-0} > 0 )) && s+="-$b "
+  [ -z "$s" ] && s="ok"
+  printf '%.8s' "$s"
+}
+
+gitcolor() { # "D A B" -> SGR (behind=red, dirty=yellow, ahead=cyan, clean=green)
+  [ -n "$1" ] || { printf '\033[90m'; return; }
+  local d a b; read -r d a b <<<"$1"
+  if   (( ${b:-0} > 0 )); then printf '\033[31m'
+  elif (( ${d:-0} > 0 )); then printf '\033[33m'
+  elif (( ${a:-0} > 0 )); then printf '\033[36m'
+  else printf '\033[32m'; fi
+}
+
 # --- data --------------------------------------------------------------------
 # ROWS[] entries: state \t label \t window_id \t window_name \t since \t pane_id
 load_rows() {
@@ -155,14 +193,20 @@ render() {
   local pa; pa=$(tmux display -p -t "$SELF_PANE" '#{pane_active}#{window_active}' 2>/dev/null)
   local markc='\033[38;5;240m'                # unfocused: dim grey
   [ "$pa" = "11" ] && markc='\033[1;32m'      # focused: green
-  # Responsive column widths: everything except label+activity is 33 cols of
-  # fixed fields/separators; share the rest between label (≤30) and activity,
-  # dropping activity entirely when the pane is too narrow for it.
-  local budget=$(( cw - 33 )); (( budget < 0 )) && budget=0
-  local lab_w act_w
-  if   (( budget >= 56 )); then lab_w=30; act_w=$(( budget - 30 ))
-  elif (( budget >= 31 )); then lab_w=26; act_w=$(( budget - 26 ))
-  else lab_w=$budget; act_w=0; fi             # narrow: label only, no activity
+  # Responsive column widths: 32 fixed cols (glyph/state/since/mode + separators)
+  # + label + an optional git column (9) + the remaining width for last-activity.
+  # Activity drops first when narrow, then the git column.
+  local budget=$(( cw - 32 )); (( budget < 0 )) && budget=0
+  local GITW=9 lab_w act_w git_on=1
+  if   (( budget >= 49 )); then lab_w=30
+  elif (( budget >= 41 )); then lab_w=26
+  elif (( budget >= 30 )); then lab_w=20
+  else git_on=0; lab_w=$budget; fi            # too narrow for git → label only
+  (( git_on )) || GITW=0
+  local actblock=$(( budget - lab_w - GITW ))
+  if (( actblock >= 2 )); then act_w=$(( actblock - 1 ))
+  else act_w=0; lab_w=$(( budget - GITW )); fi
+  (( lab_w < 0 )) && { lab_w=$budget; GITW=0; git_on=0; }
   tput cup 0 0 2>/dev/null
 
   # top border with title. Keep label text to width-1 glyphs only (box-drawing
@@ -180,20 +224,22 @@ render() {
     (( drawn < slots )) && { printf '\033[2m│\033[0m%s%-*s%s\033[2m│\033[0m\033[K\n' \
       "$ins" "$cw" "no agents yet — press n to spawn one" "$ins"; (( drawn++ )); }
   else
-    local state label since pane c act mode mc content
+    local state label since pane c act mode mc content g
     for (( i=0; i<N && drawn<slots; i++ )); do
       state=$(field "$i" 1); label=$(field "$i" 2)
       since=$(field "$i" 5); pane=$(field "$i" 6)
       c=$(glyph_color "$state")
       mode=$(mode_label "$pane"); mc=$(mode_color "$mode")
-      # content display width = cw exactly (lab_w + act_w + 32 fixed cols)
+      # content display width = cw exactly (32 fixed + lab_w + git + activity)
+      content=$(printf ' %b●\033[0m %b%-8s\033[0m %s \033[2m%6.6s\033[0m %b%-12.12s\033[0m' \
+        "$c" "$c" "$state" "$(fit_left "$label" "$lab_w")" "$since" "$mc" "$mode")
+      if (( git_on )); then
+        g=$(git_cached "$pane")
+        content+=$(printf ' %b%-8.8s\033[0m' "$(gitcolor "$g")" "$(gitfmt "$g")")
+      fi
       if (( act_w > 0 )); then
         act=$(last_line "$pane"); act=${act:0:act_w}
-        content=$(printf ' %b●\033[0m %b%-8s\033[0m %s \033[2m%6.6s\033[0m %b%-12.12s\033[0m \033[2m%-*.*s\033[0m' \
-          "$c" "$c" "$state" "$(fit_left "$label" "$lab_w")" "$since" "$mc" "$mode" "$act_w" "$act_w" "$act")
-      else
-        content=$(printf ' %b●\033[0m %b%-8s\033[0m %s \033[2m%6.6s\033[0m %b%-12.12s\033[0m ' \
-          "$c" "$c" "$state" "$(fit_left "$label" "$lab_w")" "$since" "$mc" "$mode")
+        content+=$(printf ' \033[2m%-*.*s\033[0m' "$act_w" "$act_w" "$act")
       fi
       if (( i == sel )); then   # focus-coloured marker bar + reverse-video row
         printf '\033[2m│\033[0m%b▌\033[0m\033[7m%s%b%s\033[0m\033[2m│\033[0m\033[K\n' \
@@ -214,7 +260,7 @@ render() {
   # bottom border with key hints (or a transient status)
   local hint
   if [ -n "$status" ]; then hint="$status"
-  else hint="j/k move · Ent jump · m mode · s send · n new · d close · r refresh"; fi
+  else hint="j/k move · Ent jump · v diff · m mode · s send · n new · d close · r"; fi
   tput cup $(( rows - 1 )) 0 2>/dev/null
   printf '\033[2m%s\033[0m\033[K' "$(hrule '╰' '╯' "$inner" "$hint")"
   printf '\033[J'
@@ -547,6 +593,16 @@ confirm_teardown() {
   done
 }
 
+# view_diff <dir> <label> -> show the agent's `git diff HEAD` in a popup pager
+# (delta if available, else less). Blocks until the user quits the pager.
+view_diff() {
+  local dir="$1" label="$2" pager="less -R" q
+  command -v delta >/dev/null 2>&1 && pager="delta"
+  q=$(printf '%q' "$dir")
+  local cmd="d=\$(git -C $q -c color.ui=always diff HEAD 2>/dev/null); if [ -n \"\$d\" ]; then printf '%s\\n' \"\$d\" | $pager; else printf 'working tree clean vs HEAD\\n'; sleep 1.2; fi"
+  tmux display-popup -E -b rounded -w 90% -h 90% -T " diff · $label " "$cmd" 2>/dev/null
+}
+
 # --- main loop ---------------------------------------------------------------
 clear
 while :; do
@@ -587,6 +643,11 @@ while :; do
       label=$(field "$sel" 2); win=$(field "$sel" 3); pane=$(field "$sel" 6)
       dir=$(tmux display -p -t "$pane" '#{pane_current_path}' 2>/dev/null)
       confirm_teardown "$label" "$win" "$pane" "$dir"; clear ;;
+    v)             # view the selected agent's git diff in a popup pager
+      (( N == 0 )) && continue
+      label=$(field "$sel" 2); pane=$(field "$sel" 6)
+      dir=$(tmux display -p -t "$pane" '#{pane_current_path}' 2>/dev/null)
+      view_diff "$dir" "$label"; clear ;;
     *) : ;;        # ignore everything else (no q — this is the persistent pane)
   esac
 done
