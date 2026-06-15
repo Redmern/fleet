@@ -259,24 +259,25 @@ msg_box() { # title line -> small centred notice box (drawn to /dev/tty)
   mtop "$by" "$bx" "$bw" "$title"; mrow $(( by+1 )) "$bx" "$bw" "  $line"; mbot $(( by+2 )) "$bx" "$bw"
 }
 
-settle_read() { # pane -> the mode after a Shift+Tab has fully settled. Reads the
-  local pane="$1" a b   # steady footer (polling mid-redraw catches transient
-  sleep 1.2             # frames and skips modes — a fixed settle + confirm is
-  a=$(mode_label "$pane")            # reliable, since steady reads never flicker).
-  sleep 0.4; b=$(mode_label "$pane")
-  [ "$a" = "$b" ] || { sleep 0.6; b=$(mode_label "$pane"); }
-  printf '%s' "$b"
+settle_read() { # pane prev -> the mode once it has changed from prev AND is
+  local pane="$1" prev="$2" cur last="__init__" i   # stable (seen twice). The
+  for (( i=0; i<25; i++ )); do          # footer settles in ~100ms, so this polls
+    sleep 0.1; cur=$(mode_label "$pane")   # fast and returns in ~0.2-0.3s; the
+    [ "$cur" != "$prev" ] && [ "$cur" = "$last" ] && { printf '%s' "$cur"; return; }
+    last="$cur"                         # stability check ignores transient frames.
+  done
+  printf '%s' "$cur"                    # gave up (~2.5s) — return latest
 }
 
 discover_modes() { # pane label -> fills global MODES (cycle order); restores agent
-  local pane="$1" label="$2" start cur i
+  local pane="$1" label="$2" start cur prev i
   MODES=()
-  start=$(mode_label "$pane"); MODES+=("$start")
+  start=$(mode_label "$pane"); MODES+=("$start"); prev="$start"
   for (( i=0; i<8; i++ )); do
     "$FLEET_BIN" mode "$label" >/dev/null 2>&1
-    cur=$(settle_read "$pane")
+    cur=$(settle_read "$pane" "$prev")
     [ "$cur" = "$start" ] && return 0     # full loop done — agent back at start
-    MODES+=("$cur")
+    MODES+=("$cur"); prev="$cur"
   done
   return 0
 }
@@ -287,7 +288,7 @@ apply_mode() { # pane label target -> Shift+Tab until claude reports target
   for (( i=0; i<=${#MODES[@]}; i++ )); do
     [ "$cur" = "$target" ] && return 0
     "$FLEET_BIN" mode "$label" >/dev/null 2>&1
-    cur=$(settle_read "$pane")
+    cur=$(settle_read "$pane" "$cur")
   done
   [ "$cur" = "$target" ]
 }
@@ -333,20 +334,72 @@ pick_mode() {
   done
 }
 
-# new_agent_form -> centred in-box form (same style/position as the mode popup):
-# fields are edited inline, typing goes to the active field, ↑/↓ move between
-# them, Enter on "Create" spawns. Sets global `status`; all UI on /dev/tty.
-new_agent_form() {
-  local R C bw=56 repo="" branch="" prompt="" bare="no" ai=0 note="" k r
-  local nitems=5                  # 0 Repo, 1 Branch, 2 Prompt, 3 Bare, 4 Create
+# list_pick <title> <cur-index> <item>... -> echoes the chosen index (or cur on
+# cancel). Centred scrollable popup — used for the Repo/Base dropdowns.
+list_pick() {
+  local title="$1" cur="$2"; shift 2
+  local items=("$@") n=${#items[@]}
+  (( n == 0 )) && { echo "$cur"; return; }
+  local mi="$cur"; (( mi<0 || mi>=n )) && mi=0
+  local k r R C bw=50
   read -r R C < <(tsize)
-  local bx=$(( (C - bw) / 2 )) by=$(( (R - 12) / 2 ))
+  local maxv=$(( R - 6 )); (( maxv > n )) && maxv=$n; (( maxv < 3 )) && maxv=3
+  local bx=$(( (C - bw) / 2 )) by=$(( (R - (maxv + 2)) / 2 )) vs=0
+  (( bx < 0 )) && bx=0; (( by < 1 )) && by=1
+  printf '\033[2J\033[H' >/dev/tty          # clean backdrop (not stdout — that's the result)
+  while :; do
+    (( mi < vs )) && vs=$mi
+    (( mi >= vs + maxv )) && vs=$(( mi - maxv + 1 ))
+    mtop "$by" "$bx" "$bw" "$title"
+    local i row=0
+    for (( i=vs; i<vs+maxv && i<n; i++ )); do
+      if (( i == mi )); then mrow $(( by+1+row )) "$bx" "$bw" "${items[i]}" 1
+      else mrow $(( by+1+row )) "$bx" "$bw" "${items[i]}"; fi
+      ((row++))
+    done
+    while (( row < maxv )); do mrow $(( by+1+row )) "$bx" "$bw" ""; ((row++)); done
+    mbot $(( by+1+maxv )) "$bx" "$bw"
+    IFS= read -rsN1 -t 120 k </dev/tty || { echo "$cur"; return; }
+    case "$k" in
+      $'\e') IFS= read -rsN2 -t 0.01 r </dev/tty
+        case "$r" in '[A') (( mi>0 ))&&((mi--));; '[B') (( mi<n-1 ))&&((mi++));; *) echo "$cur"; return;; esac ;;
+      k) (( mi>0 ))&&((mi--)) ;;
+      j) (( mi<n-1 ))&&((mi++)) ;;
+      $'\n'|$'\r') echo "$mi"; return ;;
+      q) echo "$cur"; return ;;
+    esac
+  done
+}
+
+# new_agent_form -> centred in-box form (same style/position as the mode popup).
+# Repo and Base are dropdowns (←/→ cycles, Enter opens a scrollable picker);
+# Branch/Prompt are text; Bare toggles. Sets global `status`.
+new_agent_form() {
+  local R C bw=58 branch="" prompt="" bare="no" ai=0 note="" k r x s
+  local nitems=6                  # 0 Repo,1 Branch,2 Base,3 Prompt,4 Bare,5 Create
+  read -r R C < <(tsize)
+  local REPOS=() ri=0
+  while IFS= read -r x; do [ -n "$x" ] && REPOS+=("$x"); done < <("$FLEET_BIN" repos 2>/dev/null)
+  (( ${#REPOS[@]} == 0 )) && { status="no repos found under the project root"; return; }
+  local repo="${REPOS[0]}"
+  local BRANCHES=() bi=0
+  _load_branches() {
+    BRANCHES=(); bi=0
+    while IFS= read -r x; do [ -n "$x" ] && BRANCHES+=("$x"); done < <("$FLEET_BIN" branches "$repo" 2>/dev/null)
+  }
+  _load_branches
+  local bx=$(( (C - bw) / 2 )) by=$(( (R - 13) / 2 ))
   (( bx < 0 )) && bx=0; (( by < 1 )) && by=1
 
-  _field() { # rowoff idx label value [placeholder] — idx<3 are editable text
-    local off="$1" idx="$2" lbl="$3" v="$4" ph="${5:-}" disp txt
-    if (( ai == idx && idx < 3 )); then disp="${v}_"          # text caret
-    elif (( ai == idx )); then disp="$v"                       # toggle, no caret
+  _base() { (( ${#BRANCHES[@]} )) && printf '%s' "${BRANCHES[bi]}" || printf '(default)'; }
+  _field() { # off idx label value type [placeholder]
+    local off="$1" idx="$2" lbl="$3" v="$4" ty="$5" ph="${6:-}" disp txt
+    if (( ai == idx )); then
+      case "$ty" in
+        text)   disp="${v}_" ;;
+        select) disp="< ${v:-$ph} >" ;;
+        *)      disp="$v" ;;
+      esac
     else disp="${v:-$ph}"; fi
     txt=$(printf '%-8s %s' "$lbl" "$disp")
     if (( ai == idx )); then mrow $(( by+off )) "$bx" "$bw" "$txt" 1
@@ -355,53 +408,66 @@ new_agent_form() {
   _draw() {
     mtop "$by" "$bx" "$bw" "New fleet agent"
     mrow $(( by+1 )) "$bx" "$bw" ""
-    _field 2 0 "Repo"   "$repo"   "<required>"
-    _field 3 1 "Branch" "$branch" "<required>"
-    _field 4 2 "Prompt" "$prompt" "(optional)"
-    _field 5 3 "Bare"   "$bare"
-    mrow $(( by+6 )) "$bx" "$bw" ""
-    if (( ai == 4 )); then mrow $(( by+7 )) "$bx" "$bw" "[ Create agent ]" 1
-    else mrow $(( by+7 )) "$bx" "$bw" "  Create agent"; fi
-    mrow $(( by+8 )) "$bx" "$bw" ""
-    mrow $(( by+9 )) "$bx" "$bw" "${note:-type to edit . up/down move . Esc cancel}"
-    mbot $(( by+10 )) "$bx" "$bw"
+    _field 2 0 "Repo"   "$repo"    select
+    _field 3 1 "Branch" "$branch"  text "<new branch>"
+    _field 4 2 "Base"   "$(_base)" select
+    _field 5 3 "Prompt" "$prompt"  text "(optional)"
+    _field 6 4 "Bare"   "$bare"    toggle
+    mrow $(( by+7 )) "$bx" "$bw" ""
+    if (( ai == 5 )); then mrow $(( by+8 )) "$bx" "$bw" "[ Create agent ]" 1
+    else mrow $(( by+8 )) "$bx" "$bw" "  Create agent"; fi
+    mrow $(( by+9 )) "$bx" "$bw" ""
+    mrow $(( by+10 )) "$bx" "$bw" "${note:-up/down move . type or <> edit . Enter=list . Esc}"
+    mbot $(( by+11 )) "$bx" "$bw"
   }
 
   while :; do
     _draw
     IFS= read -rsN1 -t 300 k </dev/tty || return
     case "$k" in
-      $'\e')   # arrows, or bare Esc = cancel
+      $'\e')
         IFS= read -rsN2 -t 0.01 r </dev/tty || r=''
         case "$r" in
           '[A') (( ai>0 )) && ((ai--)) ;;
           '[B') (( ai<nitems-1 )) && ((ai++)) ;;
-          '[C'|'[D') (( ai==3 )) && { [ "$bare" = no ] && bare=yes || bare=no; } ;;
+          '[C') case "$ai" in   # right: cycle selects / toggle
+                  0) ri=$(( (ri+1) % ${#REPOS[@]} )); repo="${REPOS[ri]}"; _load_branches ;;
+                  2) (( ${#BRANCHES[@]} )) && bi=$(( (bi+1) % ${#BRANCHES[@]} )) ;;
+                  4) [ "$bare" = no ] && bare=yes || bare=no ;;
+                esac ;;
+          '[D') case "$ai" in   # left
+                  0) ri=$(( (ri-1+${#REPOS[@]}) % ${#REPOS[@]} )); repo="${REPOS[ri]}"; _load_branches ;;
+                  2) (( ${#BRANCHES[@]} )) && bi=$(( (bi-1+${#BRANCHES[@]}) % ${#BRANCHES[@]} )) ;;
+                  4) [ "$bare" = no ] && bare=yes || bare=no ;;
+                esac ;;
           '') return ;;
         esac ;;
       $'\t') ai=$(( (ai+1) % nitems )) ;;
       $'\n'|$'\r')
-        if (( ai == 4 )); then
-          if [ -z "$repo" ] || [ -z "$branch" ]; then note="Repo and Branch are required"
-          else
-            msg_box "New fleet agent" "creating $repo / $branch ..."
-            local args=("$repo" "$branch")
-            [ -n "$prompt" ] && args+=(-p "$prompt")
-            [ "$bare" = yes ] && args+=(--bare)
-            if "$FLEET_BIN" new "${args[@]}" >/dev/null 2>&1; then status="spawned: $repo $branch"
-            else status="spawn failed: $repo $branch"; fi
-            return
-          fi
-        else (( ai<nitems-1 )) && ((ai++)); fi ;;
-      $'\177'|$'\b')   # backspace
-        case "$ai" in 0) repo="${repo%?}";; 1) branch="${branch%?}";; 2) prompt="${prompt%?}";; esac ;;
-      ' ')
-        if (( ai==3 )); then [ "$bare" = no ] && bare=yes || bare=no
-        else case "$ai" in 0) repo+=" ";; 1) branch+=" ";; 2) prompt+=" ";; esac; fi ;;
-      *)   # any other single printable char -> append to the active text field
-        case "$k" in
-          [[:print:]]) note=""; case "$ai" in 0) repo+="$k";; 1) branch+="$k";; 2) prompt+="$k";; esac ;;
+        case "$ai" in
+          0) s=$(list_pick "Select repo" "$ri" "${REPOS[@]}"); clear
+             [ -n "$s" ] && { ri="$s"; repo="${REPOS[ri]}"; _load_branches; } ;;
+          2) if (( ${#BRANCHES[@]} )); then s=$(list_pick "Branch off of" "$bi" "${BRANCHES[@]}"); clear
+               [ -n "$s" ] && bi="$s"; fi ;;
+          5) if [ -z "$branch" ]; then note="Branch name is required"
+             else
+               msg_box "New fleet agent" "creating $repo / $branch ..."
+               local args=("$repo" "$branch")
+               [ -n "$prompt" ] && args+=(-p "$prompt")
+               [ "$bare" = yes ] && args+=(--bare)
+               (( ${#BRANCHES[@]} )) && args+=(--base "${BRANCHES[bi]}")
+               if "$FLEET_BIN" new "${args[@]}" >/dev/null 2>&1; then status="spawned: $repo $branch"
+               else status="spawn failed: $repo $branch"; fi
+               return
+             fi ;;
+          *) (( ai<nitems-1 )) && ((ai++)) ;;   # text fields: Enter = next
         esac ;;
+      $'\177'|$'\b')
+        case "$ai" in 1) branch="${branch%?}";; 3) prompt="${prompt%?}";; esac ;;
+      ' ')
+        case "$ai" in 4) [ "$bare" = no ] && bare=yes || bare=no ;; 1) branch+=" ";; 3) prompt+=" ";; esac ;;
+      *)
+        case "$k" in [[:print:]]) note=""; case "$ai" in 1) branch+="$k";; 3) prompt+="$k";; esac ;; esac ;;
     esac
   done
 }

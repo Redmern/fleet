@@ -139,6 +139,35 @@ cmd_pick() {
   tmux select-window -t "$win" 2>/dev/null
 }
 
+# ---- repos / branches (used by the dashboard new-agent form) ------------------
+
+cmd_repos() { # list discoverable repo names under the project root
+  local root; root=$(fleet_root) || die "not inside tmux"
+  discover_repos "$root" | cut -f1 | awk 'NF && !seen[$0]++'
+}
+
+repo_anchor() { # repo_base -> a dir git can run in (the repo, bare container, or a worktree)
+  local repo_base="$1" is_bare sub
+  is_bare=$(git -C "$repo_base" rev-parse --is-bare-repository 2>/dev/null)
+  if [ -e "$repo_base/.git" ] && [ "$is_bare" != "true" ]; then echo "$repo_base"; return 0; fi
+  [ "$is_bare" = "true" ] && { echo "$repo_base"; return 0; }
+  for sub in "$repo_base"/*/; do [ -e "${sub%/}/.git" ] && { echo "${sub%/}"; return 0; }; done
+  return 1
+}
+
+cmd_branches() { # list candidate base branches for <repo>, default branch first
+  local repo="${1:-}"; [ -n "$repo" ] || die "usage: fleet branches <repo>"
+  local root; root=$(fleet_root) || die "not inside tmux"
+  local repo_base; repo_base=$(resolve_repo "$root" "$repo") || die "repo '$repo' not found under $root"
+  local anchor; anchor=$(repo_anchor "$repo_base") || return 0
+  local def; def=$(git -C "$anchor" symbolic-ref --short refs/remotes/origin/HEAD 2>/dev/null | sed 's|^origin/||')
+  {
+    [ -n "$def" ] && echo "$def"
+    git -C "$anchor" for-each-ref --format='%(refname:short)' refs/remotes/origin 2>/dev/null | sed 's|^origin/||'
+    git -C "$anchor" for-each-ref --format='%(refname:short)' refs/heads 2>/dev/null
+  } | grep -vxE 'HEAD|origin' | awk 'NF && !seen[$0]++'
+}
+
 # ---- new ----------------------------------------------------------------------
 
 cmd_new() {
@@ -590,6 +619,8 @@ case "${1:-}" in
   new)     shift; cmd_new "$@" ;;
   ls)      shift; cmd_ls "$@" ;;
   agents)  shift; agents_tsv "$@" ;;   # raw TSV, consumed by fleet-dash
+  repos)    shift; cmd_repos "$@" ;;     # repo names, for the new-agent form
+  branches) shift; cmd_branches "$@" ;;  # base branches for a repo
   pick)    shift; cmd_pick "$@" ;;
   send)    shift; cmd_send "$@" ;;
   mode)    shift; cmd_mode "$@" ;;
