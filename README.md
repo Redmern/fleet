@@ -24,12 +24,12 @@ fail-silent — if the daemon or any app is down, the rest keeps working.
 - **Command center** — `fleet main`: orchestrator claude at the project root on
   the left, an interactive **agent dashboard** on the right (`fleet-dash`),
   framed in a rounded box and redrawn in place (no flicker on refresh). One row
-  per agent — state glyph · repo/branch · time-in-state · live permission mode ·
-  git status (`*dirty +ahead -behind` vs upstream, `ok` when clean) · last
-  activity — sorted by urgency, self-refreshing every 1s (set
-  `FLEET_DASH_REFRESH`), columns adapt to pane
-  width (git status and activity drop first when narrow). Drive it from the
-  keyboard:
+  per agent, as rounded pills (omarchy-style): **state · repo/branch · git
+  status · permission mode**. Git status is `*dirty +ahead -behind` vs upstream
+  (`ok` when clean), pills are coloured by severity. Sorted by urgency,
+  self-refreshing every 1s (set `FLEET_DASH_REFRESH`); the label flexes and
+  pills drop right-to-left when the pane is narrow. Pills use Nerd Font caps.
+  Drive it from the keyboard:
 
   | Key | Action |
   |---|---|

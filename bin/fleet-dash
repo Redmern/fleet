@@ -133,6 +133,26 @@ gitcolor() { # "D A B" -> SGR (behind=red, dirty=yellow, ahead=cyan, clean=green
   else printf '\033[32m'; fi
 }
 
+# --- pills (rounded nerd-font capsules, like the omarchy status bar) -----------
+PILL_L=$''   # left semicircle (Nerd Font / powerline-extra)
+PILL_R=$''   # right semicircle
+pill() { # text color256 -> rounded pill; display width = len(text) + 4
+  local t="$1" c="$2" tf=0
+  [ "$c" = 8 ] && tf=15                       # white text on the grey pill
+  printf '\033[38;5;%s;49m%s\033[48;5;%s;38;5;%sm %s \033[49;38;5;%sm%s\033[0m' \
+    "$c" "$PILL_L" "$c" "$tf" "$t" "$c" "$PILL_R"
+}
+state_pcol() { case "$1" in blocked) echo 1;; working) echo 4;; idle) echo 2;; *) echo 8;; esac; }
+mode_pcol()  { case "$1" in *bypass*) echo 1;; *plan*) echo 3;; *accept*|*edit*|*auto*) echo 6;; *) echo 8;; esac; }
+git_pcol()   { # "D A B" -> pill colour
+  [ -n "$1" ] || { echo 8; return; }
+  local d a b; read -r d a b <<<"$1"
+  if   (( ${b:-0} > 0 )); then echo 1
+  elif (( ${d:-0} > 0 )); then echo 3
+  elif (( ${a:-0} > 0 )); then echo 6
+  else echo 2; fi
+}
+
 # --- data --------------------------------------------------------------------
 # ROWS[] entries: state \t label \t window_id \t window_name \t since \t pane_id
 load_rows() {
@@ -181,7 +201,9 @@ PAD_Y=1          # blank rows of inset below the top border / above the bottom
 
 render() {
   local cols rows; cols=$(tput cols); rows=$(tput lines)
-  local inner=$(( cols - 2 ))                 # columns between the │ │ rails
+  # leave the pane's last column empty: writing a full-width last line scrolls
+  # on auto-wrap terminals. cols-3 keeps the right rail one column in.
+  local inner=$(( cols - 3 ))                 # columns between the │ │ rails
   local slots=$(( rows - 2 ))                 # content rows between the borders
   local cw=$(( inner - 2 * PAD_X ))           # usable width after horizontal pad
   (( cw < 0 )) && cw=0
@@ -194,20 +216,6 @@ render() {
   local pa; pa=$(tmux display -p -t "$SELF_PANE" '#{pane_active}#{window_active}' 2>/dev/null)
   local markc='\033[38;5;240m'                # unfocused: dim grey
   [ "$pa" = "11" ] && markc='\033[1;32m'      # focused: green
-  # Responsive column widths: 32 fixed cols (glyph/state/since/mode + separators)
-  # + label + an optional git column (9) + the remaining width for last-activity.
-  # Activity drops first when narrow, then the git column.
-  local budget=$(( cw - 32 )); (( budget < 0 )) && budget=0
-  local GITW=9 lab_w act_w git_on=1
-  if   (( budget >= 49 )); then lab_w=30
-  elif (( budget >= 41 )); then lab_w=26
-  elif (( budget >= 30 )); then lab_w=20
-  else git_on=0; lab_w=$budget; fi            # too narrow for git → label only
-  (( git_on )) || GITW=0
-  local actblock=$(( budget - lab_w - GITW ))
-  if (( actblock >= 2 )); then act_w=$(( actblock - 1 ))
-  else act_w=0; lab_w=$(( budget - GITW )); fi
-  (( lab_w < 0 )) && { lab_w=$budget; GITW=0; git_on=0; }
   tput cup 0 0 2>/dev/null
 
   # top border with title. Keep label text to width-1 glyphs only (box-drawing
@@ -225,25 +233,27 @@ render() {
     (( drawn < slots )) && { printf '\033[2m│\033[0m%s%-*s%s\033[2m│\033[0m\033[K\n' \
       "$ins" "$cw" "no agents yet — press n to spawn one" "$ins"; (( drawn++ )); }
   else
-    local state label since pane c act mode mc content g
+    # Row: <state pill>  repo/branch  <git pill>  <mode pill>. The label is the
+    # flexible filler; pills (rounded capsules) have width len(text)+4. Content
+    # width is kept exactly = cw so the right rail stays aligned.
+    local state label pane mode g gt content lblsgr sw gw mw LW git_show mode_show
     for (( i=0; i<N && drawn<slots; i++ )); do
-      state=$(field "$i" 1); label=$(field "$i" 2)
-      since=$(field "$i" 5); pane=$(field "$i" 6)
-      c=$(glyph_color "$state")
-      mode=$(mode_label "$pane"); mc=$(mode_color "$mode")
-      # content display width = cw exactly (32 fixed + lab_w + git + activity)
-      content=$(printf ' %b●\033[0m %b%-8s\033[0m %s \033[2m%6.6s\033[0m %b%-12.12s\033[0m' \
-        "$c" "$c" "$state" "$(fit_left "$label" "$lab_w")" "$since" "$mc" "$mode")
-      if (( git_on )); then
-        g=$(git_cached "$pane")
-        content+=$(printf ' %b%-8.8s\033[0m' "$(gitcolor "$g")" "$(gitfmt "$g")")
-      fi
-      if (( act_w > 0 )); then
-        act=$(last_line "$pane"); act=${act:0:act_w}
-        content+=$(printf ' \033[2m%-*.*s\033[0m' "$act_w" "$act_w" "$act")
-      fi
-      if (( i == sel )); then   # focus-coloured marker bar + reverse-video row
-        printf '\033[2m│\033[0m%b▌\033[0m\033[7m%s%b%s\033[0m\033[2m│\033[0m\033[K\n' \
+      state=$(field "$i" 1); label=$(field "$i" 2); pane=$(field "$i" 6)
+      g=$(git_cached "$pane"); gt=$(gitfmt "$g")
+      mode=$(mode_label "$pane")
+      sw=$(( ${#state} + 4 )); gw=$(( ${#gt} + 4 )); mw=$(( ${#mode} + 4 ))
+      git_show=1; mode_show=1
+      LW=$(( cw - sw - gw - mw - 3 ))          # 3 separators
+      (( LW < 1 )) && { mode_show=0; LW=$(( cw - sw - gw - 2 )); }
+      (( LW < 1 )) && { git_show=0; LW=$(( cw - sw - 1 )); }
+      (( LW < 0 )) && LW=0
+      (( i == sel )) && lblsgr='\033[1m' || lblsgr='\033[2m'
+      content=$(pill "$state" "$(state_pcol "$state")")
+      content+=$(printf " ${lblsgr}%b\033[22m" "$(fit_left "$label" "$LW")")
+      (( git_show )) && content+=" $(pill "$gt" "$(git_pcol "$g")")"
+      (( mode_show )) && content+=" $(pill "$mode" "$(mode_pcol "$mode")")"
+      if (( i == sel )); then   # focus-coloured marker bar marks the selection
+        printf '\033[2m│\033[0m%b▌\033[0m%s%b%s\033[2m│\033[0m\033[K\n' \
           "$markc" "$ins1" "$content" "$ins"
       else
         printf '\033[2m│\033[0m%s%b%s\033[2m│\033[0m\033[K\n' "$ins" "$content" "$ins"
@@ -264,7 +274,6 @@ render() {
   else hint="j/k move · Ent jump · v diff · m mode · s send · n new · d close · r"; fi
   tput cup $(( rows - 1 )) 0 2>/dev/null
   printf '\033[2m%s\033[0m\033[K' "$(hrule '╰' '╯' "$inner" "$hint")"
-  printf '\033[J'
 }
 
 # read one line from the user at the bottom, cursor shown
