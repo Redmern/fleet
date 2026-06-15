@@ -137,6 +137,7 @@ gitcolor() { # "D A B" -> SGR (behind=red, dirty=yellow, ahead=cyan, clean=green
 PILL_L=$''   # left semicircle (Nerd Font / powerline-extra)
 PILL_R=$''   # right semicircle
 PILL_W=7      # fixed inner text width — every pill is the same size
+PILL_GAP=3    # spaces between row items (state · label · git · mode)
 
 pill_center() { # text -> centred/truncated to exactly PILL_W chars
   local t="$1" len=${#1} pad l
@@ -247,23 +248,25 @@ render() {
     # Row: <state pill>  repo/branch  <git pill>  <mode pill>. The label is the
     # flexible filler; pills (rounded capsules) have width len(text)+4. Content
     # width is kept exactly = cw so the right rail stays aligned.
-    # every pill is the same display width (PW); the label is the flexible filler
-    local PW=$(( PILL_W + 4 ))
+    # every pill is the same display width (PW); the label is the flexible filler.
+    # PILL_GAP-wide gaps separate the items.
+    local PW=$(( PILL_W + 4 )) G=$PILL_GAP
+    local gap; gap=$(printf '%*s' "$G" '')
     local state label pane mode g gt content lblsgr LW git_show mode_show
     for (( i=0; i<N && drawn<slots; i++ )); do
       state=$(field "$i" 1); label=$(field "$i" 2); pane=$(field "$i" 6)
       g=$(git_cached "$pane"); gt=$(gitfmt "$g")
       mode=$(mode_label "$pane")
       git_show=1; mode_show=1
-      LW=$(( cw - 3*PW - 3 ))                   # 3 pills + 3 separators
-      (( LW < 1 )) && { mode_show=0; LW=$(( cw - 2*PW - 2 )); }
-      (( LW < 1 )) && { git_show=0; LW=$(( cw - PW - 1 )); }
+      LW=$(( cw - 3*PW - 3*G ))                  # 3 pills + 3 gaps
+      (( LW < 1 )) && { mode_show=0; LW=$(( cw - 2*PW - 2*G )); }
+      (( LW < 1 )) && { git_show=0; LW=$(( cw - PW - G )); }
       (( LW < 0 )) && LW=0
       (( i == sel )) && lblsgr='\033[1m' || lblsgr='\033[2m'
       content=$(pill "$state" "$(state_pcol "$state")")
-      content+=$(printf " ${lblsgr}%b\033[22m" "$(fit_left "$label" "$LW")")
-      (( git_show )) && content+=" $(pill "$gt" "$(git_pcol "$g")")"
-      (( mode_show )) && content+=" $(pill "$(mode_short "$mode")" "$(mode_pcol "$mode")")"
+      content+=$(printf "%s${lblsgr}%b\033[22m" "$gap" "$(fit_left "$label" "$LW")")
+      (( git_show )) && content+="$gap$(pill "$gt" "$(git_pcol "$g")")"
+      (( mode_show )) && content+="$gap$(pill "$(mode_short "$mode")" "$(mode_pcol "$mode")")"
       if (( i == sel )); then   # focus-coloured marker bar marks the selection
         printf '\033[2m│\033[0m%b▌\033[0m%s%b%s\033[2m│\033[0m\033[K\n' \
           "$markc" "$ins1" "$content" "$ins"
