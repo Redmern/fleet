@@ -46,7 +46,9 @@ fail-silent — if the daemon or any app is down, the rest keeps working.
   The selected row's left marker bar is **green when the dashboard pane has
   keyboard focus** and dim grey when focus is on the orchestrator/claude pane
   or another window — so you can tell at a glance whether `j/k`/`m`/… will land
-  in the dashboard (updates within the ~2s refresh).
+  in the dashboard. It updates instantly via tmux focus events (the dashboard
+  enables `focus-events` and requests focus reporting), falling back to the
+  ~2s refresh.
 
   The `n` form's **Repo** and **Base** are dropdowns: `←/→` cycles or `Enter`
   opens a scrollable picker. Repo lists the project's repos; Base lists that

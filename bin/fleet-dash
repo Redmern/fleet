@@ -20,10 +20,15 @@ sel=0                                     # selected row index
 status=""                                 # transient status line
 
 # --- terminal setup ----------------------------------------------------------
-cleanup() { tput rmcup 2>/dev/null; tput cnorm 2>/dev/null; }
+cleanup() { printf '\033[?1004l' 2>/dev/null; tput rmcup 2>/dev/null; tput cnorm 2>/dev/null; }
 trap cleanup EXIT INT TERM
 tput smcup 2>/dev/null                    # alternate screen
 tput civis 2>/dev/null                    # hide cursor
+# Focus reporting: ask the terminal to send \033[I / \033[O on focus change, and
+# have tmux forward them. They wake the read loop so the focus marker updates
+# instantly instead of on the next ~2s refresh.
+tmux set -g focus-events on 2>/dev/null
+printf '\033[?1004h'
 
 # --- helpers -----------------------------------------------------------------
 glyph_color() { # state -> SGR color
@@ -328,7 +333,7 @@ pick_mode() {
     IFS= read -rsN1 -t 120 k </dev/tty || return
     case "$k" in
       $'\e') IFS= read -rsN2 -t 0.01 r </dev/tty
-        case "$r" in '[A') (( mi>0 ))&&((mi--));; '[B') (( mi<n-1 ))&&((mi++));; *) return;; esac ;;
+        case "$r" in '[A') (( mi>0 ))&&((mi--));; '[B') (( mi<n-1 ))&&((mi++));; '') return;; esac ;;
       k) (( mi>0 ))&&((mi--)) ;;
       j) (( mi<n-1 ))&&((mi++)) ;;
       $'\n'|$'\r')
@@ -371,7 +376,7 @@ list_pick() {
     IFS= read -rsN1 -t 120 k </dev/tty || { echo "$cur"; return; }
     case "$k" in
       $'\e') IFS= read -rsN2 -t 0.01 r </dev/tty
-        case "$r" in '[A') (( mi>0 ))&&((mi--));; '[B') (( mi<n-1 ))&&((mi++));; *) echo "$cur"; return;; esac ;;
+        case "$r" in '[A') (( mi>0 ))&&((mi--));; '[B') (( mi<n-1 ))&&((mi++));; '') echo "$cur"; return;; esac ;;
       k) (( mi>0 ))&&((mi--)) ;;
       j) (( mi<n-1 ))&&((mi++)) ;;
       $'\n'|$'\r') echo "$mi"; return ;;
@@ -516,7 +521,7 @@ confirm_teardown() {
     IFS= read -rsN1 -t 120 k </dev/tty || return
     case "$k" in
       $'\e') IFS= read -rsN2 -t 0.01 r </dev/tty
-        case "$r" in '[A') (( mi>0 ))&&((mi--));; '[B') (( mi<n-1 ))&&((mi++));; *) return;; esac ;;
+        case "$r" in '[A') (( mi>0 ))&&((mi--));; '[B') (( mi<n-1 ))&&((mi++));; '') return;; esac ;;
       k) (( mi>0 ))&&((mi--)) ;;
       j) (( mi<n-1 ))&&((mi++)) ;;
       $'\n'|$'\r')
