@@ -168,6 +168,45 @@ cmd_branches() { # list candidate base branches for <repo>, default branch first
   } | grep -vxE 'HEAD|origin' | awk 'NF && !seen[$0]++'
 }
 
+# ---- session persistence (restore agents after a tmux/server restart) ---------
+# One file per session: $CONF_DIR/sessions/<session>.agents, tab-separated
+# lines: dir <TAB> repo <TAB> branch <TAB> bare(0/1) <TAB> base.
+
+agents_file() { echo "$CONF_DIR/sessions/$1.agents"; }
+
+persist_agent() { # session dir repo branch bare base
+  local sess="$1" f; f=$(agents_file "$sess"); mkdir -p "$(dirname "$f")" 2>/dev/null
+  [ -f "$f" ] && { awk -F'\t' -v d="$2" '$1!=d' "$f" >"$f.tmp" 2>/dev/null && mv "$f.tmp" "$f"; }
+  printf '%s\t%s\t%s\t%s\t%s\n' "$2" "$3" "$4" "$5" "$6" >>"$f"
+}
+
+cmd_forget() { # forget <dir> — drop a saved agent (called by the dashboard on teardown)
+  local dir="${1:-}"; [ -n "$dir" ] || return 0
+  local sess; sess=$(session_name) || return 0
+  local f; f=$(agents_file "$sess"); [ -f "$f" ] || return 0
+  awk -F'\t' -v d="$dir" '$1!=d' "$f" >"$f.tmp" 2>/dev/null && mv "$f.tmp" "$f"
+}
+
+cmd_restore() { # respawn saved agents whose windows are gone
+  local sess; sess=$(session_name) || die "not inside tmux"
+  local f; f=$(agents_file "$sess")
+  [ -f "$f" ] || { echo "no saved agents for $sess"; return 0; }
+  # match by window name (<repo>/<branchdir>, as cmd_new names them) — precise,
+  # unlike pane cwd which the dashboard/other panes can share.
+  local openwins; openwins=$(tmux list-windows -t "$sess" -F '#{window_name}' 2>/dev/null)
+  local dir repo branch bare base n=0
+  while IFS=$'\t' read -r dir repo branch bare base; do
+    [ -n "$dir" ] && [ -n "$repo" ] && [ -n "$branch" ] || continue
+    printf '%s\n' "$openwins" | grep -qxF "$repo/${branch//\//_}" && continue   # already running
+    local args=("$repo" "$branch")
+    [ "$bare" = 1 ] && args+=(--bare)
+    [ -n "$base" ] && args+=(--base "$base")
+    echo "restoring $repo/$branch..."
+    cmd_new "${args[@]}" >/dev/null 2>&1 && n=$((n+1))
+  done < "$f"
+  echo "restored $n agent(s)"
+}
+
 # ---- new ----------------------------------------------------------------------
 
 cmd_new() {
@@ -240,6 +279,7 @@ cmd_new() {
     tmux set -w -t "$win_id" @fleet_nvim_sock "$nsock"
   fi
   echo "spawned $wname in window $win_id"
+  persist_agent "$sess" "$dir" "$(basename "$repo_base")" "$branch" "$bare" "$base"
   sync_main_tiles "$sess" 2>/dev/null || true
 }
 
@@ -525,7 +565,13 @@ cmd_keys() { # plain text listing
 }
 
 cmd_up() {
-  local arg="${1:-}" root name
+  local arg="" root name restore=0
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --restore) restore=1; shift ;;
+      *) [ -z "$arg" ] && arg="$1"; shift ;;
+    esac
+  done
   if [ -n "$arg" ] && [ -d "$arg" ]; then
     root=$(readlink -f "$arg")
     name=$(basename "$root" | tr -cd 'a-zA-Z0-9_-')
@@ -574,6 +620,13 @@ cmd_up() {
   # build command center, explicitly targeting the project session
   FLEET_SESSION="$name" FLEET_ROOT="$root" cmd_main || true
 
+  # restore previously-open agents (after a tmux/server restart), or hint
+  if [ "$restore" = 1 ]; then
+    FLEET_SESSION="$name" FLEET_ROOT="$root" cmd_restore || true
+  elif [ -s "$(agents_file "$name")" ]; then
+    echo "  $(grep -c . "$(agents_file "$name")") saved agent(s) — run 'fleet restore' (or 'fleet up --restore')"
+  fi
+
   if [ -t 0 ]; then
     if [ -n "${TMUX:-}" ]; then tmux switch-client -t "$name"; else tmux attach -t "$name"; fi
   else
@@ -621,6 +674,8 @@ case "${1:-}" in
   agents)  shift; agents_tsv "$@" ;;   # raw TSV, consumed by fleet-dash
   repos)    shift; cmd_repos "$@" ;;     # repo names, for the new-agent form
   branches) shift; cmd_branches "$@" ;;  # base branches for a repo
+  restore)  shift; cmd_restore "$@" ;;   # respawn saved agents
+  forget)   shift; cmd_forget "$@" ;;    # drop a saved agent (dashboard teardown)
   pick)    shift; cmd_pick "$@" ;;
   send)    shift; cmd_send "$@" ;;
   mode)    shift; cmd_mode "$@" ;;
@@ -634,7 +689,8 @@ case "${1:-}" in
   *) menu_key=$(keybind_for menu); cat <<EOF
 fleet — agent fleet manager (tmux + nvim + Claude Code)
 
-  fleet up [name|path]   boot project session + daemon + command center
+  fleet up [name|path]   boot project session + daemon + command center ([--restore])
+  fleet restore          respawn saved agents from a previous session
   fleet new <repo> <br>  spawn agent (worktree + window + claude) [-p prompt] [--bare] [--base br]
   fleet ls               list agents and states
   fleet pick             fzf jump-to-agent

@@ -574,13 +574,16 @@ confirm_teardown() {
         [ -n "$win" ] || return
         case "${acts[mi]}" in
           cancel) return ;;
-          close) tmux kill-window -t "$win" 2>/dev/null; status="closed $label"; return ;;
+          close) tmux kill-window -t "$win" 2>/dev/null
+                 "$FLEET_BIN" forget "$dir" 2>/dev/null
+                 status="closed $label"; return ;;
           remove|force)
             local force="" main
             [ "${acts[mi]}" = force ] && force="--force"
             # main working tree (or bare container) to run `worktree remove` from
             main=$(git -C "$dir" worktree list --porcelain 2>/dev/null | awk '/^worktree /{print $2; exit}')
             tmux kill-window -t "$win" 2>/dev/null
+            "$FLEET_BIN" forget "$dir" 2>/dev/null
             if git -C "${main:-$dir}" worktree remove $force "$dir" 2>/dev/null; then
               status="removed worktree: $label"
             else

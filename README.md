@@ -15,6 +15,10 @@ fail-silent — if the daemon or any app is down, the rest keeps working.
   git worktree (matching the `<Repo>/<branch-dir>` layout, bare-repo containers
   supported), opens a tmux window with nvim, auto-opens claude and seeds the
   prompt. `--bare` for a plain claude pane without nvim.
+- **Session restore** — spawned agents are remembered per project; after a
+  tmux/server restart, `fleet restore` (or `fleet up --restore`) respawns the
+  ones whose windows are gone. `fleet up` hints when a saved set exists.
+  Tearing an agent down (dashboard `d`) forgets it.
 - **Desktop notifications** — notify-send when an agent blocks or finishes
   while its window isn't focused (30s cooldown, flap guard).
 - **Command center** — `fleet main`: orchestrator claude at the project root on
@@ -104,7 +108,7 @@ fleet up ~/path/to/project-root     # boot a project (any root folder of repos)
 | Path | What |
 |---|---|
 | `bin/fleetd` | unix-socket daemon (`$XDG_RUNTIME_DIR/fleet.sock`), state + tmux mirroring + notifications |
-| `bin/fleet` | CLI: `up new ls pick send mode main menu keys rebind status doctor` |
+| `bin/fleet` | CLI: `up new ls pick send mode main restore menu keys rebind status doctor` |
 | `bin/fleet-hook` | Claude Code hook → daemon reporter (fail-silent, ~1ms when fleet is down) |
 | `bin/fleet-dash` | interactive agent dashboard for the command center (the right pane of `main`) |
 | `bin/fleet-tile` | legacy single-pane tile renderer — no longer used by `main`, kept for a future preview pane |
