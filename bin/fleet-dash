@@ -13,6 +13,7 @@ SESS="${1:-}"
 
 FLEET_BIN="$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/fleet"
 CLIP_PCT="${FLEET_TILE_CLIP:-32}"        # right-column % kept for nvim panes
+REFRESH="${FLEET_DASH_REFRESH:-1}"        # idle refresh interval, seconds
 MODES=()                                  # discovered permission-mode list (cached)
 SELF_PANE="${TMUX_PANE:-}"                 # this dashboard's own tmux pane id
 declare -A GIT_RAW GIT_TS                  # per-pane git status cache (4s TTL)
@@ -613,7 +614,7 @@ while :; do
   render
 
   key=''
-  IFS= read -rsN1 -t 2 key || { status=""; continue; }   # timeout -> refresh
+  IFS= read -rsN1 -t "$REFRESH" key || { status=""; continue; }   # timeout -> refresh
   case "$key" in
     $'\e')  # arrow keys: ESC [ A/B
       IFS= read -rsN2 -t 0.01 rest || rest=''

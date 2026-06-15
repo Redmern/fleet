@@ -26,7 +26,8 @@ fail-silent — if the daemon or any app is down, the rest keeps working.
   framed in a rounded box and redrawn in place (no flicker on refresh). One row
   per agent — state glyph · repo/branch · time-in-state · live permission mode ·
   git status (`*dirty +ahead -behind` vs upstream, `ok` when clean) · last
-  activity — sorted by urgency, self-refreshing ~2s, columns adapt to pane
+  activity — sorted by urgency, self-refreshing every 1s (set
+  `FLEET_DASH_REFRESH`), columns adapt to pane
   width (git status and activity drop first when narrow). Drive it from the
   keyboard:
 
@@ -55,7 +56,7 @@ fail-silent — if the daemon or any app is down, the rest keeps working.
   or another window — so you can tell at a glance whether `j/k`/`m`/… will land
   in the dashboard. It updates instantly via tmux focus events (the dashboard
   enables `focus-events` and requests focus reporting), falling back to the
-  ~2s refresh.
+  idle refresh.
 
   The `n` form's **Repo** and **Base** are dropdowns: `←/→` cycles or `Enter`
   opens a scrollable picker. Repo lists the project's repos; Base lists that
