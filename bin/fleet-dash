@@ -483,26 +483,31 @@ list_pick() {
   done
 }
 
-# new_agent_form -> centred in-box form (same style/position as the mode popup).
-# Repo and Base are dropdowns (←/→ cycles, Enter opens a scrollable picker);
-# Branch/Prompt are text; Bare toggles. Sets global `status`.
+# new_agent_form -> centred in-box form. Repo is a dropdown; Branch picks an
+# EXISTING worktree to launch on, or "+ new branch" to create one (then a text
+# field + Base appear). j/k or ↑/↓ move between fields. Sets global `status`.
+NEWSENT="+ new branch"
 new_agent_form() {
-  local R C bw=58 branch="" prompt="" bare="no" ai=0 note="" k r x s
+  local R C bw=58 prompt="" bare="no" ai=0 note="" k r x s newbranch=""
   local nitems=6                  # 0 Repo,1 Branch,2 Base,3 Prompt,4 Bare,5 Create
   read -r R C < <(tsize)
   local REPOS=() ri=0
   while IFS= read -r x; do [ -n "$x" ] && REPOS+=("$x"); done < <("$FLEET_BIN" repos 2>/dev/null)
   (( ${#REPOS[@]} == 0 )) && { status="no repos found under the project root"; return; }
   local repo="${REPOS[0]}"
-  local BRANCHES=() bi=0
-  _load_branches() {
+  local WT=() wi=0 BRANCHES=() bi=0
+  _load_repo() {  # existing worktrees (+ a "new branch" entry) and base branches
+    WT=(); while IFS= read -r x; do [ -n "$x" ] && WT+=("$x"); done < <("$FLEET_BIN" worktrees "$repo" 2>/dev/null)
+    WT+=("$NEWSENT"); wi=0
     BRANCHES=(); bi=0
     while IFS= read -r x; do [ -n "$x" ] && BRANCHES+=("$x"); done < <("$FLEET_BIN" branches "$repo" 2>/dev/null)
   }
-  _load_branches
+  _load_repo
   local bx=$(( (C - bw) / 2 )) by=$(( (R - 13) / 2 ))
   (( bx < 0 )) && bx=0; (( by < 1 )) && by=1
 
+  _isnew() { [ "${WT[wi]}" = "$NEWSENT" ]; }
+  _istext() { { (( ai == 1 )) && _isnew; } || (( ai == 3 )); }   # editable text now?
   _base() { (( ${#BRANCHES[@]} )) && printf '%s' "${BRANCHES[bi]}" || printf '(default)'; }
   _field() { # off idx label value type [placeholder]
     local off="$1" idx="$2" lbl="$3" v="$4" ty="$5" ph="${6:-}" disp txt
@@ -520,17 +525,40 @@ new_agent_form() {
   _draw() {
     mtop "$by" "$bx" "$bw" "New fleet agent"
     mrow $(( by+1 )) "$bx" "$bw" ""
-    _field 2 0 "Repo"   "$repo"    select
-    _field 3 1 "Branch" "$branch"  text "<new branch>"
-    _field 4 2 "Base"   "$(_base)" select
-    _field 5 3 "Prompt" "$prompt"  text "(optional)"
-    _field 6 4 "Bare"   "$bare"    toggle
+    _field 2 0 "Repo" "$repo" select
+    if _isnew; then _field 3 1 "Branch" "$newbranch" text "<new branch>"
+                    _field 4 2 "Base" "$(_base)" select
+    else            _field 3 1 "Branch" "${WT[wi]}" select
+                    _field 4 2 "Base" "(existing worktree)" info; fi
+    _field 5 3 "Prompt" "$prompt" text "(optional)"
+    _field 6 4 "Bare" "$bare" toggle
     mrow $(( by+7 )) "$bx" "$bw" ""
     if (( ai == 5 )); then mrow $(( by+8 )) "$bx" "$bw" "[ Create agent ]" 1
     else mrow $(( by+8 )) "$bx" "$bw" "  Create agent"; fi
     mrow $(( by+9 )) "$bx" "$bw" ""
-    mrow $(( by+10 )) "$bx" "$bw" "${note:-up/down move . type or <> edit . Enter=list . Esc}"
+    mrow $(( by+10 )) "$bx" "$bw" "${note:-j/k or up/down move . <> cycle . Enter=list . Esc}"
     mbot $(( by+11 )) "$bx" "$bw"
+  }
+  _cyc() { # field <dir:1|-1> — cycle the active select
+    local d="$1"
+    case "$ai" in
+      0) ri=$(( (ri + d + ${#REPOS[@]}) % ${#REPOS[@]} )); repo="${REPOS[ri]}"; _load_repo ;;
+      1) wi=$(( (wi + d + ${#WT[@]}) % ${#WT[@]} )) ;;
+      2) _isnew && (( ${#BRANCHES[@]} )) && bi=$(( (bi + d + ${#BRANCHES[@]}) % ${#BRANCHES[@]} )) ;;
+      4) [ "$bare" = no ] && bare=yes || bare=no ;;
+    esac
+  }
+  _spawn() {
+    local branch; if _isnew; then branch="$newbranch"; else branch="${WT[wi]}"; fi
+    [ -n "$branch" ] || { note="pick a worktree or enter a new branch name"; return; }
+    msg_box "New fleet agent" "launching $repo / $branch ..."
+    local args=("$repo" "$branch")
+    [ -n "$prompt" ] && args+=(-p "$prompt")
+    [ "$bare" = yes ] && args+=(--bare)
+    if _isnew && (( ${#BRANCHES[@]} )); then args+=(--base "${BRANCHES[bi]}"); fi
+    if "$FLEET_BIN" new "${args[@]}" >/dev/null 2>&1; then status="launched: $repo $branch"
+    else status="spawn failed: $repo $branch"; fi
+    return 0
   }
 
   while :; do
@@ -542,44 +570,39 @@ new_agent_form() {
         case "$r" in
           '[A') (( ai>0 )) && ((ai--)) ;;
           '[B') (( ai<nitems-1 )) && ((ai++)) ;;
-          '[C') case "$ai" in   # right: cycle selects / toggle
-                  0) ri=$(( (ri+1) % ${#REPOS[@]} )); repo="${REPOS[ri]}"; _load_branches ;;
-                  2) (( ${#BRANCHES[@]} )) && bi=$(( (bi+1) % ${#BRANCHES[@]} )) ;;
-                  4) [ "$bare" = no ] && bare=yes || bare=no ;;
-                esac ;;
-          '[D') case "$ai" in   # left
-                  0) ri=$(( (ri-1+${#REPOS[@]}) % ${#REPOS[@]} )); repo="${REPOS[ri]}"; _load_branches ;;
-                  2) (( ${#BRANCHES[@]} )) && bi=$(( (bi-1+${#BRANCHES[@]}) % ${#BRANCHES[@]} )) ;;
-                  4) [ "$bare" = no ] && bare=yes || bare=no ;;
-                esac ;;
+          '[C') _cyc 1 ;;
+          '[D') _cyc -1 ;;
           '') return ;;
         esac ;;
       $'\t') ai=$(( (ai+1) % nitems )) ;;
       $'\n'|$'\r')
         case "$ai" in
           0) s=$(list_pick "Select repo" "$ri" "${REPOS[@]}"); clear
-             [ -n "$s" ] && { ri="$s"; repo="${REPOS[ri]}"; _load_branches; } ;;
-          2) if (( ${#BRANCHES[@]} )); then s=$(list_pick "Branch off of" "$bi" "${BRANCHES[@]}"); clear
+             [ -n "$s" ] && { ri="$s"; repo="${REPOS[ri]}"; _load_repo; } ;;
+          1) s=$(list_pick "Launch on worktree" "$wi" "${WT[@]}"); clear
+             [ -n "$s" ] && wi="$s" ;;
+          2) if _isnew && (( ${#BRANCHES[@]} )); then s=$(list_pick "Branch off of" "$bi" "${BRANCHES[@]}"); clear
                [ -n "$s" ] && bi="$s"; fi ;;
-          5) if [ -z "$branch" ]; then note="Branch name is required"
-             else
-               msg_box "New fleet agent" "creating $repo / $branch ..."
-               local args=("$repo" "$branch")
-               [ -n "$prompt" ] && args+=(-p "$prompt")
-               [ "$bare" = yes ] && args+=(--bare)
-               (( ${#BRANCHES[@]} )) && args+=(--base "${BRANCHES[bi]}")
-               if "$FLEET_BIN" new "${args[@]}" >/dev/null 2>&1; then status="spawned: $repo $branch"
-               else status="spawn failed: $repo $branch"; fi
-               return
-             fi ;;
-          *) (( ai<nitems-1 )) && ((ai++)) ;;   # text fields: Enter = next
+          5) _spawn; [ "$status" ] && return ;;
+          *) (( ai<nitems-1 )) && ((ai++)) ;;
         esac ;;
       $'\177'|$'\b')
-        case "$ai" in 1) branch="${branch%?}";; 3) prompt="${prompt%?}";; esac ;;
+        if (( ai == 1 )) && _isnew; then newbranch="${newbranch%?}"
+        elif (( ai == 3 )); then prompt="${prompt%?}"; fi ;;
       ' ')
-        case "$ai" in 4) [ "$bare" = no ] && bare=yes || bare=no ;; 1) branch+=" ";; 3) prompt+=" ";; esac ;;
+        if (( ai == 4 )); then [ "$bare" = no ] && bare=yes || bare=no
+        elif (( ai == 1 )) && _isnew; then newbranch+=" "
+        elif (( ai == 3 )); then prompt+=" "; fi ;;
       *)
-        case "$k" in [[:print:]]) note=""; case "$ai" in 1) branch+="$k";; 3) prompt+="$k";; esac ;; esac ;;
+        case "$k" in
+          [[:print:]])
+            if _istext; then
+              note=""
+              if (( ai == 1 )); then newbranch+="$k"; else prompt+="$k"; fi
+            elif [ "$k" = k ]; then (( ai>0 )) && ((ai--))
+            elif [ "$k" = j ]; then (( ai<nitems-1 )) && ((ai++))
+            fi ;;
+        esac ;;
     esac
   done
 }

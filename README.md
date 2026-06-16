@@ -72,10 +72,12 @@ fail-silent — if the daemon or any app is down, the rest keeps working.
   enables `focus-events` and requests focus reporting), falling back to the
   idle refresh.
 
-  The `n` form's **Repo** and **Base** are dropdowns: `←/→` cycles or `Enter`
-  opens a scrollable picker. Repo lists the project's repos; Base lists that
-  repo's branches (default branch first) — the new branch is created off it
-  (passed to `fleet new --base`). Changing Repo reloads the Base list.
+  The `n` form's fields are dropdowns (`←/→` cycles, `Enter` opens a scrollable
+  picker; `j/k` or `↑/↓` move between fields). **Repo** lists the project's
+  repos. **Branch** lists the repo's **existing worktrees** — pick one to launch
+  an agent on it — or `+ new branch` to create one, which reveals a name field
+  and a **Base** dropdown (the new branch is cut off the chosen base, via
+  `fleet new --base`). Changing Repo reloads both lists.
 
   `d` tears down the selected agent: a confirm popup offers *close window*
   (keep files), *remove worktree*, or *force remove*. Removing a worktree with

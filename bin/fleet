@@ -155,6 +155,15 @@ repo_anchor() { # repo_base -> a dir git can run in (the repo, bare container, o
   return 1
 }
 
+cmd_worktrees() { # list branches of <repo>'s existing worktrees (launch targets)
+  local repo="${1:-}"; [ -n "$repo" ] || die "usage: fleet worktrees <repo>"
+  local root; root=$(fleet_root) || die "not inside tmux"
+  local repo_base; repo_base=$(resolve_repo "$root" "$repo") || die "repo '$repo' not found under $root"
+  local anchor; anchor=$(repo_anchor "$repo_base") || return 0
+  git -C "$anchor" worktree list --porcelain 2>/dev/null \
+    | awk '/^branch /{sub("refs/heads/","",$2); print $2}' | awk 'NF && !seen[$0]++'
+}
+
 cmd_branches() { # list candidate base branches for <repo>, default branch first
   local repo="${1:-}"; [ -n "$repo" ] || die "usage: fleet branches <repo>"
   local root; root=$(fleet_root) || die "not inside tmux"
@@ -755,6 +764,7 @@ case "${1:-}" in
   agents)  shift; agents_tsv "$@" ;;   # raw TSV, consumed by fleet-dash
   repos)    shift; cmd_repos "$@" ;;     # repo names, for the new-agent form
   branches) shift; cmd_branches "$@" ;;  # base branches for a repo
+  worktrees) shift; cmd_worktrees "$@" ;; # existing worktrees of a repo
   restore)  shift; cmd_restore "$@" ;;   # respawn saved agents
   forget)   shift; cmd_forget "$@" ;;    # drop a saved agent (dashboard teardown)
   guard)    shift; cmd_guard "$@" ;;     # toggle the test/CI write-guard
