@@ -91,6 +91,14 @@ fail-silent — if the daemon or any app is down, the rest keeps working.
   `fleet send <agent> "msg"` (delivered via nvim RPC into the claude terminal),
   and `fleet mode <agent>` to cycle an agent's permission mode. See `FLEET.md`
   for the orchestrator instructions.
+- **Non-blocking waits** — `fleet watch <agents> -m "msg"` lets the orchestrator
+  fire-and-forget instead of holding its turn hostage in a `sleep`+`fleet ls`
+  poll loop. It returns instantly and arms a *detached* watcher bound to the
+  calling pane; when every named agent goes idle (for ~6s straight, so a blip
+  doesn't trip it) it injects `msg` into the orchestrator's claude input —
+  waking it to read the results and report. Polling happens in the background
+  process, not the orchestrator's context. The orchestrator's `CLAUDE.md` now
+  instructs it to dispatch, `fleet watch`, and end its turn.
 - **Feature menu + keybinds** — `prefix+F` opens a rounded tmux menu listing
   every feature with its key; pick an entry to run it, or "Change a keybind" to
   rebind live. Keys are stored in `~/.config/fleet/keybinds.conf` and
@@ -130,7 +138,7 @@ fleet up ~/path/to/project-root     # boot a project (any root folder of repos)
 | Path | What |
 |---|---|
 | `bin/fleetd` | unix-socket daemon (`$XDG_RUNTIME_DIR/fleet.sock`), state + tmux mirroring + notifications |
-| `bin/fleet` | CLI: `up new fan ls pick send mode cost guard main restore menu keys rebind status doctor` |
+| `bin/fleet` | CLI: `up new fan ls pick send watch mode cost guard main restore menu keys rebind status doctor` |
 | `bin/fleet-hook` | Claude Code hook → daemon reporter + transcript recorder (fail-silent) |
 | `bin/fleet-guard` | Claude Code PreToolUse hook → write-guard for tests/CI/lockfiles |
 | `bin/fleet-dash` | interactive agent dashboard for the command center (the right pane of `main`) |

@@ -12,7 +12,15 @@ in other tmux windows of this project with the `fleet` CLI:
   agent's claude input. `<agent>` matches window name or repo/branch.
 - `fleet mode <agent>` — cycle that agent's Claude permission mode (default →
   accept-edits → plan → bypass), one step per call (sends Shift+Tab).
+- `fleet watch <agent>... -m "message"` — **don't busy-poll.** Returns
+  immediately and arms a background watcher; when every named agent goes idle it
+  delivers `"message"` into your pane, waking you. Use this to wait on agents
+  without burning your own turn in a `sleep`/`fleet ls` loop.
 
 Delegation pattern: split the user's request into per-repo tasks, `fleet new`
-one agent per task with a precise prompt, then poll `fleet ls` and `fleet send`
-follow-ups. Report consolidated status back to the user.
+one agent per task with a precise prompt. To wait for them, **never** loop on
+`sleep` + `fleet ls` (it holds your turn hostage for minutes and burns context).
+Instead, after dispatching, run one `fleet watch <agents> -m "<what to do when
+they finish>"` and **end your turn** — tell the user you've dispatched and will
+report when done. The watcher pings you when they're all idle; you resume then,
+read their results with `fleet ls` / their diffs, and report consolidated status.

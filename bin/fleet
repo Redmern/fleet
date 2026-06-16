@@ -395,6 +395,53 @@ cmd_send() {
     && echo "delivered via send-keys (focus-dependent for nvim agents)"
 }
 
+# ---- watch (don't busy-poll: get pinged when agents finish) --------------------
+# `fleet watch <agents> -m "msg"` returns immediately and spawns a detached
+# watcher bound to the calling pane (the orchestrator). When all the named
+# agents are idle, it delivers "msg" into that pane — waking the orchestrator —
+# so the orchestrator can dispatch work, end its turn, and be notified later
+# instead of holding itself hostage in a poll loop.
+cmd_watch() {
+  local msg="" targets=()
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      -m) msg="$2"; shift 2 ;;
+      -*) die "unknown flag $1" ;;
+      *) targets+=("$1"); shift ;;
+    esac
+  done
+  [ ${#targets[@]} -gt 0 ] || die "usage: fleet watch <agent>... -m \"message when done\""
+  local pane="${TMUX_PANE:-}"
+  [ -n "$pane" ] || die "run fleet watch from a tmux pane (orchestrator)"
+  [ -n "$msg" ] || msg="fleet: agents now idle — ${targets[*]}"
+  local self="$FLEET_DIR/bin/fleet"
+  if command -v setsid >/dev/null; then
+    setsid "$self" watch-run "$pane" "$msg" "${targets[@]}" </dev/null >/dev/null 2>&1 &
+  else
+    nohup "$self" watch-run "$pane" "$msg" "${targets[@]}" </dev/null >/dev/null 2>&1 &
+  fi
+  echo "watching ${targets[*]} in the background — this pane gets pinged when they're all idle. End your turn; you'll be woken."
+}
+
+cmd_watch_run() { # watch-run <pane> <msg> <target...>  (detached; internal)
+  local pane="$1" msg="$2"; shift 2
+  local targets=("$@") streak=0 i tsv state t alldone
+  for (( i=0; i<2700; i++ )); do          # ~90min cap at 2s/iteration
+    sleep 2
+    tmux display -p -t "$pane" '#{pane_id}' >/dev/null 2>&1 || return 0   # pane gone
+    tsv=$(agents_tsv 2>/dev/null)
+    alldone=1
+    for t in "${targets[@]}"; do
+      state=$(printf '%s\n' "$tsv" | awk -F'\t' -v x="$t" 'index($2,x)||index($5,x){print $1; exit}')
+      [ "$state" = idle ] || alldone=0
+    done
+    if [ "$alldone" = 1 ]; then streak=$((streak+1)); else streak=0; fi
+    (( streak >= 3 )) && break             # idle for ~6s straight → done (not a blip)
+  done
+  tmux send-keys -t "$pane" -l "$msg" 2>/dev/null
+  tmux send-keys -t "$pane" Enter 2>/dev/null
+}
+
 # ---- mode ---------------------------------------------------------------------
 # Cycle an agent's Claude permission mode by injecting Shift+Tab into its claude.
 # claude cycles default → accept-edits → plan → bypass on each press, and prints
@@ -773,6 +820,8 @@ case "${1:-}" in
   cost-pane) shift; cost_for_pane "$@" ;; # raw cost for a pane (dashboard)
   pick)    shift; cmd_pick "$@" ;;
   send)    shift; cmd_send "$@" ;;
+  watch)     shift; cmd_watch "$@" ;;
+  watch-run) shift; cmd_watch_run "$@" ;;  # internal: detached watcher
   mode)    shift; cmd_mode "$@" ;;
   main)       shift; cmd_main "$@" ;;
   menu)       shift; cmd_menu "$@" ;;
