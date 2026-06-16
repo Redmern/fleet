@@ -15,6 +15,19 @@ fail-silent — if the daemon or any app is down, the rest keeps working.
   git worktree (matching the `<Repo>/<branch-dir>` layout, bare-repo containers
   supported), opens a tmux window with nvim, auto-opens claude and seeds the
   prompt. `--bare` for a plain claude pane without nvim.
+- **Cost meter** — each agent's row shows live token spend (`$X.YZ Ntok`),
+  summed from its Claude transcript × per-model pricing (the hook records the
+  transcript path). `fleet cost <agent>` prints it on the CLI.
+- **Stall detector** — an agent stuck `working` past `FLEET_STALL` seconds
+  (default 600) flips its state pill to a red `stalled`, so runaway/looping
+  agents stand out at a glance.
+- **Best-of-N fan-out** — `fleet fan <repo> <name> -n 3 -p "task"` spawns N
+  agents on the same prompt (branches `<name>-1..N`); review each with `v`,
+  promote a winner by closing the rest (`d`).
+- **Write-guard** — opt-in PreToolUse hook (`fleet guard on`) that asks before
+  an agent edits tests, CI configs, or lockfiles — and hard-denies paths listed
+  with a leading `!` in `.fleet/protected` (or `~/.config/fleet/protected`). Off
+  by default; agents can't quietly delete tests to make a build pass.
 - **Session restore** — spawned agents are remembered per project; after a
   tmux/server restart, `fleet restore` (or `fleet up --restore`) respawns the
   ones whose windows are gone. `fleet up` hints when a saved set exists.
@@ -115,8 +128,9 @@ fleet up ~/path/to/project-root     # boot a project (any root folder of repos)
 | Path | What |
 |---|---|
 | `bin/fleetd` | unix-socket daemon (`$XDG_RUNTIME_DIR/fleet.sock`), state + tmux mirroring + notifications |
-| `bin/fleet` | CLI: `up new ls pick send mode main restore menu keys rebind status doctor` |
-| `bin/fleet-hook` | Claude Code hook → daemon reporter (fail-silent, ~1ms when fleet is down) |
+| `bin/fleet` | CLI: `up new fan ls pick send mode cost guard main restore menu keys rebind status doctor` |
+| `bin/fleet-hook` | Claude Code hook → daemon reporter + transcript recorder (fail-silent) |
+| `bin/fleet-guard` | Claude Code PreToolUse hook → write-guard for tests/CI/lockfiles |
 | `bin/fleet-dash` | interactive agent dashboard for the command center (the right pane of `main`) |
 | `bin/fleet-tile` | legacy single-pane tile renderer — no longer used by `main`, kept for a future preview pane |
 | `nvim/fleet.lua` | loaded into spawned nvim via `--cmd` — claude autostart + `FleetSend()` + `FleetCycleMode()` |

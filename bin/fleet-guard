@@ -1,0 +1,92 @@
+#!/bin/sh
+# fleet-guard — Claude Code PreToolUse hook. Asks (or denies) before edits to
+# protected paths (tests, CI configs, lockfiles) so agents can't quietly delete
+# tests or rewrite CI to make things pass. Opt-in: no-op unless `fleet guard on`
+# created the enable marker. Fail-silent and fast — on any doubt, allow.
+set -eu
+
+CFG="${XDG_CONFIG_HOME:-$HOME/.config}/fleet"
+[ -f "$CFG/guard-on" ] || exit 0           # disabled → allow everything
+command -v python3 >/dev/null 2>&1 || exit 0
+
+in="$(cat 2>/dev/null || true)"
+[ -n "$in" ] || exit 0
+
+FLEET_GUARD_INPUT="$in" FLEET_GUARD_CFG="$CFG" python3 - <<'PY' || exit 0
+import json, os, fnmatch, sys
+
+try:
+    h = json.loads(os.environ["FLEET_GUARD_INPUT"])
+except Exception:
+    sys.exit(0)
+
+tool = str(h.get("tool_name") or "")
+if tool not in ("Edit", "Write", "MultiEdit", "NotebookEdit"):
+    sys.exit(0)
+path = str((h.get("tool_input") or {}).get("file_path") or "")
+if not path:
+    sys.exit(0)
+base = os.path.basename(path)
+
+# Built-in defaults: test files, CI configs, lockfiles. A leading '!' on a
+# pattern means hard-deny instead of ask.
+patterns = [
+    "*_test.go", "*_test.py", "test_*.py", "*.test.*", "*.spec.*",
+    "*Tests.cs", "*Test.cs", "*Tests.java", "*Test.java",
+    "*/tests/*", "*/test/*", "*/__tests__/*", "*/spec/*",
+    ".github/workflows/*", "*/.github/workflows/*", "*.yml.ci", "azure-pipelines*.yml",
+    "*.lock", "package-lock.json", "yarn.lock", "pnpm-lock.yaml", "Cargo.lock",
+    "Gemfile.lock", "poetry.lock", "composer.lock", "go.sum",
+]
+
+# Per-repo + global overrides: <cwd ancestor>/.fleet/protected and $CFG/protected.
+def load(p):
+    try:
+        with open(p, encoding="utf-8") as f:
+            return [l.strip() for l in f if l.strip() and not l.startswith("#")]
+    except Exception:
+        return []
+
+cwd = str(h.get("cwd") or "")
+extra = []
+d = cwd
+for _ in range(40):
+    extra += load(os.path.join(d, ".fleet", "protected"))
+    nd = os.path.dirname(d)
+    if nd == d:
+        break
+    d = nd
+extra += load(os.path.join(os.environ["FLEET_GUARD_CFG"], "protected"))
+patterns += extra
+
+def matches(pat, path, base):
+    pat = pat.strip()
+    return fnmatch.fnmatch(path, pat) or fnmatch.fnmatch(base, pat) \
+        or fnmatch.fnmatch(path, "*/" + pat)
+
+deny = False
+hit = None
+for pat in patterns:
+    hard = pat.startswith("!")
+    p = pat[1:] if hard else pat
+    if matches(p, path, base):
+        hit = p
+        if hard:
+            deny = True
+        break
+
+if hit is None:
+    sys.exit(0)
+
+decision = "deny" if deny else "ask"
+reason = ("fleet-guard: %s is protected (%s). %s"
+          % (base, hit,
+             "Edit blocked — remove it from .fleet/protected to allow."
+             if deny else "Confirm this change is intended."))
+print(json.dumps({"hookSpecificOutput": {
+    "hookEventName": "PreToolUse",
+    "permissionDecision": decision,
+    "permissionDecisionReason": reason,
+}}))
+PY
+exit 0

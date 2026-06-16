@@ -39,6 +39,18 @@ try:
 except Exception:
     hook_input = {}
 
+# Record this agent's transcript path (keyed by pane) so `fleet cost` can sum
+# token usage from it. Best-effort, never fatal.
+try:
+    _tp = hook_input.get("transcript_path")
+    if isinstance(_tp, str) and _tp:
+        _txdir = os.path.join(os.path.dirname(sock_path), "fleet", "tx")
+        os.makedirs(_txdir, exist_ok=True)
+        with open(os.path.join(_txdir, pane.replace("%", "")), "w", encoding="utf-8") as _fh:
+            _fh.write(_tp)
+except Exception:
+    pass
+
 # Subagent guards (herdr learnings, keep verbatim):
 # - SubagentStop can fire after the main turn already stopped; never let it
 #   revive or change an idle pane.

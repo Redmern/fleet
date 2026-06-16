@@ -18,6 +18,8 @@ REFRESH="${FLEET_DASH_REFRESH:-1}"        # idle refresh interval, seconds
 MODES=(default accept-edits auto plan bypass)   # selectable permission modes
 SELF_PANE="${TMUX_PANE:-}"                 # this dashboard's own tmux pane id
 declare -A GIT_RAW GIT_TS                  # per-pane git status cache (4s TTL)
+declare -A COST_RAW COST_TS                 # per-pane token/cost cache (10s TTL)
+STALL_SEC="${FLEET_STALL:-600}"             # working longer than this = stalled
 
 sel=0                                     # selected row index
 status=""                                 # transient status line
@@ -115,6 +117,15 @@ git_cached() { # pane -> "DIRTY AHEAD BEHIND", recomputed at most every 4s
   printf '%s' "${GIT_RAW[$pane]}"
 }
 
+cost_cached() { # pane -> "$X.YZ Nk" token/cost, recomputed at most every 10s
+  local pane="$1"
+  if [ -z "${COST_TS[$pane]:-}" ] || (( SECONDS - COST_TS[$pane] > 10 )); then
+    COST_RAW[$pane]=$("$FLEET_BIN" cost-pane "$pane" 2>/dev/null)
+    COST_TS[$pane]=$SECONDS
+  fi
+  printf '%s' "${COST_RAW[$pane]:--}"
+}
+
 gitfmt() { # "D A B" -> compact ASCII (≤8 cols): *dirty +ahead -behind, or ok/-
   [ -n "$1" ] || { printf -- '-'; return; }
   local d a b s=""; read -r d a b <<<"$1"
@@ -168,15 +179,15 @@ git_pcol()   { # "D A B" -> pill colour
 }
 
 # --- data --------------------------------------------------------------------
-# ROWS[] entries: state \t label \t window_id \t window_name \t since \t pane_id
+# ROWS[] entries: state \t label \t window_id \t window_name \t since \t pane_id \t age
 load_rows() {
   ROWS=()
-  local line state label sess win wname since pane order
-  while IFS=$'\t' read -r state label sess win wname since pane; do
+  local line state label sess win wname since pane age order
+  while IFS=$'\t' read -r state label sess win wname since pane age; do
     [ -n "$pane" ] || continue
     [ "$sess" = "$SESS" ] || continue     # this project only
     [ "$wname" = "main" ] && continue     # skip the orchestrator itself
-    ROWS+=("$state"$'\t'"$label"$'\t'"$win"$'\t'"$wname"$'\t'"$since"$'\t'"$pane")
+    ROWS+=("$state"$'\t'"$label"$'\t'"$win"$'\t'"$wname"$'\t'"$since"$'\t'"$pane"$'\t'"${age:-0}")
   done < <("$FLEET_BIN" agents 2>/dev/null | sort -t$'\t' -k1,1 \
             | awk -F'\t' '
                 $1=="blocked"{o=0} $1=="idle"{o=1} $1=="working"{o=2} $1!~/blocked|idle|working/{o=3}
@@ -252,23 +263,32 @@ render() {
     # width is kept exactly = cw so the right rail stays aligned.
     # every pill is the same display width (PW); the label is the flexible filler.
     # PILL_GAP-wide gaps separate the items.
-    local PW=$(( PILL_W + 4 )) G=$PILL_GAP
+    local PW=$(( PILL_W + 4 )) G=$PILL_GAP CF=12    # CF = cost field width
     local gap; gap=$(printf '%*s' "$G" '')
-    local state label pane mode g gt content lblsgr LW git_show mode_show
+    local state label pane mode g gt content lblsgr LW git_show mode_show cost_show
+    local age sdisp scol cost
     for (( i=0; i<N && drawn<slots; i++ )); do
-      state=$(field "$i" 1); label=$(field "$i" 2); pane=$(field "$i" 6)
+      state=$(field "$i" 1); label=$(field "$i" 2); pane=$(field "$i" 6); age=$(field "$i" 7)
       g=$(git_cached "$pane"); gt=$(gitfmt "$g")
       mode=$(mode_label "$pane")
-      git_show=1; mode_show=1
-      LW=$(( cw - 3*PW - 3*G ))                  # 3 pills + 3 gaps
+      git_show=1; mode_show=1; cost_show=1
+      LW=$(( cw - 3*PW - CF - 4*G ))              # 3 pills + cost + 4 gaps
+      (( LW < 1 )) && { cost_show=0; LW=$(( cw - 3*PW - 3*G )); }
       (( LW < 1 )) && { mode_show=0; LW=$(( cw - 2*PW - 2*G )); }
       (( LW < 1 )) && { git_show=0; LW=$(( cw - PW - G )); }
       (( LW < 0 )) && LW=0
+      # stall: an agent stuck "working" too long shows a red 'stalled' pill
+      sdisp="$state"; scol=$(state_pcol "$state")
+      if [ "$state" = working ] && (( ${age:-0} > STALL_SEC )); then sdisp="stalled"; scol=1; fi
       (( i == sel )) && lblsgr='\033[1m' || lblsgr='\033[2m'
-      content=$(pill "$state" "$(state_pcol "$state")")
+      content=$(pill "$sdisp" "$scol")
       content+=$(printf "%s${lblsgr}%b\033[22m" "$gap" "$(fit_left "$label" "$LW")")
       (( git_show )) && content+="$gap$(pill "$gt" "$(git_pcol "$g")")"
       (( mode_show )) && content+="$gap$(pill "$(mode_short "$mode")" "$(mode_pcol "$mode")")"
+      if (( cost_show )); then
+        cost=$(cost_cached "$pane")
+        content+=$(printf "%s\033[2m%-*.*s\033[0m" "$gap" "$CF" "$CF" "$cost")
+      fi
       if (( i == sel )); then   # focus-coloured marker bar marks the selection
         printf '\033[2m│\033[0m%b▌\033[0m%s%b%s\033[2m│\033[0m\033[K\n' \
           "$markc" "$ins1" "$content" "$ins"

@@ -71,7 +71,9 @@ hooks = settings.get("hooks", {})
 for event in list(hooks):
     entries = hooks[event]
     for entry in entries:
-        entry["hooks"] = [h for h in entry.get("hooks", []) if "fleet-hook" not in h.get("command", "")]
+        entry["hooks"] = [h for h in entry.get("hooks", [])
+                          if "fleet-hook" not in h.get("command", "")
+                          and "fleet-guard" not in h.get("command", "")]
     hooks[event] = [e for e in entries if e.get("hooks")]
     if not hooks[event]:
         del hooks[event]
@@ -84,7 +86,7 @@ PY
 
 if [ "${1:-}" = "--uninstall" ]; then
   systemctl --user disable --now fleetd 2>/dev/null || true
-  rm -f "$UNIT_DIR/fleetd.service" "$BIN_DIR/fleet" "$BIN_DIR/fleetd" "$BIN_DIR/fleet-hook" "$BIN_DIR/fleet-tile"
+  rm -f "$UNIT_DIR/fleetd.service" "$BIN_DIR/fleet" "$BIN_DIR/fleetd" "$BIN_DIR/fleet-hook" "$BIN_DIR/fleet-tile" "$BIN_DIR/fleet-guard"
   systemctl --user daemon-reload 2>/dev/null || true
   for p in "${PROFILES[@]}"; do
     [ -f "$p/settings.json" ] && unwire_hooks "$p/settings.json"
@@ -93,8 +95,31 @@ if [ "${1:-}" = "--uninstall" ]; then
   exit 0
 fi
 
+wire_guard() { # wire_guard <settings.json> — PreToolUse write-guard (no-op until `fleet guard on`)
+  python3 - "$1" "$BIN_DIR/fleet-guard" <<'PY'
+import json, sys
+path, guard = sys.argv[1], sys.argv[2]
+try:
+    with open(path) as f: settings = json.load(f)
+except FileNotFoundError:
+    settings = {}
+hooks = settings.setdefault("hooks", {})
+entries = hooks.setdefault("PreToolUse", [])
+for e in entries:                                  # drop any previous guard entry
+    e["hooks"] = [h for h in e.get("hooks", []) if "fleet-guard" not in h.get("command", "")]
+entries[:] = [e for e in entries if e.get("hooks")]
+entries.append({
+    "matcher": "Edit|Write|MultiEdit|NotebookEdit",
+    "hooks": [{"type": "command", "command": f"sh '{guard}'", "timeout": 10}],
+})
+with open(path, "w") as f:
+    json.dump(settings, f, indent=2); f.write("\n")
+print(f"  wired write-guard: {path}")
+PY
+}
+
 mkdir -p "$BIN_DIR" "$UNIT_DIR"
-for b in fleet fleetd fleet-hook fleet-tile; do
+for b in fleet fleetd fleet-hook fleet-tile fleet-guard; do
   chmod +x "$FLEET_DIR/bin/$b"
   ln -sf "$FLEET_DIR/bin/$b" "$BIN_DIR/$b"
   echo "  linked $BIN_DIR/$b"
@@ -109,6 +134,7 @@ for p in "${PROFILES[@]}"; do
   [ -d "$p" ] || continue
   [ -f "$p/settings.json" ] || echo '{}' > "$p/settings.json"
   wire_hooks "$p/settings.json"
+  wire_guard "$p/settings.json"
 done
 
 echo
