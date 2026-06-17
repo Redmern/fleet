@@ -618,7 +618,7 @@ action_tmux_command() { # tmux command string run when an action's key is presse
     pick) echo "display-popup -E -b rounded -w 80% -h 60% '$self pick'" ;;
     new)  echo "command-prompt -p 'fleet new (repo branch):' \"run-shell '$self new %%'\"" ;;
     main)   echo "run-shell '$self main'" ;;
-    reload) echo "run-shell '$self main --reload'" ;;
+    reload) echo "display-menu -b rounded -T '#[align=centre]Reload dashboard?' -x C -y C 'Yes, reload' y \"run-shell '$self main --reload'\" 'Cancel' n ''" ;;
     ls)     echo "display-popup -E -b rounded -w 70% -h 60% \"$self ls; echo; read -n1 -r -p 'press any key'\"" ;;
   esac
 }

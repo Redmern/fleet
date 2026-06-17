@@ -1,3 +1,123 @@
+# CLAUDE.md
+
+This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+
+> This file does double duty. The **orchestrator capabilities** section at the
+> bottom is the verbatim content of `FLEET.md`, which `fleet up` installs as a
+> project's `CLAUDE.md` so the orchestrator Claude learns the `fleet` CLI. Keep
+> that section in sync with `FLEET.md` when you change orchestration commands.
+> Everything above it is guidance for developing fleet itself.
+
+## What this is
+
+Fleet is a standalone manager for a personal "fleet" of Claude Code coding
+agents, each running in its own tmux window (nvim + claude split) on its own git
+worktree. Fleet only *calls* tmux/nvim/git/claude — it embeds none of them.
+**Every integration is fail-silent:** if the daemon, tmux, nvim, or claude is
+missing, each command degrades to a working subset rather than erroring. Preserve
+this property in any change — guard external calls and `exit 0` / fall back on
+failure rather than propagating errors.
+
+## No build, no test suite
+
+There is nothing to compile and no test runner. The deliverables are scripts run
+directly via symlinks in `~/.local/bin`:
+
+- `./install.sh` — symlink bins, install + enable the systemd user unit, and
+  idempotently wire the Claude Code hooks into `~/.claude` and
+  `~/.claude_personal` `settings.json`. `./install.sh --uninstall` reverses all.
+- `fleet doctor` — verify dependencies (tmux, nvim, git, python3, fzf), the
+  daemon socket, hook wiring, and the systemd unit. Use this as the smoke test.
+- `fleet up <project-root>` — boot a project session (orchestrator + command center).
+- After editing `bin/fleet-dash`, reload it in place with `fleet main --reload`
+  or tmux `prefix+R` — no need to restart the session or the orchestrator.
+- `systemctl --user restart fleetd` after editing `bin/fleetd`; tail it with
+  `journalctl --user -u fleetd -f`.
+
+Languages: `bin/fleet` and `bin/fleet-dash` / `bin/fleet-tile` are **bash**;
+`bin/fleetd` is **Python 3 (stdlib only)**; `bin/fleet-hook` and `bin/fleet-guard`
+are **POSIX sh**. Keep `fleetd` stdlib-only and the hooks fast and dependency-light
+(they run on every Claude hook event).
+
+## Architecture
+
+Five cooperating processes plus an nvim plugin, communicating through a Unix
+socket and tmux options — there is no shared in-process state.
+
+- **`bin/fleetd`** — the only long-lived process. A stdlib daemon on
+  `$XDG_RUNTIME_DIR/fleet.sock` speaking newline-delimited JSON. It owns agent
+  state keyed by tmux pane id, mirrors it into per-window tmux user options
+  (`@agent_state` / `@agent_since` / `@agent_glyph`) for the status bar, sends
+  desktop notifications when an unfocused agent blocks/finishes, and sweeps dead
+  panes every 60s. RPC methods: `agent.report`, `agent.release`, `fleet.list`,
+  `fleet.ping`.
+- **`bin/fleet-hook`** — wired into Claude Code's hooks by `install.sh`. Maps
+  hook events to states and reports them to the daemon:
+  UserPromptSubmit/PreToolUse → `working`, PermissionRequest/Notification →
+  `blocked`, Stop/SessionStart → `idle`, SessionEnd → `release`. **Subagent
+  events must never mark the parent pane done** (a hard-won lesson carried over
+  from the predecessor "herdr" — keep the subagent filtering intact).
+- **`bin/fleet-guard`** — opt-in PreToolUse hook. No-op unless `fleet guard on`
+  created `~/.config/fleet/guard-on`. Asks before edits to tests/CI/lockfiles and
+  hard-denies paths flagged with a leading `!` in `.fleet/protected` (or
+  `~/.config/fleet/protected`).
+- **`bin/fleet`** — the user/orchestrator CLI; the bulk of the logic. Subcommands
+  dispatch at the bottom `case` block to `cmd_*` functions. It is mostly
+  stateless: it reads live agent state from the daemon (`agents_tsv` calls
+  `fleet.list`, falling back to tmux `@agent_state` options when the daemon is
+  down) and shells out to tmux/git/nvim.
+- **`bin/fleet-dash`** — the interactive dashboard, the right pane of the `main`
+  window. Self-refreshing TUI that consumes `fleet agents` (raw TSV) and drives
+  tmux. The orchestrator Claude runs in the left pane.
+- **`nvim/fleet.lua`** — loaded into each spawned nvim via `--cmd`. Provides
+  claude autostart (`FLEET_AUTOCLAUDE` / `FLEET_PROMPT` env), `FleetSend()`
+  (delivers `fleet send` messages into the claude terminal via RPC), and
+  `FleetCycleMode()`.
+
+### State and persistence
+
+State lives in three places, none of them a database:
+
+- **Live agent state** — in `fleetd`'s memory, mirrored to tmux window options.
+- **Per-session saved agents** — `~/.config/fleet/sessions/<session>.agents`
+  (tab-separated: dir, repo, branch, bare, base). Written on `fleet new`, read by
+  `fleet restore` to respawn agents whose windows vanished after a tmux/server
+  restart. Teardown (`forget`) drops the line.
+- **Config** — `~/.config/fleet/`: `keybinds.conf` (`action=key`, re-applied on
+  every `fleet up`), `projects/<name>.yml` (`root:` to pin a project root),
+  `guard-on` marker, `protected` glob list.
+
+### Worktree / repo layout (`cmd_new`)
+
+A "project" is any root folder of repos; repos are auto-discovered. `fleet new`
+resolves the repo then picks a layout: a **plain working repo** is used in place
+(no worktree); a **bare-repo container** or a **worktree container** gets a new
+worktree at `<repo>/<branch-with-slashes-as-underscores>`, anchored off the
+container's bare repo or first worktree, cut from `--base` (or the remote default
+branch). Branches with `/` become `_` in directory and window names.
+
+### Permission-mode discovery (notable)
+
+Claude only exposes mode *cycling* (Shift+Tab), not "set mode X". `cmd_mode`
+cycles one step per call; the dashboard's `m` popup **discovers** the available
+modes the first time it's used — cycling a full loop, recording each mode from
+claude's footer, returning to start — then caches the list. Mode is always read
+live from claude's own footer line, so it stays authoritative across claude
+versions. Sending into nvim agents prefers headless nvim RPC (`FleetCycleMode`),
+falling back to tmux `send-keys BTab` (focus-dependent).
+
+## Conventions
+
+- Match the existing fail-silent style: `2>/dev/null`, `|| true`, `|| return 0`,
+  `|| exit 0` around every tmux/git/nvim/notify call.
+- `fleetd` swallows all tmux/notify errors — it must never take anything else
+  down with it.
+- Keep `bin/fleet`'s subcommand `case` dispatch and the `cmd_*` function names in
+  sync; several are internal (`agents`, `repos`, `branches`, `worktrees`,
+  `forget`, `watch-run`) and consumed by the dashboard or detached watchers.
+
+---
+
 # Fleet — orchestrator capabilities
 
 You are running inside a fleet command center. You can manage coding agents
