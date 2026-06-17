@@ -11,8 +11,49 @@ FLEET_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)"
 RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
 SOCK="$RUNTIME_DIR/fleet.sock"
 CONF_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/fleet"
+HARNESS_DIR="$FLEET_DIR/harness.d"
 
 die() { echo "fleet: $*" >&2; exit 1; }
+
+# ---- harness adapters --------------------------------------------------------
+# A "harness" is the agent CLI fleet drives (claude, omp, …). Each is described
+# by a harness.d/<name>.conf sourced into H_* vars. Add a harness = add a file.
+
+harness_select() { # resolve the active harness name (precedence: flag handled by
+  # caller, then $FLEET_HARNESS, project .fleet/harness, config, default claude)
+  if [ -n "${FLEET_HARNESS:-}" ]; then echo "$FLEET_HARNESS"; return; fi
+  local root; root=$(fleet_root 2>/dev/null)
+  if [ -n "$root" ] && [ -f "$root/.fleet/harness" ]; then
+    local h; h=$(head -1 "$root/.fleet/harness" 2>/dev/null | tr -d '[:space:]')
+    [ -n "$h" ] && { echo "$h"; return; }
+  fi
+  if [ -f "$CONF_DIR/config" ]; then
+    local h; h=$(grep -E '^harness=' "$CONF_DIR/config" 2>/dev/null | tail -1 | cut -d= -f2 | tr -d '[:space:]')
+    [ -n "$h" ] && { echo "$h"; return; }
+  fi
+  echo claude
+}
+
+harness_list() { # names of installed harness adapters
+  for f in "$HARNESS_DIR"/*.conf; do [ -e "$f" ] && basename "$f" .conf; done
+}
+
+harness_load() { # populate H_* for <name>; defaults first, then the conf overrides
+  local name="${1:-claude}"
+  H_NAME="$name"
+  H_BIN="$name"; H_PROMPT_FLAG=""; H_TERM_MATCH="$name"; H_NVIM_PLUGIN=0
+  H_STATE_SRC="scrape"; H_MODE_KEYS=""; H_MODE_LIST=""; H_COST_KIND=""
+  H_GUARD_KIND="none"; H_BUSY_RE=""
+  local conf="$HARNESS_DIR/$name.conf"
+  [ -f "$conf" ] || die "unknown harness '$name' (have: $(harness_list | tr '\n' ' '))"
+  # shellcheck disable=SC1090
+  . "$conf"
+}
+
+harness_bin() { # first launchable binary from H_BIN candidates
+  local c; for c in $H_BIN; do command -v "$c" >/dev/null 2>&1 && { command -v "$c"; return 0; }; done
+  return 1
+}
 
 # ---- daemon RPC --------------------------------------------------------------
 
@@ -141,6 +182,8 @@ cmd_pick() {
 
 # ---- repos / branches (used by the dashboard new-agent form) ------------------
 
+cmd_harnesses() { harness_list; }   # installed harness adapter names (for the form)
+
 cmd_repos() { # list discoverable repo names under the project root
   local root; root=$(fleet_root) || die "not inside tmux"
   discover_repos "$root" | cut -f1 | awk 'NF && !seen[$0]++'
@@ -183,10 +226,10 @@ cmd_branches() { # list candidate base branches for <repo>, default branch first
 
 agents_file() { echo "$CONF_DIR/sessions/$1.agents"; }
 
-persist_agent() { # session dir repo branch bare base
+persist_agent() { # session dir repo branch bare base harness
   local sess="$1" f; f=$(agents_file "$sess"); mkdir -p "$(dirname "$f")" 2>/dev/null
   [ -f "$f" ] && { awk -F'\t' -v d="$2" '$1!=d' "$f" >"$f.tmp" 2>/dev/null && mv "$f.tmp" "$f"; }
-  printf '%s\t%s\t%s\t%s\t%s\n' "$2" "$3" "$4" "$5" "$6" >>"$f"
+  printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$2" "$3" "$4" "$5" "$6" "${7:-claude}" >>"$f"
 }
 
 cmd_forget() { # forget <dir> — drop a saved agent (called by the dashboard on teardown)
@@ -221,13 +264,69 @@ cmd_fan() { # best-of-N: spawn N agents on the same prompt, branches <name>-1..N
 }
 
 # ---- cost / tokens ------------------------------------------------------------
-# The hook writes each agent's Claude transcript path to $RUNTIME_DIR/fleet/tx/<pane>;
-# we sum usage × per-model price from it.
+# Per-harness: claude records a transcript path per pane (the hook writes it to
+# $RUNTIME_DIR/fleet/tx/<pane>); omp writes session JSONL we locate by cwd.
 txfile() { echo "$RUNTIME_DIR/fleet/tx/${1#%}"; }
+
+pane_harness() { # pane -> harness name from its window (@fleet_harness), default claude
+  local h; h=$(tmux display -p -t "${1:-}" '#{@fleet_harness}' 2>/dev/null)
+  echo "${h:-claude}"
+}
 
 cost_for_pane() { # pane -> "$X.YZ Nk" (cost + total tokens), or "-" if unknown
   local pane="${1:-}"; [ -n "$pane" ] || { echo "-"; return 0; }
-  local f tp; f=$(txfile "$pane")
+  local h; h=$(pane_harness "$pane")
+  harness_load "$h" 2>/dev/null || { echo "-"; return 0; }
+  case "$H_COST_KIND" in
+    claude-tx)   cost_claude_tx "$pane" ;;
+    omp-session) cost_omp_session "$pane" ;;
+    *)           echo "-" ;;
+  esac
+}
+
+cost_omp_session() { # pane -> cost from the omp session JSONL matching its cwd
+  local pane="$1" cwd root="${OMP_DATA_DIR:-$HOME/.omp/agent/sessions}"
+  cwd=$(tmux display -p -t "$pane" '#{pane_current_path}' 2>/dev/null)
+  [ -n "$cwd" ] && [ -d "$root" ] || { echo "-"; return 0; }
+  python3 - "$root" "$cwd" <<'PY' 2>/dev/null || echo "-"
+import json, os, sys, glob
+root, cwd = sys.argv[1], sys.argv[2].rstrip("/")
+# pick the newest session file that references this agent's cwd
+best=None; best_mt=-1
+for fp in glob.glob(os.path.join(root, "**", "*.jsonl"), recursive=True):
+    try:
+        with open(fp, encoding="utf-8") as fh:
+            head = fh.read(4096)
+    except Exception:
+        continue
+    if cwd not in head:
+        continue
+    mt = os.path.getmtime(fp)
+    if mt > best_mt:
+        best_mt, best = mt, fp
+if not best:
+    print("-"); raise SystemExit
+cost=0.0; toks=0
+for line in open(best, encoding="utf-8"):
+    line=line.strip()
+    if not line: continue
+    try: o=json.loads(line)
+    except Exception: continue
+    u=o.get("usage") or (o.get("message") or {}).get("usage")
+    if not isinstance(u, dict): continue
+    c=u.get("cost")
+    if isinstance(c, dict): cost += c.get("total", 0) or 0
+    elif isinstance(c, (int,float)): cost += c
+    for k in ("input","output","cacheRead","cacheWrite"):
+        v=u.get(k);  toks += v if isinstance(v,(int,float)) else 0
+    if u.get("totalTokens"): toks = max(toks, u["totalTokens"])
+k=toks/1000.0
+print(f"${cost:.2f} " + (f"{k:.0f}k" if k < 1000 else f"{k/1000:.1f}M"))
+PY
+}
+
+cost_claude_tx() { # pane -> cost from the claude transcript recorded by the hook
+  local pane="$1" f tp; f=$(txfile "$pane")
   [ -f "$f" ] || { echo "-"; return 0; }
   tp=$(cat "$f" 2>/dev/null); [ -n "$tp" ] && [ -f "$tp" ] || { echo "-"; return 0; }
   python3 - "$tp" <<'PY' 2>/dev/null || echo "-"
@@ -282,13 +381,14 @@ cmd_restore() { # respawn saved agents whose windows are gone
   # match by window name (<repo>/<branchdir>, as cmd_new names them) — precise,
   # unlike pane cwd which the dashboard/other panes can share.
   local openwins; openwins=$(tmux list-windows -t "$sess" -F '#{window_name}' 2>/dev/null)
-  local dir repo branch bare base n=0
-  while IFS=$'\t' read -r dir repo branch bare base; do
+  local dir repo branch bare base harness n=0
+  while IFS=$'\t' read -r dir repo branch bare base harness; do
     [ -n "$dir" ] && [ -n "$repo" ] && [ -n "$branch" ] || continue
     printf '%s\n' "$openwins" | grep -qxF "$repo/${branch//\//_}" && continue   # already running
     local args=("$repo" "$branch")
     [ "$bare" = 1 ] && args+=(--bare)
     [ -n "$base" ] && args+=(--base "$base")
+    [ -n "$harness" ] && args+=(--harness "$harness")
     echo "restoring $repo/$branch..."
     cmd_new "${args[@]}" >/dev/null 2>&1 && n=$((n+1))
   done < "$f"
@@ -298,17 +398,20 @@ cmd_restore() { # respawn saved agents whose windows are gone
 # ---- new ----------------------------------------------------------------------
 
 cmd_new() {
-  local repo="" branch="" prompt="" bare=0 base=""
+  local repo="" branch="" prompt="" bare=0 base="" harness=""
   while [ $# -gt 0 ]; do
     case "$1" in
       -p) prompt="$2"; shift 2 ;;
       --bare) bare=1; shift ;;
       --base) base="$2"; shift 2 ;;
+      --harness) harness="$2"; shift 2 ;;
       -*) die "unknown flag $1" ;;
       *) if [ -z "$repo" ]; then repo="$1"; elif [ -z "$branch" ]; then branch="$1"; else die "extra arg $1"; fi; shift ;;
     esac
   done
-  [ -n "$repo" ] && [ -n "$branch" ] || die "usage: fleet new <repo> <branch> [-p prompt] [--bare] [--base branch]"
+  [ -n "$repo" ] && [ -n "$branch" ] || die "usage: fleet new <repo> <branch> [-p prompt] [--bare] [--base branch] [--harness name]"
+  [ -n "$harness" ] || harness=$(harness_select)
+  harness_load "$harness"
 
   local root; root=$(fleet_root) || die "not inside tmux"
   local repo_base; repo_base=$(resolve_repo "$root" "$repo") || die "repo '$repo' not found under $root"
@@ -346,28 +449,39 @@ cmd_new() {
 
   local sess; sess=$(session_name) || die "not inside tmux"
   local wname; wname="$(basename "$repo_base")/$branchdir"
-  local claude_bin
-  claude_bin=$(command -v claude-profile || command -v claude) || die "claude not found"
+  local hbin
+  hbin=$(harness_bin) || die "$H_NAME not found (looked for: $H_BIN)"
 
   local win_id
   if [ "$bare" = 1 ]; then
+    # bare pane: run the harness directly; prompt is one arg, via the flag (or
+    # positional when H_PROMPT_FLAG is empty, e.g. claude).
+    local argv=("$hbin")
     if [ -n "$prompt" ]; then
-      win_id=$(tmux new-window -P -F '#{window_id}' -t "$sess" -n "$wname" -c "$dir" \
-        "$claude_bin" "$prompt")
-    else
-      win_id=$(tmux new-window -P -F '#{window_id}' -t "$sess" -n "$wname" -c "$dir" \
-        "$claude_bin")
+      [ -n "$H_PROMPT_FLAG" ] && argv+=("$H_PROMPT_FLAG")
+      argv+=("$prompt")
     fi
+    win_id=$(tmux new-window -P -F '#{window_id}' -t "$sess" -n "$wname" -c "$dir" \
+      "${argv[@]}")
   else
+    # nvim pane: claude autostarts via claudecode.nvim; other harnesses open in a
+    # generic :terminal. Both seed the prompt + take FleetSend over the nvim RPC.
     local nsock="$RUNTIME_DIR/fleet/nvim-$(date +%s%N).sock"
     mkdir -p "$RUNTIME_DIR/fleet"
     win_id=$(tmux new-window -P -F '#{window_id}' -t "$sess" -n "$wname" -c "$dir" \
-      -e FLEET_AUTOCLAUDE=1 -e FLEET_PROMPT="$prompt" \
+      -e FLEET_AUTOCLAUDE="$([ "$H_NVIM_PLUGIN" = 1 ] && echo 1 || echo 0)" \
+      -e FLEET_HARNESS="$H_NAME" -e FLEET_HARNESS_BIN="$hbin" \
+      -e FLEET_TERM_MATCH="$H_TERM_MATCH" -e FLEET_PROMPT="$prompt" \
       nvim . --cmd "lua pcall(dofile, '$FLEET_DIR/nvim/fleet.lua')" --listen "$nsock")
     tmux set -w -t "$win_id" @fleet_nvim_sock "$nsock"
   fi
-  echo "spawned $wname in window $win_id"
-  persist_agent "$sess" "$dir" "$(basename "$repo_base")" "$branch" "$bare" "$base"
+  tmux set -w -t "$win_id" @fleet_harness "$H_NAME"
+  # Let fleetd derive state for hookless harnesses without knowing them: stamp
+  # the state source + the "busy" scrape pattern onto the window.
+  tmux set -w -t "$win_id" @fleet_state_src "$H_STATE_SRC"
+  [ -n "$H_BUSY_RE" ] && tmux set -w -t "$win_id" @fleet_busy_re "$H_BUSY_RE"
+  echo "spawned $wname ($H_NAME) in window $win_id"
+  persist_agent "$sess" "$dir" "$(basename "$repo_base")" "$branch" "$bare" "$base" "$H_NAME"
   sync_main_tiles "$sess" 2>/dev/null || true
 }
 
@@ -791,6 +905,13 @@ cmd_doctor() {
   command -v tmuxinator >/dev/null && echo "ok   tmuxinator (optional)" || echo "warn tmuxinator missing (fleet up builds sessions itself)"
   command -v claude-profile >/dev/null && echo "ok   claude-profile" \
     || { command -v claude >/dev/null && echo "ok   claude (no profile wrapper)" || { echo "MISS claude"; ok=1; }; }
+  # harness adapters + whether each one's binary is on PATH
+  local h; for h in $(harness_list); do
+    if harness_load "$h" 2>/dev/null && harness_bin >/dev/null 2>&1; then
+      echo "ok   harness: $h ($(harness_bin))"
+    else echo "warn harness: $h (binary not found: $H_BIN)"; fi
+  done
+  echo "     default harness: $(harness_select)"
   [ -S "$SOCK" ] && rpc fleet.ping >/dev/null 2>&1 && echo "ok   fleetd socket" || echo "warn fleetd not running (fleet up starts it)"
   local prof hooked
   for prof in "$HOME/.claude" "$HOME/.claude_personal"; do
@@ -817,6 +938,7 @@ case "${1:-}" in
   repos)    shift; cmd_repos "$@" ;;     # repo names, for the new-agent form
   branches) shift; cmd_branches "$@" ;;  # base branches for a repo
   worktrees) shift; cmd_worktrees "$@" ;; # existing worktrees of a repo
+  harnesses) shift; cmd_harnesses "$@" ;; # installed harness adapters (for the form)
   restore)  shift; cmd_restore "$@" ;;   # respawn saved agents
   forget)   shift; cmd_forget "$@" ;;    # drop a saved agent (dashboard teardown)
   guard)    shift; cmd_guard "$@" ;;     # toggle the test/CI write-guard

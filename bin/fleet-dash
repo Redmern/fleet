@@ -19,6 +19,7 @@ MODES=(default accept-edits auto plan bypass)   # selectable permission modes
 SELF_PANE="${TMUX_PANE:-}"                 # this dashboard's own tmux pane id
 declare -A GIT_RAW GIT_TS                  # per-pane git status cache (4s TTL)
 declare -A COST_RAW COST_TS                 # per-pane token/cost cache (10s TTL)
+declare -A HNS_RAW                          # per-pane harness name cache
 STALL_SEC="${FLEET_STALL:-600}"             # working longer than this = stalled
 
 sel=0                                     # selected row index
@@ -124,6 +125,19 @@ cost_cached() { # pane -> "$X.YZ Nk" token/cost, recomputed at most every 10s
     COST_TS[$pane]=$SECONDS
   fi
   printf '%s' "${COST_RAW[$pane]:--}"
+}
+
+harness_of() { # pane -> harness name (@fleet_harness), default claude; cached
+  local pane="$1"
+  if [ -z "${HNS_RAW[$pane]:-}" ]; then
+    HNS_RAW[$pane]=$(tmux display -p -t "$pane" '#{@fleet_harness}' 2>/dev/null)
+    [ -n "${HNS_RAW[$pane]}" ] || HNS_RAW[$pane]=claude
+  fi
+  printf '%s' "${HNS_RAW[$pane]}"
+}
+
+harness_has_modes() { # harness -> 0 if it supports a permission-mode cycle
+  case "$1" in claude) return 0 ;; *) return 1 ;; esac
 }
 
 gitfmt() { # "D A B" -> compact ASCII (≤8 cols): *dirty +ahead -behind, or ok/-
@@ -270,11 +284,14 @@ render() {
     for (( i=0; i<N && drawn<slots; i++ )); do
       state=$(field "$i" 1); label=$(field "$i" 2); pane=$(field "$i" 6); age=$(field "$i" 7)
       g=$(git_cached "$pane"); gt=$(gitfmt "$g")
-      mode=$(mode_label "$pane")
-      git_show=1; mode_show=1; cost_show=1
-      LW=$(( cw - 3*PW - CF - 4*G ))              # 3 pills + cost + 4 gaps
-      (( LW < 1 )) && { cost_show=0; LW=$(( cw - 3*PW - 3*G )); }
-      (( LW < 1 )) && { mode_show=0; LW=$(( cw - 2*PW - 2*G )); }
+      # mode pill only for harnesses with a runtime permission-mode cycle (claude)
+      local hmode np
+      if harness_has_modes "$(harness_of "$pane")"; then mode=$(mode_label "$pane"); hmode=1; np=3
+      else mode=""; hmode=0; np=2; fi
+      git_show=1; mode_show=$hmode; cost_show=1
+      LW=$(( cw - np*PW - CF - (np+1)*G ))         # np pills + cost + gaps
+      (( LW < 1 )) && { cost_show=0; LW=$(( cw - np*PW - np*G )); }
+      (( LW < 1 )) && (( hmode )) && { mode_show=0; np=2; LW=$(( cw - np*PW - np*G )); }
       (( LW < 1 )) && { git_show=0; LW=$(( cw - PW - G )); }
       (( LW < 0 )) && LW=0
       # stall: an agent stuck "working" too long shows a red 'stalled' pill
@@ -489,12 +506,17 @@ list_pick() {
 NEWSENT="+ new branch"
 new_agent_form() {
   local R C bw=58 prompt="" bare="no" ai=0 note="" k r x s newbranch=""
-  local nitems=6                  # 0 Repo,1 Branch,2 Base,3 Prompt,4 Bare,5 Create
+  local nitems=7    # 0 Repo,1 Branch,2 Base,3 Prompt,4 Bare,5 Harness,6 Create
   read -r R C < <(tsize)
   local REPOS=() ri=0
   while IFS= read -r x; do [ -n "$x" ] && REPOS+=("$x"); done < <("$FLEET_BIN" repos 2>/dev/null)
   (( ${#REPOS[@]} == 0 )) && { status="no repos found under the project root"; return; }
   local repo="${REPOS[0]}"
+  local HARN=() hi=0
+  while IFS= read -r x; do [ -n "$x" ] && HARN+=("$x"); done < <("$FLEET_BIN" harnesses 2>/dev/null)
+  (( ${#HARN[@]} == 0 )) && HARN=(claude)
+  # default to claude if present
+  local _i; for _i in "${!HARN[@]}"; do [ "${HARN[_i]}" = claude ] && hi=$_i; done
   local WT=() wi=0 BRANCHES=() bi=0
   _load_repo() {  # existing worktrees (+ a "new branch" entry) and base branches
     WT=(); while IFS= read -r x; do [ -n "$x" ] && WT+=("$x"); done < <("$FLEET_BIN" worktrees "$repo" 2>/dev/null)
@@ -503,7 +525,7 @@ new_agent_form() {
     while IFS= read -r x; do [ -n "$x" ] && BRANCHES+=("$x"); done < <("$FLEET_BIN" branches "$repo" 2>/dev/null)
   }
   _load_repo
-  local bx=$(( (C - bw) / 2 )) by=$(( (R - 13) / 2 ))
+  local bx=$(( (C - bw) / 2 )) by=$(( (R - 14) / 2 ))
   (( bx < 0 )) && bx=0; (( by < 1 )) && by=1
 
   _isnew() { [ "${WT[wi]}" = "$NEWSENT" ]; }
@@ -532,12 +554,13 @@ new_agent_form() {
                     _field 4 2 "Base" "(existing worktree)" info; fi
     _field 5 3 "Prompt" "$prompt" text "(optional)"
     _field 6 4 "Bare" "$bare" toggle
-    mrow $(( by+7 )) "$bx" "$bw" ""
-    if (( ai == 5 )); then mrow $(( by+8 )) "$bx" "$bw" "[ Create agent ]" 1
-    else mrow $(( by+8 )) "$bx" "$bw" "  Create agent"; fi
-    mrow $(( by+9 )) "$bx" "$bw" ""
-    mrow $(( by+10 )) "$bx" "$bw" "${note:-j/k or up/down move . <> cycle . Enter=list . Esc}"
-    mbot $(( by+11 )) "$bx" "$bw"
+    _field 7 5 "Harness" "${HARN[hi]}" select
+    mrow $(( by+8 )) "$bx" "$bw" ""
+    if (( ai == 6 )); then mrow $(( by+9 )) "$bx" "$bw" "[ Create agent ]" 1
+    else mrow $(( by+9 )) "$bx" "$bw" "  Create agent"; fi
+    mrow $(( by+10 )) "$bx" "$bw" ""
+    mrow $(( by+11 )) "$bx" "$bw" "${note:-j/k or up/down move . <> cycle . Enter=list . Esc}"
+    mbot $(( by+12 )) "$bx" "$bw"
   }
   _cyc() { # field <dir:1|-1> — cycle the active select
     local d="$1"
@@ -546,6 +569,7 @@ new_agent_form() {
       1) wi=$(( (wi + d + ${#WT[@]}) % ${#WT[@]} )) ;;
       2) _isnew && (( ${#BRANCHES[@]} )) && bi=$(( (bi + d + ${#BRANCHES[@]}) % ${#BRANCHES[@]} )) ;;
       4) [ "$bare" = no ] && bare=yes || bare=no ;;
+      5) hi=$(( (hi + d + ${#HARN[@]}) % ${#HARN[@]} )) ;;
     esac
   }
   _spawn() {
@@ -556,6 +580,7 @@ new_agent_form() {
     [ -n "$prompt" ] && args+=(-p "$prompt")
     [ "$bare" = yes ] && args+=(--bare)
     if _isnew && (( ${#BRANCHES[@]} )); then args+=(--base "${BRANCHES[bi]}"); fi
+    args+=(--harness "${HARN[hi]}")
     if "$FLEET_BIN" new "${args[@]}" >/dev/null 2>&1; then status="launched: $repo $branch"
     else status="spawn failed: $repo $branch"; fi
     return 0
@@ -583,7 +608,9 @@ new_agent_form() {
              [ -n "$s" ] && wi="$s" ;;
           2) if _isnew && (( ${#BRANCHES[@]} )); then s=$(list_pick "Branch off of" "$bi" "${BRANCHES[@]}"); clear
                [ -n "$s" ] && bi="$s"; fi ;;
-          5) _spawn; [ "$status" ] && return ;;
+          5) s=$(list_pick "Harness" "$hi" "${HARN[@]}"); clear
+             [ -n "$s" ] && hi="$s" ;;
+          6) _spawn; [ "$status" ] && return ;;
           *) (( ai<nitems-1 )) && ((ai++)) ;;
         esac ;;
       $'\177'|$'\b')
@@ -708,7 +735,8 @@ while :; do
     m)             # permission-mode pick-list for the selected agent (sets status)
       (( N == 0 )) && continue
       label=$(field "$sel" 2); pane=$(field "$sel" 6)
-      pick_mode "$pane" "$label"; clear ;;
+      if harness_has_modes "$(harness_of "$pane")"; then pick_mode "$pane" "$label"; clear
+      else status="$(harness_of "$pane") has no permission modes"; fi ;;
     s)             # send a message to selected agent
       (( N == 0 )) && continue
       label=$(field "$sel" 2)

@@ -14,6 +14,7 @@ import json
 import os
 import selectors
 import socket
+import re
 import subprocess
 import time
 
@@ -24,6 +25,7 @@ SEVERITY = {"blocked": 3, "working": 2, "idle": 1}
 GLYPH_COLOR = {"working": "colour4", "blocked": "colour1", "idle": "colour2"}
 
 SWEEP_INTERVAL = 60
+SCRAPE_INTERVAL = 2          # how often hookless harnesses (omp, …) are polled
 NOTIFY_COOLDOWN = 30
 IDLE_FLAP_GUARD = 2.0
 
@@ -46,6 +48,7 @@ class Fleet:
         self.last_notify = {}  # (pane_id, state) -> ts
         self.last_working = {}  # pane_id -> ts of last working report
         self.last_sweep = 0.0
+        self.last_scrape = 0.0
 
     # ---- state ingestion -------------------------------------------------
 
@@ -165,6 +168,46 @@ class Fleet:
         if self.panes:
             self.heal_status_format()
 
+    def scrape_harnesses(self, force=False):
+        # Hookless harnesses (omp, …) can't report via Claude-style hooks. fleet
+        # stamps @fleet_state_src=scrape + @fleet_busy_re onto their windows; we
+        # poll capture-pane and infer working/idle from whether the busy pattern
+        # (e.g. the "esc to interrupt" hint) is on screen. fleetd stays harness-
+        # agnostic — all harness knowledge lives in the window options.
+        now = time.time()
+        if not force and now - self.last_scrape < SCRAPE_INTERVAL:
+            return
+        self.last_scrape = now
+        out = tmux(
+            "list-panes", "-a", "-F",
+            "#{pane_id}\t#{@fleet_state_src}\t#{@fleet_busy_re}\t#{pane_current_path}",
+        )
+        if not out:
+            return
+        for line in out.splitlines():
+            parts = line.split("\t")
+            if len(parts) != 4:
+                continue
+            pane, src, busy_re, path = parts
+            if src != "scrape" or not busy_re:
+                continue
+            cap = tmux("capture-pane", "-p", "-t", pane)
+            if cap is None:
+                continue
+            try:
+                working = re.search(busy_re, cap, re.IGNORECASE) is not None
+            except re.error:
+                working = False
+            state = "working" if working else "idle"
+            # Only emit on change to avoid resetting "since" every tick.
+            cur = (self.panes.get(pane) or {}).get("_scrape")
+            if cur and cur["state"] == state:
+                continue
+            self.report({
+                "pane_id": pane, "session_id": "_scrape", "state": state,
+                "seq": time.time_ns(), "cwd": path,
+            })
+
     def heal_status_format(self):
         # Theme switches regenerate omarchy's pill formats and drop our glyph;
         # re-append it to the runtime global value (config files untouched).
@@ -257,7 +300,7 @@ def main():
     buffers = {}
 
     while True:
-        for key, _ in sel.select(timeout=SWEEP_INTERVAL):
+        for key, _ in sel.select(timeout=SCRAPE_INTERVAL):
             if key.data is None:
                 try:
                     conn, _ = server.accept()
@@ -287,6 +330,7 @@ def main():
                         conn.sendall((json.dumps(resp) + "\n").encode())
                     except OSError:
                         pass
+        fleet.scrape_harnesses()
         fleet.sweep()
 
 

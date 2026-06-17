@@ -77,7 +77,8 @@ fail-silent — if the daemon or any app is down, the rest keeps working.
   repos. **Branch** lists the repo's **existing worktrees** — pick one to launch
   an agent on it — or `+ new branch` to create one, which reveals a name field
   and a **Base** dropdown (the new branch is cut off the chosen base, via
-  `fleet new --base`). Changing Repo reloads both lists.
+  `fleet new --base`). Changing Repo reloads both lists. **Harness** picks which
+  agent CLI to launch (claude/omp/…).
 
   `d` tears down the selected agent: a confirm popup offers *close window*
   (keep files), *remove worktree*, or *force remove*. Removing a worktree with
@@ -87,6 +88,18 @@ fail-silent — if the daemon or any app is down, the rest keeps working.
   `fleet main --reload` restarts just the dashboard process in place (same pane,
   size, and position) — handy after editing `fleet-dash`. The orchestrator pane
   and every agent window keep running; no work is lost.
+- **Pluggable harness** — the agent CLI fleet drives is selectable per agent.
+  `claude` (full-featured) and `omp` (oh-my-pi, omp.sh) ship today; each is a
+  drop-in `harness.d/<name>.conf` describing how to launch it, seed a prompt,
+  read its state, and read its cost — so a new harness is a new file, not a code
+  change. Pick one with `fleet new <repo> <br> --harness omp`, the dashboard `n`
+  form's **Harness** dropdown, or set a default in `~/.config/fleet/config`
+  (`harness=omp`) or a project `.fleet/harness`. Capabilities vary by tool and
+  the UI adapts: harnesses without a permission-mode cycle hide the mode pill +
+  `m` key; cost works for any harness that writes a usage log. Harnesses that
+  don't emit Claude-style hooks (omp) get their state from a fleetd **scrape**
+  loop (the window carries a `busy` regex fleet stamps on it) instead — so
+  working/idle still light up with zero integration on the tool's side.
 - **Orchestration** — the orchestrator (or you) can `fleet ls`, `fleet new`,
   `fleet send <agent> "msg"` (delivered via nvim RPC into the claude terminal),
   and `fleet mode <agent>` to cycle an agent's permission mode. See `FLEET.md`
@@ -143,7 +156,8 @@ socket is missing. Everything else (hooks, bins) is identical.
 | Path | What |
 |---|---|
 | `bin/fleetd` | unix-socket daemon (`$XDG_RUNTIME_DIR/fleet.sock`), state + tmux mirroring + notifications |
-| `bin/fleet` | CLI: `up new fan ls pick send watch mode cost guard main restore menu keys rebind status doctor` |
+| `bin/fleet` | CLI: `up new fan ls pick send watch mode cost guard main restore menu keys rebind harnesses status doctor` |
+| `harness.d/` | one `<name>.conf` per supported agent CLI (claude, omp); drop in a file to add a harness |
 | `bin/fleet-hook` | Claude Code hook → daemon reporter + transcript recorder (fail-silent) |
 | `bin/fleet-guard` | Claude Code PreToolUse hook → write-guard for tests/CI/lockfiles |
 | `bin/fleet-dash` | interactive agent dashboard for the command center (the right pane of `main`) |
