@@ -4,26 +4,49 @@
 -- wrapped so a missing claudecode.nvim just means "no autostart", never an
 -- error that blocks nvim.
 
+-- Which terminal buffer is "the agent" — claude by default, but fleet sets
+-- FLEET_TERM_MATCH per harness (e.g. "omp") so FleetSend/FleetCycleMode route
+-- to the right terminal.
+local function term_match()
+  local m = vim.env.FLEET_TERM_MATCH
+  if m == nil or m == "" then m = "claude" end
+  return m
+end
+
 -- Defer everything until plugins are loaded.
 vim.api.nvim_create_autocmd("VimEnter", {
   once = true,
   callback = function()
-    if vim.env.FLEET_AUTOCLAUDE ~= "1" then return end
-    vim.defer_fn(function()
-      local ok, terminal = pcall(require, "claudecode.terminal")
-      if not ok then
-        vim.notify("fleet: claudecode.nvim not available, open claude manually", vim.log.levels.WARN)
-        return
-      end
-      pcall(terminal.open, {})
-      -- Seed the initial prompt through the terminal channel (same path as
-      -- FleetSend) — passing it as a CLI arg through terminal.open proved
-      -- unreliable across terminal providers.
-      local prompt = vim.env.FLEET_PROMPT
-      if prompt and prompt ~= "" then
-        vim.defer_fn(function() FleetSend(prompt) end, 3000)
-      end
-    end, 300)
+    local prompt = vim.env.FLEET_PROMPT
+    if vim.env.FLEET_AUTOCLAUDE == "1" then
+      -- Claude via claudecode.nvim.
+      vim.defer_fn(function()
+        local ok, terminal = pcall(require, "claudecode.terminal")
+        if not ok then
+          vim.notify("fleet: claudecode.nvim not available, open claude manually", vim.log.levels.WARN)
+          return
+        end
+        pcall(terminal.open, {})
+        -- Seed the prompt through the terminal channel (same path as FleetSend)
+        -- — passing it as a CLI arg through terminal.open proved unreliable.
+        if prompt and prompt ~= "" then
+          vim.defer_fn(function() FleetSend(prompt) end, 3000)
+        end
+      end, 300)
+    elseif vim.env.FLEET_HARNESS_BIN and vim.env.FLEET_HARNESS_BIN ~= "" then
+      -- Generic harness (omp, …): open it in a plain :terminal split so
+      -- FleetSend can chan_send into it just like the claude terminal.
+      vim.defer_fn(function()
+        pcall(function()
+          vim.cmd("botright vsplit")
+          vim.cmd("terminal " .. vim.env.FLEET_HARNESS_BIN)
+          vim.cmd("startinsert")
+        end)
+        if prompt and prompt ~= "" then
+          vim.defer_fn(function() FleetSend(prompt) end, 3000)
+        end
+      end, 300)
+    end
   end,
 })
 
@@ -34,7 +57,7 @@ function FleetSend(text)
   for _, buf in ipairs(vim.api.nvim_list_bufs()) do
     if vim.api.nvim_buf_is_loaded(buf) and vim.bo[buf].buftype == "terminal" then
       local name = vim.api.nvim_buf_get_name(buf)
-      if name:match("claude") then
+      if name:match(term_match()) then
         local chan = vim.bo[buf].channel
         if chan and chan > 0 then
           -- Send text and the submit CR as SEPARATE writes. A single
@@ -65,7 +88,7 @@ function FleetCycleMode()
   for _, buf in ipairs(vim.api.nvim_list_bufs()) do
     if vim.api.nvim_buf_is_loaded(buf) and vim.bo[buf].buftype == "terminal" then
       local name = vim.api.nvim_buf_get_name(buf)
-      if name:match("claude") then
+      if name:match(term_match()) then
         local chan = vim.bo[buf].channel
         if chan and chan > 0 then
           vim.api.nvim_chan_send(chan, "\27[Z")

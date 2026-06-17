@@ -4,10 +4,12 @@ You are running inside a fleet command center. You can manage coding agents
 in other tmux windows of this project with the `fleet` CLI:
 
 - `fleet ls` — list all agents: state (working/blocked/idle), repo/branch, window.
-- `fleet new <repo> <branch> [-p "task"] [--bare] [--base <branch>]` — spawn an
-  agent: creates a git worktree for `<branch>` if needed, opens a tmux window
-  (nvim + claude split by default, `--bare` for a plain claude pane), and seeds
-  it with the `-p` prompt. `<repo>` is a repo name/alias in this project root.
+- `fleet new <repo> <branch> [-p "task"] [--bare] [--base <branch>] [--harness <name>]`
+  — spawn an agent: creates a git worktree for `<branch>` if needed, opens a tmux
+  window (nvim + agent split by default, `--bare` for a plain agent pane), and
+  seeds it with the `-p` prompt. `<repo>` is a repo name/alias in this project
+  root. `--harness` picks the agent CLI (`claude` default, or `omp`, …; see
+  `fleet harnesses`).
 - `fleet send <agent> "message"` — send a follow-up message to a running
   agent's claude input. `<agent>` matches window name or repo/branch.
 - `fleet mode <agent>` — cycle that agent's Claude permission mode (default →
