@@ -10,6 +10,16 @@ PROFILES=("$HOME/.claude" "$HOME/.claude_personal")
 
 HOOK_CMD="$BIN_DIR/fleet-hook"
 
+# --no-systemd: skip the systemd user unit. The daemon is then started on demand
+# by `fleet up` (ensure_daemon falls back to `nohup fleetd &`). Auto-detected
+# when `systemctl --user` isn't usable (no systemd, no user bus, containers).
+NO_SYSTEMD=0
+for a in "$@"; do [ "$a" = "--no-systemd" ] && NO_SYSTEMD=1; done
+if [ "$NO_SYSTEMD" = 0 ] && ! systemctl --user show-environment >/dev/null 2>&1; then
+  NO_SYSTEMD=1
+  echo "note: 'systemctl --user' unavailable → installing without systemd (--no-systemd)"
+fi
+
 wire_hooks() { # wire_hooks <settings.json>
   python3 - "$1" "$HOOK_CMD" <<'PY'
 import json, sys
@@ -125,10 +135,19 @@ for b in fleet fleetd fleet-hook fleet-tile fleet-guard; do
   echo "  linked $BIN_DIR/$b"
 done
 
-cp "$FLEET_DIR/systemd/fleetd.service" "$UNIT_DIR/fleetd.service"
-systemctl --user daemon-reload
-systemctl --user enable --now fleetd
-echo "  fleetd.service enabled + started"
+if [ "$NO_SYSTEMD" = 1 ]; then
+  echo "  skipping systemd unit (--no-systemd); fleetd starts on demand via 'fleet up'"
+  # start it now so 'fleet doctor' is green immediately
+  if ! { [ -S "${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/fleet.sock" ]; }; then
+    nohup "$FLEET_DIR/bin/fleetd" >/dev/null 2>&1 &
+    echo "  started fleetd (nohup, pid $!)"
+  fi
+else
+  cp "$FLEET_DIR/systemd/fleetd.service" "$UNIT_DIR/fleetd.service"
+  systemctl --user daemon-reload
+  systemctl --user enable --now fleetd
+  echo "  fleetd.service enabled + started"
+fi
 
 for p in "${PROFILES[@]}"; do
   [ -d "$p" ] || continue

@@ -133,6 +133,11 @@ fleet up ~/path/to/project-root     # boot a project (any root folder of repos)
 
 `install.sh --uninstall` reverses everything.
 
+**No systemd?** `./install.sh --no-systemd` skips the user unit (auto-detected
+when `systemctl --user` isn't usable — containers, no user bus). The daemon then
+starts on demand: `fleet up`'s `ensure_daemon` runs `nohup fleetd &` whenever the
+socket is missing. Everything else (hooks, bins) is identical.
+
 ## Layout
 
 | Path | What |

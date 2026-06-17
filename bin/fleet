@@ -798,7 +798,12 @@ cmd_doctor() {
     hooked=$(grep -c fleet-hook "$prof/settings.json" 2>/dev/null || true)
     if [ "${hooked:-0}" -gt 0 ]; then echo "ok   hooks wired in $prof"; else echo "warn hooks NOT wired in $prof (run install.sh)"; fi
   done
-  systemctl --user is-enabled fleetd >/dev/null 2>&1 && echo "ok   fleetd.service enabled" || echo "warn fleetd.service not enabled"
+  if systemctl --user show-environment >/dev/null 2>&1; then
+    systemctl --user is-enabled fleetd >/dev/null 2>&1 && echo "ok   fleetd.service enabled" \
+      || echo "warn fleetd.service not enabled (ok if installed --no-systemd; 'fleet up' starts it)"
+  else
+    echo "ok   no systemd user bus — fleetd runs on demand (nohup via 'fleet up')"
+  fi
   return $ok
 }
 
