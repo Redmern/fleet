@@ -94,7 +94,12 @@ fail-silent — if the daemon or any app is down, the rest keeps working.
   read its state, and read its cost — so a new harness is a new file, not a code
   change. Pick one with `fleet new <repo> <br> --harness omp`, the dashboard `n`
   form's **Harness** dropdown, or set a default in `~/.config/fleet/config`
-  (`harness=omp`) or a project `.fleet/harness`. Capabilities vary by tool and
+  (`harness=omp`) or a project `.fleet/harness`. The **orchestrator** itself is
+  selectable too: `fleet up <root> --harness omp` boots the command center with
+  an omp driver, and `fleet orchestrator <name>` swaps it **live** on a running
+  session — it respawns just the orchestrator pane (the dashboard and every agent
+  window keep running; the previous orchestrator's conversation ends). Bare
+  `fleet orchestrator` prints the current one. Capabilities vary by tool and
   the UI adapts: harnesses without a permission-mode cycle hide the mode pill +
   `m` key; cost works for any harness that writes a usage log. Harnesses that
   don't emit Claude-style hooks (omp) get their state from a fleetd **scrape**
@@ -156,7 +161,7 @@ socket is missing. Everything else (hooks, bins) is identical.
 | Path | What |
 |---|---|
 | `bin/fleetd` | unix-socket daemon (`$XDG_RUNTIME_DIR/fleet.sock`), state + tmux mirroring + notifications |
-| `bin/fleet` | CLI: `up new fan ls pick send watch mode cost guard main restore menu keys rebind harnesses status doctor` |
+| `bin/fleet` | CLI: `up new fan ls pick send watch mode cost guard main orchestrator restore menu keys rebind harnesses status doctor` |
 | `harness.d/` | one `<name>.conf` per supported agent CLI (claude, omp); drop in a file to add a harness |
 | `bin/fleet-hook` | Claude Code hook → daemon reporter + transcript recorder (fail-silent) |
 | `bin/fleet-guard` | Claude Code PreToolUse hook → write-guard for tests/CI/lockfiles |

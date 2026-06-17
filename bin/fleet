@@ -650,24 +650,71 @@ reload_dash() { # restart the dash process in place — keeps pane size/position
   fi
 }
 
+# orchestrator helpers: the command-center driver pane can be any harness too.
+# load_orch <harness> echoes the binary path AND leaves H_* set in the *caller*
+# (so tag_orch_window can read them) — hence it must NOT be run in a $() subshell.
+load_orch() { # <harness>; sets ORCH_BIN + H_* in the caller
+  harness_load "${1:-claude}"
+  ORCH_BIN=$(harness_bin) || die "$H_NAME not found (looked for: $H_BIN)"
+}
+tag_orch_window() { # <window_id> — tag with current H_* so hookless orchestrators
+  local win="$1"     # still get a status glyph via fleetd's scrape loop
+  tmux set -w -t "$win" @fleet_harness "$H_NAME"
+  tmux set -w -t "$win" @fleet_state_src "$H_STATE_SRC"
+  [ -n "$H_BUSY_RE" ] && tmux set -w -t "$win" @fleet_busy_re "$H_BUSY_RE"
+}
+
 cmd_main() {
-  if [ "${1:-}" = "--reload" ] || [ "${1:-}" = "reload" ]; then
-    local sess; sess=$(session_name) || die "not inside tmux"
-    reload_dash "$sess"
-    return
-  fi
+  local harness=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --reload|reload)
+        local sess; sess=$(session_name) || die "not inside tmux"
+        reload_dash "$sess"; return ;;
+      --harness) harness="$2"; shift 2 ;;
+      *) shift ;;
+    esac
+  done
   local sess; sess=$(session_name) || die "not inside tmux"
   local root; root=$(fleet_root)
   local win; win=$(main_window_id "$sess")
   if [ -z "$win" ]; then
-    local claude_bin
-    claude_bin=$(command -v claude-profile || command -v claude) || die "claude not found"
-    win=$(tmux new-window -P -F '#{window_id}' -t "$sess" -n main -c "$root" "$claude_bin")
+    # orchestrator harness: flag > session memory (@fleet_orch_harness) > claude
+    [ -n "$harness" ] || harness=$(tmux show -t "$sess" -v @fleet_orch_harness 2>/dev/null)
+    [ -n "$harness" ] || harness=claude
+    local ORCH_BIN; load_orch "$harness"
+    win=$(tmux new-window -P -F '#{window_id}' -t "$sess" -n main -c "$root" "$ORCH_BIN")
+    tag_orch_window "$win"
+    tmux set -t "$sess" @fleet_orch_harness "$harness"
     tmux move-window -t "$sess" -s "$win" 2>/dev/null || true
   fi
   sync_main_tiles "$sess"
   tmux select-window -t "$win"
-  echo "command center ready (window 'main')"
+  local oh; oh=$(tmux show -t "$sess" -v @fleet_orch_harness 2>/dev/null)
+  echo "command center ready (window 'main', orchestrator: ${oh:-claude})"
+}
+
+# Switch the orchestrator harness on a running session: respawn just the
+# orchestrator pane (left pane of 'main') with the new harness, in place. The
+# dashboard pane and every agent window keep running. The previous orchestrator
+# agent's conversation/context ends — it's literally a different CLI now.
+cmd_orchestrator() {
+  local sess; sess=$(session_name) || die "not inside tmux"
+  local cur; cur=$(tmux show -t "$sess" -v @fleet_orch_harness 2>/dev/null)
+  local h="${1:-}"
+  if [ -z "$h" ]; then echo "orchestrator: ${cur:-claude} (switch with: fleet orchestrator <harness>)"; return 0; fi
+  local win; win=$(main_window_id "$sess") || true
+  [ -n "$win" ] || die "no 'main' window — run: fleet main"
+  # orchestrator pane = the main window's pane that ISN'T the dashboard
+  # (the dashboard is flagged @fleet_dash=1 by sync_main_tiles).
+  local pane
+  pane=$(tmux list-panes -t "$win" -F $'#{pane_id}\t#{@fleet_dash}' | awk -F'\t' '$2!="1"{print $1; exit}')
+  [ -n "$pane" ] || die "couldn't find the orchestrator pane in 'main'"
+  local ORCH_BIN; load_orch "$h"        # validates harness + loads H_* for tagging
+  tmux respawn-pane -k -t "$pane" "$ORCH_BIN"
+  tag_orch_window "$win"
+  tmux set -t "$sess" @fleet_orch_harness "$h"
+  echo "orchestrator → $h (the previous ${cur:-claude} agent's context ended)"
 }
 
 # ---- up -----------------------------------------------------------------------
@@ -816,10 +863,11 @@ cmd_keys() { # plain text listing
 }
 
 cmd_up() {
-  local arg="" root name restore=0
+  local arg="" root name restore=0 harness=""
   while [ $# -gt 0 ]; do
     case "$1" in
       --restore) restore=1; shift ;;
+      --harness) harness="$2"; shift 2 ;;
       *) [ -z "$arg" ] && arg="$1"; shift ;;
     esac
   done
@@ -848,10 +896,20 @@ cmd_up() {
     fi
     if ! tmux has-session -t "=$name" 2>/dev/null; then
       # fresh session: main IS the first window, orchestrator runs in it —
-      # no placeholder shell window
-      local claude_bin
-      claude_bin=$(command -v claude-profile || command -v claude) || die "claude not found"
-      tmux new-session -d -s "$name" -c "$root" -n main "$claude_bin"
+      # no placeholder shell window. Orchestrator harness: flag > project
+      # .fleet/harness > config (harness=) > claude.
+      local orch="$harness"
+      if [ -z "$orch" ] && [ -f "$root/.fleet/harness" ]; then
+        orch=$(head -1 "$root/.fleet/harness" 2>/dev/null | tr -d '[:space:]')
+      fi
+      if [ -z "$orch" ] && [ -f "$CONF_DIR/config" ]; then
+        orch=$(grep -E '^harness=' "$CONF_DIR/config" 2>/dev/null | tail -1 | cut -d= -f2 | tr -d '[:space:]')
+      fi
+      [ -n "$orch" ] || orch=claude
+      local ORCH_BIN; load_orch "$orch"
+      tmux new-session -d -s "$name" -c "$root" -n main "$ORCH_BIN"
+      tag_orch_window "$(tmux list-windows -t "$name" -F '#{window_id}' | head -1)"
+      tmux set -t "$name" @fleet_orch_harness "$orch"
     fi
   fi
 
@@ -951,6 +1009,7 @@ case "${1:-}" in
   watch-run) shift; cmd_watch_run "$@" ;;  # internal: detached watcher
   mode)    shift; cmd_mode "$@" ;;
   main)       shift; cmd_main "$@" ;;
+  orchestrator|orch) shift; cmd_orchestrator "$@" ;;  # switch orchestrator harness live
   menu)       shift; cmd_menu "$@" ;;
   keys)       shift; cmd_keys "$@" ;;
   rebind)     shift; cmd_rebind "$@" ;;

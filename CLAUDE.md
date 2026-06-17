@@ -80,7 +80,7 @@ State lives in three places, none of them a database:
 
 - **Live agent state** — in `fleetd`'s memory, mirrored to tmux window options.
 - **Per-session saved agents** — `~/.config/fleet/sessions/<session>.agents`
-  (tab-separated: dir, repo, branch, bare, base). Written on `fleet new`, read by
+  (tab-separated: dir, repo, branch, bare, base, harness). Written on `fleet new`, read by
   `fleet restore` to respawn agents whose windows vanished after a tmux/server
   restart. Teardown (`forget`) drops the line.
 - **Config** — `~/.config/fleet/`: `keybinds.conf` (`action=key`, re-applied on
