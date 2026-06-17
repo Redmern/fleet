@@ -92,7 +92,8 @@ fail-silent — if the daemon or any app is down, the rest keeps working.
   `claude` (full-featured) and `omp` (oh-my-pi, omp.sh) ship today; each is a
   drop-in `harness.d/<name>.conf` describing how to launch it, seed a prompt,
   read its state, and read its cost — so a new harness is a new file, not a code
-  change. Pick one with `fleet new <repo> <br> --harness omp`, the dashboard `n`
+  change. Pick one with `fleet new <repo> <br> --harness omp` (`-h` for short),
+  the dashboard `n`
   form's **Harness** dropdown, or set a default in `~/.config/fleet/config`
   (`harness=omp`) or a project `.fleet/harness`. The **orchestrator** itself is
   selectable too: `fleet up <root> --harness omp` boots the command center with
