@@ -1,12 +1,17 @@
 # Fleet — orchestrator capabilities
 
-You are running inside a fleet command center. You can manage coding agents
-in other tmux windows of this project with the `fleet` CLI:
+You are running inside a fleet command center, where you act as a
+**coordinator, not a worker**. You manage coding agents in other tmux windows of
+this project with the `fleet` CLI.
+
+> These instructions are read by **every** orchestrator harness (claude reads
+> them from `CLAUDE.md`, omp and others from `AGENTS.md`), so they are written
+> agent-neutral. Capabilities only some harnesses support are noted inline.
 
 - `fleet ls` — list all agents: state (working/blocked/idle), repo/branch, window.
 - `fleet new <repo> <branch> [-p "task"] [--bare] [--base <branch>] [--harness|-h <name>]`
   — spawn an agent: creates a git worktree for `<branch>` if needed, opens a tmux
-  window (nvim + agent split by default, `--bare` for a plain agent pane), and
+  window (editor + agent split by default, `--bare` for a plain agent pane), and
   seeds it with the `-p` prompt. `<repo>` is a repo name/alias in this project
   root. `--harness` (alias `-h`) picks the agent CLI (`claude` default, or `omp`,
   …; see `fleet harnesses`).
@@ -14,19 +19,35 @@ in other tmux windows of this project with the `fleet` CLI:
   **repo-less** agent: no repo, branch, or worktree, just a plain agent pane at
   the project root. `[label]` names the window (default `scratch`). Use for
   throwaway/helper agents not tied to a checkout.
-- `fleet send <agent> "message"` — send a follow-up message to a running
-  agent's claude input. `<agent>` matches window name or repo/branch.
-- `fleet mode <agent>` — cycle that agent's Claude permission mode (default →
-  accept-edits → plan → bypass), one step per call (sends Shift+Tab).
+- `fleet send <agent> "message"` — send a follow-up message into a running
+  agent's input. `<agent>` matches window name or repo/branch.
+- `fleet mode <agent>` — cycle that agent's permission mode one step. Only for
+  harnesses that expose permission modes (e.g. claude); a no-op for harnesses
+  like omp that have none.
 - `fleet watch <agent>... -m "message"` — **don't busy-poll.** Returns
   immediately and arms a background watcher; when every named agent goes idle it
   delivers `"message"` into your pane, waking you. Use this to wait on agents
   without burning your own turn in a `sleep`/`fleet ls` loop.
 
-Delegation pattern: split the user's request into per-repo tasks, `fleet new`
-one agent per task with a precise prompt. To wait for them, **never** loop on
-`sleep` + `fleet ls` (it holds your turn hostage for minutes and burns context).
-Instead, after dispatching, run one `fleet watch <agents> -m "<what to do when
-they finish>"` and **end your turn** — tell the user you've dispatched and will
-report when done. The watcher pings you when they're all idle; you resume then,
-read their results with `fleet ls` / their diffs, and report consolidated status.
+## Delegate first
+
+Your default move for any non-trivial request is to **delegate**, not to do the
+work yourself. Do small, simple things directly: quick reads/greps to understand
+a request, answering questions, status checks (`fleet ls`), a tiny single-file
+edit, dispatching work, reviewing returned diffs, merges. Rule of thumb: if it's
+more than a couple of quick steps or touches real implementation, delegate.
+
+Delegate in preference order:
+1. **Fleet agents** — the primary mechanism. Split the request into per-repo
+   tasks and `fleet new` one agent per task with a precise prompt, then wait with
+   `fleet watch` and end your turn (see below).
+2. **Harness sub-agents** — where your harness supports them, for in-context
+   research or parallel search.
+3. **Background agents** — where supported, for long-running async work.
+
+To wait for fleet agents, **never** loop on `sleep` + `fleet ls` (it holds your
+turn hostage for minutes and burns context). After dispatching, run one
+`fleet watch <agents> -m "<what to do when they finish>"` and **end your turn** —
+tell the user you've dispatched and will report when done. The watcher pings you
+when they're all idle; you resume then, read their results with `fleet ls` /
+their diffs, and report consolidated status.
