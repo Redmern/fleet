@@ -1182,10 +1182,12 @@ cmd_keys() { # plain text listing
 }
 
 cmd_up() {
-  local arg="" root name restore=0 harness=""
+  local arg="" root name no_restore=0 tmuxinator=0 harness=""
   while [ $# -gt 0 ]; do
     case "$1" in
-      --restore) restore=1; shift ;;
+      --restore) shift ;;             # default now; accepted as a harmless no-op
+      --no-restore) no_restore=1; shift ;;
+      --tmuxinator) tmuxinator=1; shift ;;
       --harness|-h) harness="$2"; shift 2 ;;
       *) [ -z "$arg" ] && arg="$1"; shift ;;
     esac
@@ -1199,6 +1201,10 @@ cmd_up() {
     if [ -f "$yml" ]; then
       root=$(awk -F': *' '$1=="root"{print $2; exit}' "$yml")
       root="${root/#\~/$HOME}"
+      # opt in to the tmuxinator layout per-project: `tmuxinator: true`
+      case "$(awk -F': *' '$1=="tmuxinator"{print $2; exit}' "$yml" | tr -d '[:space:]')" in
+        true|yes|1) tmuxinator=1 ;;
+      esac
     fi
     [ -n "${root:-}" ] || root="$PWD"
   else
@@ -1209,8 +1215,12 @@ cmd_up() {
 
   ensure_daemon
 
+  local created=0
   if ! tmux has-session -t "=$name" 2>/dev/null; then
-    if command -v tmuxinator >/dev/null && tmuxinator list -n 2>/dev/null | grep -qx "$name"; then
+    created=1
+    # tmuxinator layout is opt-in only (--tmuxinator or `tmuxinator: true` in the
+    # project yml). Default fleet up = a clean command center, no repo windows.
+    if [ "$tmuxinator" = 1 ] && command -v tmuxinator >/dev/null && tmuxinator list -n 2>/dev/null | grep -qx "$name"; then
       tmuxinator start "$name" --no-attach 2>/dev/null || true
     fi
     if ! tmux has-session -t "=$name" 2>/dev/null; then
@@ -1244,11 +1254,13 @@ cmd_up() {
   # build command center, explicitly targeting the project session
   FLEET_SESSION="$name" FLEET_ROOT="$root" cmd_main || true
 
-  # restore previously-open agents (after a tmux/server restart), or hint
-  if [ "$restore" = 1 ]; then
+  # restore previously-open agents by default — but only into a session we just
+  # created (don't re-restore when re-attaching a running session). --no-restore
+  # opts out (clean main-only session even when agents were saved).
+  if [ "$created" = 1 ] && [ "$no_restore" != 1 ] && [ -s "$(agents_file "$name")" ]; then
     FLEET_SESSION="$name" FLEET_ROOT="$root" cmd_restore || true
-  elif [ -s "$(agents_file "$name")" ]; then
-    echo "  $(grep -c . "$(agents_file "$name")") saved agent(s) — run 'fleet restore' (or 'fleet up --restore')"
+  elif [ "$no_restore" = 1 ] && [ -s "$(agents_file "$name")" ]; then
+    echo "  $(grep -c . "$(agents_file "$name")") saved agent(s) skipped (--no-restore) — run 'fleet restore' to bring them back"
   fi
 
   if [ -t 0 ]; then
@@ -1276,7 +1288,8 @@ cmd_save() { # save [name] — save the current session as a reusable project al
   local yml="$CONF_DIR/projects/$name.yml" verb="saved"
   [ -f "$yml" ] && verb="updated"
   local rootc="${root/#$HOME/\~}"   # contract $HOME to ~ for portability (cmd_up re-expands)
-  # name: is for readability; cmd_up keys off the FILENAME, only reads root:.
+  # name: is for readability; cmd_up keys off the FILENAME, reads root: (and
+  # optional `tmuxinator: true` to opt in to a same-named tmuxinator layout).
   printf 'name: %s\nroot: %s\n' "$name" "$rootc" > "$yml" || die "could not write $yml"
   echo "$verb project '$name' -> $rootc"
   echo "  'fleet up $name' now starts this project from anywhere."
@@ -1430,7 +1443,7 @@ print_usage() {
 fleet — agent fleet manager (tmux + nvim + Claude Code)
 
   fleet                  (bare, interactive) fzf picker of saved projects -> fleet up
-  fleet up [name|path]   boot project session + daemon + command center ([--restore])
+  fleet up [name|path]   boot project session + daemon + command center (auto-restores saved agents; --no-restore for main only, --tmuxinator to load a same-named tmuxinator layout)
   fleet save [name]      save the current session as a reusable project alias (fleet up <name>)
   fleet restore          respawn saved agents from a previous session
   fleet new <repo> <br>  spawn agent (worktree + window + claude) [-p prompt] [--bare] [--switch|-s] [--base br] [-h harness]
