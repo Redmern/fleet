@@ -512,6 +512,7 @@ new_agent_form() {
   # `editing` (0/1): text fields (Prompt; new-branch name) only capture keystrokes
   # while editing=1. Enter on a text field enters edit mode; Enter/Esc commits and
   # returns to nav mode. In nav mode j/k/arrows navigate every field uniformly.
+  # Scratch is a plain toggle (not a text field) — it never uses editing mode.
   read -r R C < <(tsize)
   local REPOS=() ri=0
   while IFS= read -r x; do [ -n "$x" ] && REPOS+=("$x"); done < <("$FLEET_BIN" repos 2>/dev/null)
