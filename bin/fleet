@@ -453,7 +453,7 @@ cmd_restore() { # respawn saved agents whose windows are gone
 # ---- new ----------------------------------------------------------------------
 
 cmd_new() {
-  local repo="" branch="" prompt="" bare=0 base="" harness="" scratch=0 switch=0
+  local repo="" branch="" prompt="" bare=0 base="" harness="" scratch=0 switch=0 mode=""
   while [ $# -gt 0 ]; do
     case "$1" in
       -p) prompt="$2"; shift 2 ;;
@@ -462,12 +462,14 @@ cmd_new() {
       --switch|-s) switch=1; shift ;;
       --base) base="$2"; shift 2 ;;
       --harness|-h) harness="$2"; shift 2 ;;
+      --mode) mode="$2"; shift 2 ;;   # override start --permission-mode (e.g. bypassPermissions) — not reachable via Shift+Tab
       -*) die "unknown flag $1" ;;
       *) if [ -z "$repo" ]; then repo="$1"; elif [ -z "$branch" ]; then branch="$1"; else die "extra arg $1"; fi; shift ;;
     esac
   done
   [ -n "$harness" ] || harness=$(harness_select)
   harness_load "$harness"
+  [ -n "$mode" ] && H_START_MODE="$mode"   # --mode overrides the harness default start mode
 
   local root; root=$(fleet_root) || die "not inside tmux"
   local sess; sess=$(session_name) || die "not inside tmux"
@@ -481,7 +483,7 @@ cmd_new() {
     dir="$root"
     wname=$(scratch_wname "$sess" "${repo:-scratch}")
   else
-    [ -n "$repo" ] && [ -n "$branch" ] || die "usage: fleet new <repo> <branch> [-p prompt] [--bare] [--switch|-s] [--base branch] [--harness|-h name]  (or: fleet new --scratch [label] for a repo-less agent)"
+    [ -n "$repo" ] && [ -n "$branch" ] || die "usage: fleet new <repo> <branch> [-p prompt] [--bare] [--switch|-s] [--base branch] [--harness|-h name] [--mode default|acceptEdits|plan|auto|bypassPermissions]  (or: fleet new --scratch [label] for a repo-less agent)"
     repo_base=$(resolve_repo "$root" "$repo") || die "repo '$repo' not found under $root"
     local branchdir="${branch//\//_}" anchor=""
     local is_bare_repo; is_bare_repo=$(git -C "$repo_base" rev-parse --is-bare-repository 2>/dev/null)
