@@ -999,6 +999,7 @@ fleet_actions() {
 menu|F|Feature menu|Open this menu
 pick|a|Pick / jump to agent|fzf popup of all agents, Enter jumps
 new|n|New agent|Prompt for "repo branch", spawn agent
+save|s|Save project|Save this session as a reusable project alias (fleet up <name>)
 orch-jump|m|Orchestrator|Jump to the main window's orchestrator pane
 main|M|Rebuild command center|Re-tile the main window
 reload|R|Reload dashboard|Restart the dashboard pane in place (picks up new code)
@@ -1021,6 +1022,7 @@ action_tmux_command() { # tmux command string run when an action's key is presse
     menu) echo "run-shell '$self menu'" ;;
     pick) echo "display-popup -E -b rounded -w 80% -h 60% '$self pick'" ;;
     new)  echo "command-prompt -p 'fleet new (repo branch):' \"run-shell '$self new %%'\"" ;;
+    save) echo "command-prompt -p 'fleet save (name, blank=session):' \"run-shell '$self save %%'\"" ;;
     main)   echo "run-shell '$self main'" ;;
     orch-jump) echo "run-shell '$self orch-jump'" ;;
     reload) echo "display-menu -b rounded -T '#[align=centre]Reload dashboard?' -x C -y C 'Yes, reload' y \"run-shell '$self main --reload'\" 'Cancel' n ''" ;;
