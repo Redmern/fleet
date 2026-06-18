@@ -897,6 +897,27 @@ cmd_orchestrator() {
   echo "orchestrator → $h (the previous ${cur:-claude} agent's context ended)"
 }
 
+# Jump to the orchestrator: select the current session's 'main' window and focus
+# its orchestrator pane (the LEFT pane; the dashboard is the right split, flagged
+# @fleet_dash=1 by sync_main_tiles). Session-relative — run via a prefix keybind,
+# session_name() resolves to the client that pressed it. Fail-silent everywhere:
+# no tmux / no 'main' window / non-fleet session → quietly do nothing.
+cmd_orch_jump() {
+  local sess; sess=$(session_name 2>/dev/null) || exit 0
+  [ -n "$sess" ] || exit 0
+  local win; win=$(main_window_id "$sess") || exit 0
+  [ -n "$win" ] || exit 0
+  tmux select-window -t "$win" 2>/dev/null || exit 0
+  # Leftmost pane that ISN'T the dashboard. Sorting by #{pane_left} (not picking
+  # the first listed) stays correct if the orchestrator was manually re-split or
+  # panes were renumbered by a reload.
+  local pane
+  pane=$(tmux list-panes -t "$win" -F $'#{pane_left}\t#{pane_id}\t#{@fleet_dash}' 2>/dev/null \
+          | awk -F'\t' '$3!="1"{print $1"\t"$2}' | sort -n -k1,1 | head -1 | cut -f2)
+  [ -n "$pane" ] && tmux select-pane -t "$pane" 2>/dev/null
+  exit 0
+}
+
 # ---- up -----------------------------------------------------------------------
 
 ensure_daemon() {
@@ -937,7 +958,8 @@ fleet_actions() {
 menu|F|Feature menu|Open this menu
 pick|a|Pick / jump to agent|fzf popup of all agents, Enter jumps
 new|n|New agent|Prompt for "repo branch", spawn agent
-main|m|Rebuild command center|Re-tile the main window
+orch-jump|m|Orchestrator|Jump to the main window's orchestrator pane
+main|M|Rebuild command center|Re-tile the main window
 reload|R|Reload dashboard|Restart the dashboard pane in place (picks up new code)
 ls|l|List agents|Show agent states in a popup
 EOF
@@ -959,6 +981,7 @@ action_tmux_command() { # tmux command string run when an action's key is presse
     pick) echo "display-popup -E -b rounded -w 80% -h 60% '$self pick'" ;;
     new)  echo "command-prompt -p 'fleet new (repo branch):' \"run-shell '$self new %%'\"" ;;
     main)   echo "run-shell '$self main'" ;;
+    orch-jump) echo "run-shell '$self orch-jump'" ;;
     reload) echo "display-menu -b rounded -T '#[align=centre]Reload dashboard?' -x C -y C 'Yes, reload' y \"run-shell '$self main --reload'\" 'Cancel' n ''" ;;
     ls)     echo "display-popup -E -b rounded -w 70% -h 60% \"$self ls; echo; read -n1 -r -p 'press any key'\"" ;;
   esac
@@ -1285,6 +1308,8 @@ case "${1:-}" in
   reap)    shift; cmd_reap "$@" ;;         # remove flagged-ready worktrees
   mode)    shift; cmd_mode "$@" ;;
   main)       shift; cmd_main "$@" ;;
+  orch-jump)  shift; cmd_orch_jump "$@" ;;            # internal: prefix-key jump to orchestrator pane
+  apply-keybinds) shift; apply_keybinds ;;            # internal: re-apply runtime keybinds live
   orchestrator|orch) shift; cmd_orchestrator "$@" ;;  # switch orchestrator harness live
   menu)       shift; cmd_menu "$@" ;;
   keys)       shift; cmd_keys "$@" ;;
