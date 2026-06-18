@@ -198,6 +198,36 @@ cmd_pick() {
   tmux select-window -t "$win" 2>/dev/null
 }
 
+cmd_pick_project() { # fzf picker over saved projects -> fleet up <name> (bare `fleet`)
+  # fzf-missing falls back to usage (do NOT popup); caller already gated on tty.
+  command -v fzf >/dev/null || { print_usage; return 0; }
+  local dir="$CONF_DIR/projects" ymls=()
+  [ -d "$dir" ] && ymls=("$dir"/*.yml)
+  # zero saved projects: friendly hint + usage, never an empty fzf.
+  if [ ${#ymls[@]} -eq 0 ] || [ ! -e "${ymls[0]}" ]; then
+    echo "no saved projects yet — run 'fleet save <name>' inside a session"
+    echo
+    print_usage
+    return 0
+  fi
+  local rows="" f nm root
+  for f in "${ymls[@]}"; do
+    [ -f "$f" ] || continue
+    nm=$(basename "$f" .yml)
+    root=$(awk -F': *' '$1=="root"{print $2; exit}' "$f")
+    if tmux has-session -t "=$nm" 2>/dev/null; then
+      rows+=$(printf '%s\t\033[32m●\033[0m %-18s %s  \033[32m(running)\033[0m' "$nm" "$nm" "$root")$'\n'
+    else
+      rows+=$(printf '%s\t  %-18s %s' "$nm" "$nm" "$root")$'\n'
+    fi
+  done
+  local choice
+  choice=$(printf '%s' "$rows" | fzf --ansi --delimiter='\t' --with-nth=2 \
+            --no-sort --prompt='project> ' --height=100% --border=rounded) || return 0
+  [ -n "$choice" ] || return 0
+  cmd_up "$(printf '%s' "$choice" | cut -f1)"
+}
+
 # ---- repos / branches (used by the dashboard new-agent form) ------------------
 
 cmd_harnesses() { harness_list; }   # installed harness adapter names (for the form)
@@ -1142,6 +1172,30 @@ cmd_up() {
   fi
 }
 
+cmd_save() { # save [name] — save the current session as a reusable project alias
+  local name="${1:-}" sess root
+  sess=$(session_name 2>/dev/null)
+  [ -n "$sess" ] && root=$(tmux show -t "$sess" -v @fleet_root 2>/dev/null)
+  if [ -z "${root:-}" ]; then
+    # not inside a fleet session (no @fleet_root) — surface clearly, fall back to PWD.
+    root="$PWD"
+    echo "fleet save: not inside a fleet session (no @fleet_root) — using \$PWD: $root" >&2
+  fi
+  [ -n "$root" ] && [ -d "$root" ] || die "could not determine project root"
+  # default name: session name, else basename of root. sanitize to a safe filename.
+  [ -n "$name" ] || name="${sess:-$(basename "$root")}"
+  name=$(printf '%s' "$name" | tr -cd 'a-zA-Z0-9_-')
+  [ -n "$name" ] || die "could not derive a valid project name"
+  mkdir -p "$CONF_DIR/projects" 2>/dev/null || die "could not create $CONF_DIR/projects"
+  local yml="$CONF_DIR/projects/$name.yml" verb="saved"
+  [ -f "$yml" ] && verb="updated"
+  local rootc="${root/#$HOME/\~}"   # contract $HOME to ~ for portability (cmd_up re-expands)
+  # name: is for readability; cmd_up keys off the FILENAME, only reads root:.
+  printf 'name: %s\nroot: %s\n' "$name" "$rootc" > "$yml" || die "could not write $yml"
+  echo "$verb project '$name' -> $rootc"
+  echo "  'fleet up $name' now starts this project from anywhere."
+}
+
 # ---- status / doctor ------------------------------------------------------------
 
 cmd_status() {
@@ -1285,8 +1339,37 @@ doctor_config_sync() {
 
 # ---- dispatch -------------------------------------------------------------------
 
+print_usage() {
+  local menu_key; menu_key=$(keybind_for menu); cat <<EOF
+fleet — agent fleet manager (tmux + nvim + Claude Code)
+
+  fleet                  (bare, interactive) fzf picker of saved projects -> fleet up
+  fleet up [name|path]   boot project session + daemon + command center ([--restore])
+  fleet save [name]      save the current session as a reusable project alias (fleet up <name>)
+  fleet restore          respawn saved agents from a previous session
+  fleet new <repo> <br>  spawn agent (worktree + window + claude) [-p prompt] [--bare] [--switch|-s] [--base br] [-h harness]
+  fleet new --scratch    spawn a repo-less agent (no repo/branch/worktree) [label] [-p prompt] [-h harness]
+  fleet ls               list agents and states
+  fleet pick             fzf jump-to-agent
+  fleet send <a> "msg"   send message to an agent's claude
+  fleet ready [a] [-m r]  flag a worktree done/ready for deletion (no arg = the one you're in) [--clear]
+  fleet reap             remove all worktrees flagged ready (skips unmerged/dirty unless --force)
+  fleet fan <repo> <nm>  best-of-N: spawn N agents on one prompt [-n N] [-p prompt] [--base br] [--bare]
+  fleet cost <a>         show an agent's token spend
+  fleet guard on|off     test/CI write-guard (asks before editing tests/CI/lockfiles)
+  fleet mode <a>         cycle an agent's Claude permission mode (Shift+Tab)
+  fleet main [--reload]  (re)build command center window (--reload restarts just the dashboard)
+  fleet menu             feature menu (bound to prefix+$menu_key by fleet up)
+  fleet keys             list feature keybinds
+  fleet rebind           change a keybind interactively
+  fleet status           live config report (what's deployed, per config repo)
+  fleet doctor           dependency / wiring check
+EOF
+}
+
 case "${1:-}" in
   up)      shift; cmd_up "$@" ;;
+  save)    shift; cmd_save "$@" ;;
   new)     shift; cmd_new "$@" ;;
   ls)      shift; cmd_ls "$@" ;;
   agents)  shift; agents_tsv "$@" ;;   # raw TSV, consumed by fleet-dash
@@ -1317,28 +1400,13 @@ case "${1:-}" in
   rebind-set) shift; cmd_rebind_set "$@" ;;
   status)     shift; cmd_status "$@" ;;
   doctor)     shift; cmd_doctor "$@" ;;
-  *) menu_key=$(keybind_for menu); cat <<EOF
-fleet — agent fleet manager (tmux + nvim + Claude Code)
-
-  fleet up [name|path]   boot project session + daemon + command center ([--restore])
-  fleet restore          respawn saved agents from a previous session
-  fleet new <repo> <br>  spawn agent (worktree + window + claude) [-p prompt] [--bare] [--switch|-s] [--base br] [-h harness]
-  fleet new --scratch    spawn a repo-less agent (no repo/branch/worktree) [label] [-p prompt] [-h harness]
-  fleet ls               list agents and states
-  fleet pick             fzf jump-to-agent
-  fleet send <a> "msg"   send message to an agent's claude
-  fleet ready [a] [-m r]  flag a worktree done/ready for deletion (no arg = the one you're in) [--clear]
-  fleet reap             remove all worktrees flagged ready (skips unmerged/dirty unless --force)
-  fleet fan <repo> <nm>  best-of-N: spawn N agents on one prompt [-n N] [-p prompt] [--base br] [--bare]
-  fleet cost <a>         show an agent's token spend
-  fleet guard on|off     test/CI write-guard (asks before editing tests/CI/lockfiles)
-  fleet mode <a>         cycle an agent's Claude permission mode (Shift+Tab)
-  fleet main [--reload]  (re)build command center window (--reload restarts just the dashboard)
-  fleet menu             feature menu (bound to prefix+$menu_key by fleet up)
-  fleet keys             list feature keybinds
-  fleet rebind           change a keybind interactively
-  fleet status           live config report (what's deployed, per config repo)
-  fleet doctor           dependency / wiring check
-EOF
-  ;;
+  help|-h|--help) print_usage ;;       # explicit help: always the usage text
+  "")
+    # bare `fleet`: project picker only when interactive (stdin+stdout tty) AND
+    # fzf present AND projects exist (cmd_pick_project handles the latter two).
+    # Otherwise usage. NOTE: scripts/dashboard always call WITH a subcommand and
+    # non-interactively, so they keep getting usage, never a popup.
+    if [ -t 0 ] && [ -t 1 ]; then cmd_pick_project; else print_usage; fi
+    ;;
+  *) print_usage ;;                     # a real unknown subcommand (typo) -> usage, not picker
 esac
