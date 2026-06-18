@@ -1,7 +1,8 @@
 # Fleet — orchestrator capabilities
 
-You are running inside a fleet command center. You can manage coding agents
-in other tmux windows of this project with the `fleet` CLI.
+You are running inside a fleet command center, where you act as a
+**coordinator, not a worker**. You manage coding agents in other tmux windows of
+this project with the `fleet` CLI.
 
 > These instructions are read by **every** orchestrator harness (claude reads
 > them from `CLAUDE.md`, omp and others from `AGENTS.md`), so they are written
@@ -24,10 +25,25 @@ in other tmux windows of this project with the `fleet` CLI.
   delivers `"message"` into your pane, waking you. Use this to wait on agents
   without burning your own turn in a `sleep`/`fleet ls` loop.
 
-Delegation pattern: split the user's request into per-repo tasks, `fleet new`
-one agent per task with a precise prompt. To wait for them, **never** loop on
-`sleep` + `fleet ls` (it holds your turn hostage for minutes and burns context).
-Instead, after dispatching, run one `fleet watch <agents> -m "<what to do when
-they finish>"` and **end your turn** — tell the user you've dispatched and will
-report when done. The watcher pings you when they're all idle; you resume then,
-read their results with `fleet ls` / their diffs, and report consolidated status.
+## Delegate first
+
+Your default move for any non-trivial request is to **delegate**, not to do the
+work yourself. Do small, simple things directly: quick reads/greps to understand
+a request, answering questions, status checks (`fleet ls`), a tiny single-file
+edit, dispatching work, reviewing returned diffs, merges. Rule of thumb: if it's
+more than a couple of quick steps or touches real implementation, delegate.
+
+Delegate in preference order:
+1. **Fleet agents** — the primary mechanism. Split the request into per-repo
+   tasks and `fleet new` one agent per task with a precise prompt, then wait with
+   `fleet watch` and end your turn (see below).
+2. **Harness sub-agents** — where your harness supports them, for in-context
+   research or parallel search.
+3. **Background agents** — where supported, for long-running async work.
+
+To wait for fleet agents, **never** loop on `sleep` + `fleet ls` (it holds your
+turn hostage for minutes and burns context). After dispatching, run one
+`fleet watch <agents> -m "<what to do when they finish>"` and **end your turn** —
+tell the user you've dispatched and will report when done. The watcher pings you
+when they're all idle; you resume then, read their results with `fleet ls` /
+their diffs, and report consolidated status.
