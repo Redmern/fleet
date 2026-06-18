@@ -959,6 +959,69 @@ cmd_orch_jump() {
   exit 0
 }
 
+# Tear down the CURRENT fleet session: kill the command center + every agent
+# window in one shot. Session-relative — run via a prefix keybind/menu, so
+# session_name() resolves to the client that triggered it. Does NOT stop fleetd
+# (it's the shared daemon) and does NOT delete the saved-agents file (kept so
+# `fleet up --restore` can rebuild this session later). If a client is attached
+# to the session we're about to kill, move it to another tmux session first (or
+# detach) so tmux doesn't drop the client abruptly. Fail-silent throughout.
+cmd_quit() {
+  local sess; sess=$(session_name 2>/dev/null) || exit 0
+  [ -n "$sess" ] || exit 0
+  # hop the attached client elsewhere before the kill (switch if another session
+  # exists, else detach); ignore failures — the kill is what matters.
+  local other
+  other=$(tmux list-sessions -F '#{session_name}' 2>/dev/null | grep -vxF "$sess" | head -1)
+  if [ -n "$other" ]; then
+    tmux switch-client -t "$other" 2>/dev/null || true
+  else
+    tmux detach-client -s "$sess" 2>/dev/null || true
+  fi
+  tmux kill-session -t "$sess" 2>/dev/null || true
+  exit 0
+}
+
+# fzf picker over OPEN fleet sessions only (tmux sessions carrying a non-empty
+# @fleet_root, set by `fleet up`) -> switch-client to the chosen one. Mirrors
+# cmd_pick's fzf styling. Plain tmux sessions (no @fleet_root) are excluded.
+# Fallbacks: fzf missing or non-interactive -> print the list plainly (never
+# hang); zero or one fleet session -> a friendly message (nothing to switch to).
+cmd_sessions() {
+  local cur; cur=$(session_name 2>/dev/null)
+  local list
+  list=$(tmux list-sessions -F $'#{session_name}\t#{@fleet_root}' 2>/dev/null \
+          | awk -F'\t' '$2!=""')
+  [ -n "$list" ] || { echo "no open fleet sessions"; return 0; }
+  local n; n=$(printf '%s\n' "$list" | grep -c .)
+  if [ "$n" -le 1 ]; then
+    echo "only one open fleet session (${cur:-?}) — nothing to switch to"; return 0
+  fi
+  # agent counts per session, fetched once (cheap), keyed by session name (col 3).
+  local tsv; tsv=$(agents_tsv 2>/dev/null)
+  local rows="" name root cnt mark tag
+  while IFS=$'\t' read -r name root; do
+    [ -n "$name" ] || continue
+    cnt=$(printf '%s\n' "$tsv" | awk -F'\t' -v s="$name" '$3==s' | grep -c .)
+    if [ "$name" = "$cur" ]; then
+      mark=$'\033[32m●\033[0m'; tag=$'  \033[32m(current)\033[0m'
+    else
+      mark=" "; tag=""
+    fi
+    rows+=$(printf '%s\t%s %-18s %s  [%s agents]%s' "$name" "$mark" "$name" "$root" "$cnt" "$tag")$'\n'
+  done <<< "$list"
+  # no fzf / not a tty: print the list plainly and bail (don't hang on fzf).
+  if ! command -v fzf >/dev/null || [ ! -t 0 ] || [ ! -t 1 ]; then
+    printf '%s' "$rows" | cut -f2-
+    return 0
+  fi
+  local choice
+  choice=$(printf '%s' "$rows" | fzf --ansi --delimiter='\t' --with-nth=2 \
+            --no-sort --prompt='fleet session> ' --height=100% --border=rounded) || return 0
+  local chosen; chosen=$(printf '%s' "$choice" | cut -f1)
+  [ -n "$chosen" ] && tmux switch-client -t "$chosen" 2>/dev/null
+}
+
 # ---- up -----------------------------------------------------------------------
 
 ensure_daemon() {
@@ -1004,6 +1067,8 @@ orch-jump|m|Orchestrator|Jump to the main window's orchestrator pane
 main|M|Rebuild command center|Re-tile the main window
 reload|R|Reload dashboard|Restart the dashboard pane in place (picks up new code)
 ls|l|List agents|Show agent states in a popup
+sessions|o|Fleet sessions|Switch between open fleet sessions
+quit|Q|Quit fleet|Kill this fleet session (closes all agents)
 EOF
 }
 
@@ -1027,6 +1092,8 @@ action_tmux_command() { # tmux command string run when an action's key is presse
     orch-jump) echo "run-shell '$self orch-jump'" ;;
     reload) echo "display-menu -b rounded -T '#[align=centre]Reload dashboard?' -x C -y C 'Yes, reload' y \"run-shell '$self main --reload'\" 'Cancel' n ''" ;;
     ls)     echo "display-popup -E -b rounded -w 70% -h 60% \"$self ls; echo; read -n1 -r -p 'press any key'\"" ;;
+    sessions) echo "display-popup -E -b rounded -w 70% -h 60% '$self sessions'" ;;
+    quit)   echo "display-menu -b rounded -T '#[align=centre]Quit fleet session? (closes all agents)' -x C -y C 'Yes, quit' y \"run-shell '$self quit'\" 'Cancel' n ''" ;;
   esac
 }
 
@@ -1372,6 +1439,8 @@ fleet — agent fleet manager (tmux + nvim + Claude Code)
   fleet guard on|off     test/CI write-guard (asks before editing tests/CI/lockfiles)
   fleet mode <a>         cycle an agent's Claude permission mode (Shift+Tab)
   fleet main [--reload]  (re)build command center window (--reload restarts just the dashboard)
+  fleet sessions         fzf switch between open fleet sessions (prefix+$(keybind_for sessions))
+  fleet quit             tear down THIS fleet session — kills all its windows (prefix+$(keybind_for quit))
   fleet menu             feature menu (bound to prefix+$menu_key by fleet up)
   fleet keys             list feature keybinds
   fleet rebind           change a keybind interactively
@@ -1407,6 +1476,8 @@ case "${1:-}" in
   orch-jump)  shift; cmd_orch_jump "$@" ;;            # internal: prefix-key jump to orchestrator pane
   apply-keybinds) shift; apply_keybinds ;;            # internal: re-apply runtime keybinds live
   orchestrator|orch) shift; cmd_orchestrator "$@" ;;  # switch orchestrator harness live
+  sessions|switch) shift; cmd_sessions "$@" ;;        # fzf switcher over open fleet sessions
+  quit)       shift; cmd_quit "$@" ;;                 # tear down THIS fleet session
   menu)       shift; cmd_menu "$@" ;;
   keys)       shift; cmd_keys "$@" ;;
   rebind)     shift; cmd_rebind "$@" ;;
