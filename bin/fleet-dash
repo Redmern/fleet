@@ -408,6 +408,10 @@ render() {
     local age sdisp scol cost
     for (( i=0; i<N && drawn<slots; i++ )); do
       state=$(field "$i" 1); label=$(field "$i" 2); pane=$(field "$i" 6); age=$(field "$i" 7)
+      # show the agent/task name (window name) ahead of the repo/folder so rows
+      # sharing a repo are distinguishable: "<task>  <repo/folder>".
+      local wname; wname=$(field "$i" 4)
+      [ -n "$wname" ] && [ "$wname" != "$label" ] && label="$wname  $label"
       g=$(git_cached "$pane"); gt=$(gitfmt "$g")
       # mode pill only for harnesses with a runtime permission-mode cycle (claude)
       local hmode np
