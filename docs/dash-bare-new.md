@@ -1,110 +1,103 @@
-# Dashboard: bare + harness on the "new agent" form
+# Dashboard: bare + harness on the "new agent" form, plus repo-less `--scratch`
 
-## TL;DR
+## Two different meanings of "bare"
 
-**Already shipped.** The dashboard's `n` → "New fleet agent" form already exposes
-both a **Harness** picker (enumerated live from `fleet harnesses`) and a **Bare**
-yes/no toggle, and passes `--harness`/`--bare` to `fleet new`. No code change is
-required. This doc records the design and the seams in case the flow is extended.
+There are two orthogonal ideas that both got called "bare":
 
-The original task brief ("the dashboard's new flow gives no bare option and no
-harness picker") is out of date: both fields were added in commit `2f0a73e`
-(`feat(harness): pluggable agent harness — claude + omp`) and are present on
-`main`. This branch (`dash-bare-new`) is 0 commits ahead of `main`.
+1. **`--bare` (pre-existing)** — *pane style*: a plain agent pane instead of the
+   default nvim + agent split. It still needs a repo + branch and still builds a
+   worktree. `cmd_new` required both positionals (`bin/fleet:435`) and ran the
+   agent in the worktree dir (`bin/fleet:419-448`).
+2. **`--scratch` (new)** — *repo-less*: **no repo, no branch, no worktree**. A
+   plain agent pane launched at the project root. This is the "bare means nothing
+   is checked out" sense.
 
-## How the flow works today
-
-Trigger: the `n` key in the dashboard main loop calls `new_agent_form`
-(`bin/fleet-dash:746-747`).
-
-`new_agent_form` (`bin/fleet-dash:503-635`) is a self-drawn, centred in-box form
-— **not** fzf or `tmux display-popup`. It owns its own raw-key read loop
-(`read -rsN1 </dev/tty`, `bin/fleet-dash:591`) and renders rows with the
-`mtop`/`mrow`/`mbot` box helpers. This is the same idiom as `confirm_teardown`
-and the `list_pick` dropdown used for Repo/Base. (`display-popup` is used only for
-the read-only diff pager, `bin/fleet-dash:708`.) Any extension must match this
-idiom — no new dependency.
-
-Seven fields, index `0..6` (`nitems=7`, `bin/fleet-dash:509`):
-
-| idx | field   | type     | source / default                                            |
-|-----|---------|----------|-------------------------------------------------------------|
-| 0   | Repo    | select   | `fleet repos` (`:512`)                                      |
-| 1   | Branch  | select/text | `fleet worktrees <repo>` + `+ new branch` sentinel (`:522`) |
-| 2   | Base    | select   | `fleet branches <repo>` (`:525`); hidden unless new branch  |
-| 3   | Prompt  | text     | optional, seeds `-p`                                        |
-| 4   | **Bare**    | toggle   | `no` default (`:508`); space or ←/→ flips (`:571,620`)     |
-| 5   | **Harness** | select   | `fleet harnesses` (`:516`), default `claude` (`:519`)      |
-| 6   | Create  | button   | runs `_spawn`                                              |
-
-Navigation: `j`/`k` or ↑/↓ move between fields; ←/→ (`_cyc`) or space cycle the
-active select/toggle; Enter on a select opens a `list_pick` dropdown
-(`:605-612`); Enter on Create spawns; Esc / 300s timeout cancels at any step
-(`:591,600`).
-
-### The harness picker
-
-- Populated live: `fleet harnesses` (`bin/fleet-dash:516`), whose source is
-  `harness_list` → `harness.d/*.conf` basenames (`bin/fleet:37`, exposed as
-  `cmd_harnesses`, `bin/fleet:185`). Currently yields `claude`, `omp`.
-- Default selection is `claude` if present, else the first entry
-  (`bin/fleet-dash:519`).
-- Empty-list guard: falls back to `HARN=(claude)` (`bin/fleet-dash:517`).
-- Rendered as field 5; cycled by `_cyc` case `5` (`:572`); Enter opens a
-  `list_pick` dropdown (`:611-612`).
-
-### The bare toggle
-
-- Field 4, `bare="no"` default (`bin/fleet-dash:508`).
-- Flipped by space (`:620`) or ←/→ via `_cyc` case `4` (`:571`).
-- `bare=yes` appends `--bare` to the spawn args (`:581`).
-
-### The spawn
-
-`_spawn` (`bin/fleet-dash:575-587`) builds the argv and shells out:
+They are kept as separate flags so neither overloads the other:
 
 ```
-fleet new <repo> <branch> [-p <prompt>] [--bare] [--base <branch>] --harness <name>
+fleet new myrepo feat --bare     # plain pane on a worktree (unchanged)
+fleet new --scratch              # repo-less agent at the project root (new)
+fleet new --scratch dbg -h omp   # repo-less, window labelled "dbg", omp harness
 ```
 
-(`bin/fleet-dash:579-584`). All output is swallowed (`>/dev/null 2>&1`) and the
-result is reported via the dashboard `status` line — fail-silent, matching house
-style.
+## What `--scratch` does (`bin/fleet:400-497`)
 
-On the `fleet new` side (`bin/fleet:400-478`) the flags are already supported:
-`--bare` (`:405`), `--harness|-h` (`:407`). `bare=1` makes `cmd_new` open a plain
-agent pane running the harness binary directly with the prompt via
-`$H_PROMPT_FLAG` (`bin/fleet:457-466`); non-bare opens the nvim + agent split
-(`:467+`). The chosen harness is loaded (`harness_load`, `bin/fleet:414`) and
-stamped onto the window as `@fleet_harness` (`:478`) so fleetd/`pane_harness` can
-recover it.
+- Arg parse: `--scratch) scratch=1` (`bin/fleet:406`). Repo/branch are **not**
+  required in scratch mode; the usage `die` is gated behind `else`
+  (`bin/fleet:435`).
+- Forces `bare=1` — a repo-less agent has nothing to edit in nvim, so it uses the
+  plain-pane spawn path (`bin/fleet:419-424`).
+- `dir = $(fleet_root)` — runs at the project root (`bin/fleet:421`). Verified:
+  spawns at `/home/red/proj/pc-tune`.
+- Window name comes from `scratch_wname` (`bin/fleet:229-234`): the optional
+  first positional as a label (default `scratch`), auto-suffixed `-2`, `-3`… if
+  that name is already an open window in the session, so `fleet send` stays
+  unambiguous. Fail-silent (tmux errors → empty open list → base name).
+- **Not persisted**: `persist_agent` is skipped for scratch (`bin/fleet:495`) —
+  repo-less agents are ephemeral, there is nothing to anchor a `fleet restore`
+  to. `cmd_restore` already skips lines missing repo/branch (`bin/fleet:386`), so
+  this is consistent and needs no restore change.
+- Everything else (harness load, `@fleet_harness` / state-source tagging, the
+  spawn) is shared with the normal path.
 
-## Edge cases (all already handled)
+## What the dashboard form does (`bin/fleet-dash:503-669`)
 
-- **Empty harness list** → `HARN=(claude)` fallback, picker still usable
-  (`bin/fleet-dash:517`).
-- **Single harness** → picker shows the one entry; cycling is a no-op modulo-1.
-  Harmless. *Optional polish below.*
-- **Default behaviour unchanged** → hitting Create with no edits gives
-  `bare=no` + `--harness claude`, i.e. the pre-feature default flow.
-- **Cancel at any step** → Esc or the 300s read timeout returns from the form
-  without spawning (`bin/fleet-dash:591,600`).
+Trigger unchanged: `n` → `new_agent_form` (`bin/fleet-dash:746`). The form is a
+self-drawn in-box modal (same idiom as `confirm_teardown` / `list_pick`, not fzf
+or `display-popup`).
 
-## Reloading after edits
+A **Scratch** toggle was inserted. Field indices are now (`nitems=8`):
 
-Per `CLAUDE.md`: edit `bin/fleet-dash`, then reload in place with `R` in the
-dashboard (`exec "$SELF" "$SESS"`, `bin/fleet-dash:731`) or `fleet main --reload`
-(`bin/fleet:671-673`) — no session/orchestrator restart needed.
+| idx | field   | type   | notes                                             |
+|-----|---------|--------|---------------------------------------------------|
+| 0   | Repo    | select | disabled in scratch mode                          |
+| 1   | Branch  | select/text | disabled in scratch mode                     |
+| 2   | Base    | select | disabled in scratch mode                          |
+| 3   | Prompt  | text   | always active                                     |
+| 4   | **Scratch** | toggle | the new repo-less switch                      |
+| 5   | Bare    | toggle | shown as `(forced)` info when scratch=yes         |
+| 6   | Harness | select | `fleet harnesses`, default claude                 |
+| 7   | Create  | button |                                                   |
 
-## Optional polish (not implemented; low value)
+Mechanics:
 
-1. **Skip the harness field when only one harness exists.** When
-   `${#HARN[@]} == 1`, the field adds a navigation step with no choice. Could
-   conditionally drop field 5 and renumber. Cost: index churn across `_field`,
-   `_cyc`, the Enter `case`, and `nitems`. Not worth it for one saved keypress;
-   leaving the field visible also signals which harness will launch.
-2. **Surface the harness/bare choice in the launching message.** `_spawn`'s
-   `msg_box` (`bin/fleet-dash:578`) says only `launching <repo> / <branch>`.
-   Could append `(<harness>, bare)` for confirmation. Cosmetic.
+- `_active idx` (`bin/fleet-dash:534`) returns non-navigable for fields 0/1/2/5
+  when `scratch=yes`. `_step dir` (`:538`) moves the cursor skipping inactive
+  fields; Tab wraps while skipping (`:636`). Up/down/j/k all route through
+  `_step`.
+- Disabled fields render dimmed with `(scratch — repo-less)` / `(forced)`
+  placeholders (`bin/fleet-dash:_draw`), so the mode is visible.
+- `_toggle_scratch` (`:545`) flips the toggle (space, or ←/→ via `_cyc` case 4).
+- `_spawn` (`bin/fleet-dash:600`): in scratch mode builds `fleet new --scratch
+  [-p prompt] --harness <h>` and skips repo/branch/base entirely; otherwise the
+  original `fleet new <repo> <branch> …` path.
 
-Neither is required; the feature is complete and correct as-is.
+### Edge cases handled
+
+- **No repos under the project root**: the form no longer aborts. It defaults
+  `scratch=yes`, parks the cursor on the Scratch toggle (`ai=4`), and
+  `_toggle_scratch` refuses to turn scratch off while `REPOS` is empty
+  (`bin/fleet-dash:546`). So a repo-less agent is still launchable on an empty
+  project.
+- **Empty harness list** → `HARN=(claude)` fallback (`bin/fleet-dash:517`).
+- **Cancel** at any step: Esc / 300s timeout returns without spawning.
+- **Default flow unchanged**: open form, leave Scratch=no → identical to before
+  (Repo/Branch/Base/Prompt/Bare/Harness/Create).
+
+## Reload / test
+
+Per `CLAUDE.md`: `R` in the dashboard (`bin/fleet-dash:744`, `exec "$SELF"`) or
+`fleet main --reload` (`bin/fleet:671-673`) reloads the dash in place. Note these
+act on the **installed** symlink (`~/.local/bin`), so to test this branch's dash
+either run it from the worktree or re-`install.sh` from here first.
+
+CLI verified end-to-end from inside the live session: `fleet new --scratch`
+spawned `pc-tune:6` named `scratch`, cwd `/home/red/proj/pc-tune`. `fleet new`
+(no scratch, no positionals) still dies with the repo/branch usage message.
+
+## Status
+
+Implemented on branch `dash-bare-new`: `bin/fleet` (`--scratch`, `scratch_wname`,
+persist gate, usage) and `bin/fleet-dash` (Scratch toggle + skip-navigation +
+repo-less spawn). Syntax-checked (`bash -n`) and CLI-tested. The dashboard TUI
+flow needs an interactive reload-test in a session running this branch's code.
