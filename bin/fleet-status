@@ -1,0 +1,105 @@
+#!/usr/bin/env bash
+# fleet-status (DRAFT — see docs/config-sync-architecture.md §3.1)
+#
+# Read-only "what is LIVE" report for the pc-tune config repos. Prints, per repo:
+# the live symlink + its resolved target (asserting it == <repo>/main), main's
+# branch / dirty / ahead-behind, other worktrees, chezmoi-coupling, and stale
+# sibling clones. Touches nothing. Fail-silent in the fleet house style.
+#
+# Not yet wired into the `fleet` dispatch — run directly:
+#   pc-tune/fleet/main/bin/fleet-status
+# MVP follow-up is to expose it as `fleet status` and a dashboard pill.
+
+ROOT="${PC_TUNE_ROOT:-$HOME/proj/pc-tune}"
+
+c_red=$'\033[31m'; c_grn=$'\033[32m'; c_yel=$'\033[33m'; c_dim=$'\033[2m'; c_b=$'\033[1m'; c_0=$'\033[0m'
+ok()   { printf '    %s✓%s %s\n' "$c_grn" "$c_0" "$1"; }
+bad()  { printf '    %s✗%s %s\n' "$c_red" "$c_0" "$1"; }
+warn() { printf '    %s!%s %s\n' "$c_yel" "$c_0" "$1"; }
+info() { printf '    %s·%s %s\n' "$c_dim" "$c_0" "$1"; }
+
+# repo -> "live-symlink-path|expected-resolved-target-under-ROOT|push-remote-branch"
+# (fleet's live wiring is bin symlinks; we check the canonical `fleet` one.)
+specs=(
+  "nvim|$HOME/.config/nvim|nvim/main|main"
+  "tmux|$HOME/.tmux.conf|tmux/main/tmux.conf|main"
+  "tmuxinator|$HOME/.config/tmuxinator|tmuxinator/main|main"
+  "fleet|$HOME/.local/bin/fleet|fleet/main/bin/fleet|master"
+)
+
+printf '%sLIVE CONFIG STATUS%s  (root: %s)\n\n' "$c_b" "$c_0" "$ROOT"
+
+for spec in "${specs[@]}"; do
+  IFS='|' read -r name link relsrc remotebr <<<"$spec"
+  gd="$ROOT/$name/.git"
+  main="$ROOT/$name/main"
+  want="$ROOT/$relsrc"
+  printf '%s%s%s\n' "$c_b" "$name" "$c_0"
+
+  # 1. live symlink resolves to the canonical main worktree?
+  if [ -L "$link" ]; then
+    got="$(readlink -f "$link" 2>/dev/null)"
+    wantres="$(readlink -f "$want" 2>/dev/null)"
+    if [ -n "$got" ] && [ "$got" = "$wantres" ]; then
+      ok "live: $link → $want"
+    else
+      bad "live: $link → ${got:-<broken>}  (expected $want)"
+    fi
+  elif [ -e "$link" ]; then
+    bad "live: $link is NOT a symlink (config drifted out of git?)"
+  else
+    bad "live: $link missing"
+  fi
+
+  # 2. main worktree: branch / dirty / ahead-behind
+  if [ -d "$main" ]; then
+    br="$(git -C "$main" rev-parse --abbrev-ref HEAD 2>/dev/null)"
+    [ "$br" = main ] && info "branch: main" || warn "branch: $br (expected main)"
+    if [ -n "$(git -C "$main" status --porcelain 2>/dev/null)" ]; then
+      n="$(git -C "$main" status --porcelain 2>/dev/null | grep -c .)"
+      warn "DIRTY: $n uncommitted change(s) — live tool reflects un-reviewed edits"
+    else
+      ok "clean"
+    fi
+    # ahead/behind vs the correct remote branch (fleet → origin/master)
+    git -C "$main" fetch -q origin "$remotebr" 2>/dev/null || true
+    counts="$(git -C "$main" rev-list --left-right --count HEAD...origin/"$remotebr" 2>/dev/null)"
+    if [ -n "$counts" ]; then
+      ahead="${counts%%	*}"; behind="${counts##*	}"
+      [ "$ahead" = 0 ] && [ "$behind" = 0 ] && ok "in sync with origin/$remotebr" \
+        || warn "vs origin/$remotebr: ahead $ahead, behind $behind  (push: git -C $name/main push origin main:$remotebr)"
+    fi
+  else
+    bad "no main worktree at $main"
+  fi
+
+  # 3. other (scratch) worktrees — not live (skip the bare repo and main itself)
+  others="$(git --git-dir="$gd" worktree list 2>/dev/null | grep -v '(bare)' | grep -v "^$main ")"
+  if [ -n "$others" ]; then
+    while IFS= read -r line; do [ -n "$line" ] && info "scratch worktree: $line"; done <<<"$others"
+  fi
+  echo
+done
+
+# 4. chezmoi must NOT manage any pc-tune path
+printf '%schezmoi decoupling%s\n' "$c_b" "$c_0"
+if command -v chezmoi >/dev/null 2>&1; then
+  # anchored to the exact live targets — NOT a loose substring (TPM lives at
+  # .config/.tmux/plugins/tpm and is legitimately chezmoi-managed; don't flag it)
+  hit="$(chezmoi managed 2>/dev/null | grep -Ex '\.config/nvim|\.tmux\.conf|\.config/tmuxinator|\.local/bin/fleet' || true)"
+  [ -z "$hit" ] && ok "no config-repo path is chezmoi-managed" \
+    || { bad "chezmoi manages config-repo path(s) — re-coupling! chezmoi forget them:"; printf '%s\n' "$hit" | sed 's/^/        /'; }
+else
+  info "chezmoi not installed — skipping"
+fi
+echo
+
+# 5. stale / duplicate sibling clones in ~/proj
+printf '%sduplicate clones%s\n' "$c_b" "$c_0"
+for name in fleet nvim tmux tmuxinator; do
+  d="$HOME/proj/$name"
+  if [ -d "$d/.git" ] || { [ -d "$d" ] && git -C "$d" rev-parse --git-dir >/dev/null 2>&1; }; then
+    bad "STALE clone at $d (outside pc-tune) — a trap; see doc §3.4. rm -rf after salvaging."
+  fi
+done
+[ -d "$HOME/proj/fleet" ] || ok "no stale sibling clones in ~/proj"
