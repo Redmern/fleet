@@ -724,11 +724,22 @@ cmd_reap() { # reap [<target>] [--force] — remove worktrees flagged ready
     local main; main=$(git -C "$dir" worktree list --porcelain 2>/dev/null | awk '/^worktree /{print $2; exit}')
     local rmflag=""; [ "$force" = 1 ] && rmflag="--force"
     if git -C "${main:-$dir}" worktree remove $rmflag "$dir" 2>/dev/null; then
+      local bnote=""
       if [ -n "$branch" ] && [ -n "$main" ]; then
-        if [ "$force" = 1 ]; then git -C "$main" branch -D "$branch" 2>/dev/null || true
-        else                     git -C "$main" branch -d "$branch" 2>/dev/null || true; fi
+        # Always -D: the non-force path already verified the branch is merged
+        # into its base (the "not merged" guard above), and --force intends to
+        # ignore mergedness — so -D is safe in both. Plain -d would check
+        # mergedness against $main's HEAD, which for a bare worktree-container
+        # is the bare repo's lagging default branch (not the worktree the user
+        # merged into), so it wrongly refuses and the branch lingers. The
+        # branch is no longer checked out anywhere after worktree remove, so
+        # deletion is not blocked by a checkout in either layout.
+        local derr
+        if ! derr=$(git -C "$main" branch -D "$branch" 2>&1); then
+          bnote=" (branch $branch kept: $(printf '%s' "$derr" | head -1))"
+        fi
       fi
-      echo "reaped $lbl"; reaped=$((reaped+1))
+      echo "reaped $lbl$bnote"; reaped=$((reaped+1))
     else
       echo "skip   $lbl: worktree remove failed (uncommitted? use --force)"
     fi
