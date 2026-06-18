@@ -26,7 +26,11 @@ vim.api.nvim_create_autocmd("VimEnter", {
           vim.notify("fleet: claudecode.nvim not available, open claude manually", vim.log.levels.WARN)
           return
         end
-        pcall(terminal.open, {})
+        -- Fleet-scoped permission mode: only this autostart path passes it, so
+        -- manual <leader>cc launches keep claudecode's configured default.
+        local sm = vim.env.FLEET_START_MODE
+        local cmd_args = (sm and sm ~= "") and ("--permission-mode " .. sm) or nil
+        pcall(terminal.open, {}, cmd_args)
         -- Seed the prompt through the terminal channel (same path as FleetSend)
         -- — passing it as a CLI arg through terminal.open proved unreliable.
         if prompt and prompt ~= "" then

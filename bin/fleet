@@ -43,7 +43,7 @@ harness_load() { # populate H_* for <name>; defaults first, then the conf overri
   H_NAME="$name"
   H_BIN="$name"; H_ARGS=""; H_PROMPT_FLAG=""; H_TERM_MATCH="$name"; H_NVIM_PLUGIN=0
   H_STATE_SRC="scrape"; H_MODE_KEYS=""; H_MODE_LIST=""; H_COST_KIND=""
-  H_GUARD_KIND="none"; H_BUSY_RE=""
+  H_GUARD_KIND="none"; H_BUSY_RE=""; H_START_MODE=""
   local conf="$HARNESS_DIR/$name.conf"
   [ -f "$conf" ] || die "unknown harness '$name' (have: $(harness_list | tr '\n' ' '))"
   # shellcheck disable=SC1090
@@ -526,6 +526,7 @@ cmd_new() {
     local argv=("$hbin")
     # shellcheck disable=SC2206
     [ -n "$H_ARGS" ] && argv+=($H_ARGS)
+    [ -n "$H_START_MODE" ] && argv+=(--permission-mode "$H_START_MODE")
     if [ -n "$prompt" ]; then
       [ -n "$H_PROMPT_FLAG" ] && argv+=("$H_PROMPT_FLAG")
       argv+=("$prompt")
@@ -541,6 +542,7 @@ cmd_new() {
       -e FLEET_AUTOCLAUDE="$([ "$H_NVIM_PLUGIN" = 1 ] && echo 1 || echo 0)" \
       -e FLEET_HARNESS="$H_NAME" -e FLEET_HARNESS_BIN="$hbin${H_ARGS:+ $H_ARGS}" \
       -e FLEET_TERM_MATCH="$H_TERM_MATCH" -e FLEET_PROMPT="$prompt" \
+      -e FLEET_START_MODE="$H_START_MODE" \
       nvim . --cmd "lua pcall(dofile, '$FLEET_DIR/nvim/fleet.lua')" --listen "$nsock")
     tmux set -w -t "$win_id" @fleet_nvim_sock "$nsock"
   fi
