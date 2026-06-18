@@ -130,6 +130,10 @@ in other tmux windows of this project with the `fleet` CLI:
   seeds it with the `-p` prompt. `<repo>` is a repo name/alias in this project
   root. `--harness` (alias `-h`) picks the agent CLI (`claude` default, or `omp`,
   …; see `fleet harnesses`).
+- `fleet new --scratch [label] [-p "task"] [--harness|-h <name>]` — spawn a
+  **repo-less** agent: no repo, branch, or worktree, just a plain agent pane at
+  the project root. `[label]` names the window (default `scratch`). Use for
+  throwaway/helper agents not tied to a checkout.
 - `fleet send <agent> "message"` — send a follow-up message to a running
   agent's claude input. `<agent>` matches window name or repo/branch.
 - `fleet mode <agent>` — cycle that agent's Claude permission mode (default →
