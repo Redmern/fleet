@@ -135,7 +135,7 @@ class Fleet:
         self.last_notify[key] = now
         label = agent_label(cur.get("cwd") or pane)
         title, urgency = (
-            ("Agent blocked", "critical") if state == "blocked" else ("Agent done", "normal")
+            ("Agent blocked", "low") if state == "blocked" else ("Agent done", "normal")
         )
         body = f"{label} — " + (
             "waiting for permission/input" if state == "blocked" else "turn finished"
