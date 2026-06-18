@@ -505,13 +505,14 @@ list_pick() {
 # field + Base appear). j/k or ↑/↓ move between fields. Sets global `status`.
 NEWSENT="+ new branch"
 new_agent_form() {
-  local R C bw=58 prompt="" bare="no" ai=0 note="" k r x s newbranch=""
-  local nitems=7    # 0 Repo,1 Branch,2 Base,3 Prompt,4 Bare,5 Harness,6 Create
+  local R C bw=58 prompt="" bare="no" scratch="no" ai=0 note="" k r x s newbranch=""
+  local nitems=8    # 0 Repo,1 Branch,2 Base,3 Prompt,4 Scratch,5 Bare,6 Harness,7 Create
   read -r R C < <(tsize)
   local REPOS=() ri=0
   while IFS= read -r x; do [ -n "$x" ] && REPOS+=("$x"); done < <("$FLEET_BIN" repos 2>/dev/null)
-  (( ${#REPOS[@]} == 0 )) && { status="no repos found under the project root"; return; }
-  local repo="${REPOS[0]}"
+  local repo=""
+  # No repos under the project root? A repo-less scratch agent is still possible.
+  if (( ${#REPOS[@]} )); then repo="${REPOS[0]}"; else scratch="yes"; note="no repos found — scratch only"; ai=4; fi
   local HARN=() hi=0
   while IFS= read -r x; do [ -n "$x" ] && HARN+=("$x"); done < <("$FLEET_BIN" harnesses 2>/dev/null)
   (( ${#HARN[@]} == 0 )) && HARN=(claude)
@@ -525,12 +526,24 @@ new_agent_form() {
     while IFS= read -r x; do [ -n "$x" ] && BRANCHES+=("$x"); done < <("$FLEET_BIN" branches "$repo" 2>/dev/null)
   }
   _load_repo
-  local bx=$(( (C - bw) / 2 )) by=$(( (R - 14) / 2 ))
+  local bx=$(( (C - bw) / 2 )) by=$(( (R - 16) / 2 ))
   (( bx < 0 )) && bx=0; (( by < 1 )) && by=1
 
   _isnew() { [ "${WT[wi]}" = "$NEWSENT" ]; }
   _istext() { { (( ai == 1 )) && _isnew; } || (( ai == 3 )); }   # editable text now?
   _base() { (( ${#BRANCHES[@]} )) && printf '%s' "${BRANCHES[bi]}" || printf '(default)'; }
+  _active() { # idx -> 0 if the field is navigable in the current mode
+    [ "$scratch" = yes ] && case "$1" in 0|1|2|5) return 1 ;; esac   # repo/branch/base/bare off
+    return 0
+  }
+  _step() { # move ai by <dir>, skipping inactive fields, clamped to the range
+    local d="$1" j=$ai
+    while :; do j=$(( j + d )); (( j<0 || j>=nitems )) && return; _active "$j" && { ai=$j; return; }; done
+  }
+  _toggle_scratch() { # repo-less needs at least the option; lock on when no repos
+    (( ${#REPOS[@]} == 0 )) && { scratch=yes; note="no repos found — scratch only"; return; }
+    [ "$scratch" = no ] && scratch=yes || scratch=no
+  }
   _field() { # off idx label value type [placeholder]
     local off="$1" idx="$2" lbl="$3" v="$4" ty="$5" ph="${6:-}" disp txt
     if (( ai == idx )); then
@@ -547,36 +560,57 @@ new_agent_form() {
   _draw() {
     mtop "$by" "$bx" "$bw" "New fleet agent"
     mrow $(( by+1 )) "$bx" "$bw" ""
-    _field 2 0 "Repo" "$repo" select
-    if _isnew; then _field 3 1 "Branch" "$newbranch" text "<new branch>"
-                    _field 4 2 "Base" "$(_base)" select
-    else            _field 3 1 "Branch" "${WT[wi]}" select
-                    _field 4 2 "Base" "(existing worktree)" info; fi
+    if [ "$scratch" = yes ]; then
+      _field 2 0 "Repo"   "(scratch — repo-less)" info
+      _field 3 1 "Branch" "(scratch — repo-less)" info
+      _field 4 2 "Base"   "(scratch — repo-less)" info
+    elif _isnew; then
+      _field 2 0 "Repo" "$repo" select
+      _field 3 1 "Branch" "$newbranch" text "<new branch>"
+      _field 4 2 "Base" "$(_base)" select
+    else
+      _field 2 0 "Repo" "$repo" select
+      _field 3 1 "Branch" "${WT[wi]}" select
+      _field 4 2 "Base" "(existing worktree)" info
+    fi
     _field 5 3 "Prompt" "$prompt" text "(optional)"
-    _field 6 4 "Bare" "$bare" toggle
-    _field 7 5 "Harness" "${HARN[hi]}" select
-    mrow $(( by+8 )) "$bx" "$bw" ""
-    if (( ai == 6 )); then mrow $(( by+9 )) "$bx" "$bw" "[ Create agent ]" 1
-    else mrow $(( by+9 )) "$bx" "$bw" "  Create agent"; fi
-    mrow $(( by+10 )) "$bx" "$bw" ""
-    mrow $(( by+11 )) "$bx" "$bw" "${note:-j/k or up/down move . <> cycle . Enter=list . Esc}"
-    mbot $(( by+12 )) "$bx" "$bw"
+    _field 6 4 "Scratch" "$scratch" toggle
+    if [ "$scratch" = yes ]; then _field 7 5 "Bare" "(forced)" info
+    else                          _field 7 5 "Bare" "$bare" toggle; fi
+    _field 8 6 "Harness" "${HARN[hi]}" select
+    mrow $(( by+9 )) "$bx" "$bw" ""
+    if (( ai == 7 )); then mrow $(( by+10 )) "$bx" "$bw" "[ Create agent ]" 1
+    else mrow $(( by+10 )) "$bx" "$bw" "  Create agent"; fi
+    mrow $(( by+11 )) "$bx" "$bw" ""
+    mrow $(( by+12 )) "$bx" "$bw" "${note:-j/k or up/down move . <> cycle . Enter=list . Esc}"
+    mbot $(( by+13 )) "$bx" "$bw"
   }
   _cyc() { # field <dir:1|-1> — cycle the active select
     local d="$1"
     case "$ai" in
-      0) ri=$(( (ri + d + ${#REPOS[@]}) % ${#REPOS[@]} )); repo="${REPOS[ri]}"; _load_repo ;;
+      0) (( ${#REPOS[@]} )) && { ri=$(( (ri + d + ${#REPOS[@]}) % ${#REPOS[@]} )); repo="${REPOS[ri]}"; _load_repo; } ;;
       1) wi=$(( (wi + d + ${#WT[@]}) % ${#WT[@]} )) ;;
       2) _isnew && (( ${#BRANCHES[@]} )) && bi=$(( (bi + d + ${#BRANCHES[@]}) % ${#BRANCHES[@]} )) ;;
-      4) [ "$bare" = no ] && bare=yes || bare=no ;;
-      5) hi=$(( (hi + d + ${#HARN[@]}) % ${#HARN[@]} )) ;;
+      4) _toggle_scratch ;;
+      5) [ "$bare" = no ] && bare=yes || bare=no ;;
+      6) hi=$(( (hi + d + ${#HARN[@]}) % ${#HARN[@]} )) ;;
     esac
   }
   _spawn() {
+    local args
+    if [ "$scratch" = yes ]; then   # repo-less: no repo/branch/worktree
+      msg_box "New fleet agent" "launching scratch agent (${HARN[hi]}) ..."
+      args=(--scratch)
+      [ -n "$prompt" ] && args+=(-p "$prompt")
+      args+=(--harness "${HARN[hi]}")
+      if "$FLEET_BIN" new "${args[@]}" >/dev/null 2>&1; then status="launched: scratch (${HARN[hi]})"
+      else status="spawn failed: scratch"; fi
+      return 0
+    fi
     local branch; if _isnew; then branch="$newbranch"; else branch="${WT[wi]}"; fi
     [ -n "$branch" ] || { note="pick a worktree or enter a new branch name"; return; }
     msg_box "New fleet agent" "launching $repo / $branch ..."
-    local args=("$repo" "$branch")
+    args=("$repo" "$branch")
     [ -n "$prompt" ] && args+=(-p "$prompt")
     [ "$bare" = yes ] && args+=(--bare)
     if _isnew && (( ${#BRANCHES[@]} )); then args+=(--base "${BRANCHES[bi]}"); fi
@@ -593,13 +627,13 @@ new_agent_form() {
       $'\e')
         IFS= read -rsN2 -t 0.01 r </dev/tty || r=''
         case "$r" in
-          '[A') (( ai>0 )) && ((ai--)) ;;
-          '[B') (( ai<nitems-1 )) && ((ai++)) ;;
+          '[A') _step -1 ;;
+          '[B') _step 1 ;;
           '[C') _cyc 1 ;;
           '[D') _cyc -1 ;;
           '') return ;;
         esac ;;
-      $'\t') ai=$(( (ai+1) % nitems )) ;;
+      $'\t') local _n=0; while (( _n++ < nitems )); do ai=$(( (ai+1) % nitems )); _active "$ai" && break; done ;;
       $'\n'|$'\r')
         case "$ai" in
           0) s=$(list_pick "Select repo" "$ri" "${REPOS[@]}"); clear
@@ -608,16 +642,17 @@ new_agent_form() {
              [ -n "$s" ] && wi="$s" ;;
           2) if _isnew && (( ${#BRANCHES[@]} )); then s=$(list_pick "Branch off of" "$bi" "${BRANCHES[@]}"); clear
                [ -n "$s" ] && bi="$s"; fi ;;
-          5) s=$(list_pick "Harness" "$hi" "${HARN[@]}"); clear
+          6) s=$(list_pick "Harness" "$hi" "${HARN[@]}"); clear
              [ -n "$s" ] && hi="$s" ;;
-          6) _spawn; [ "$status" ] && return ;;
-          *) (( ai<nitems-1 )) && ((ai++)) ;;
+          7) _spawn; [ "$status" ] && return ;;
+          *) _step 1 ;;
         esac ;;
       $'\177'|$'\b')
         if (( ai == 1 )) && _isnew; then newbranch="${newbranch%?}"
         elif (( ai == 3 )); then prompt="${prompt%?}"; fi ;;
       ' ')
-        if (( ai == 4 )); then [ "$bare" = no ] && bare=yes || bare=no
+        if (( ai == 4 )); then _toggle_scratch
+        elif (( ai == 5 )); then [ "$bare" = no ] && bare=yes || bare=no
         elif (( ai == 1 )) && _isnew; then newbranch+=" "
         elif (( ai == 3 )); then prompt+=" "; fi ;;
       *)
@@ -626,8 +661,8 @@ new_agent_form() {
             if _istext; then
               note=""
               if (( ai == 1 )); then newbranch+="$k"; else prompt+="$k"; fi
-            elif [ "$k" = k ]; then (( ai>0 )) && ((ai--))
-            elif [ "$k" = j ]; then (( ai<nitems-1 )) && ((ai++))
+            elif [ "$k" = k ]; then _step -1
+            elif [ "$k" = j ]; then _step 1
             fi ;;
         esac ;;
     esac
