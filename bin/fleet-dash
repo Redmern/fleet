@@ -133,14 +133,22 @@ harness_has_modes() { # harness -> 0 if it supports a permission-mode cycle
   case "$1" in claude) return 0 ;; *) return 1 ;; esac
 }
 
-gitfmt() { # "D A B" -> compact ASCII (≤8 cols): *dirty +ahead -behind, or ok/-
+gitfmt() { # "D A B" -> nerd-font glyphs (≤PILL_W cols): ●dirty ↑ahead ↓behind, ✓ clean, - none
   [ -n "$1" ] || { printf -- '-'; return; }
-  local d a b s=""; read -r d a b <<<"$1"
-  (( ${d:-0} > 0 )) && s+="*$d "
-  (( ${a:-0} > 0 )) && s+="+$a "
-  (( ${b:-0} > 0 )) && s+="-$b "
-  [ -z "$s" ] && s="ok"
-  printf '%.8s' "$s"
+  local d a b; read -r d a b <<<"$1"
+  # priority order: behind ↓ (red) > dirty ● (yellow) > ahead ↑ (cyan); ahead drops first if clipped
+  local segs=()
+  (( ${b:-0} > 0 )) && segs+=("↓$b")
+  (( ${d:-0} > 0 )) && segs+=("●$d")
+  (( ${a:-0} > 0 )) && segs+=("↑$a")
+  (( ${#segs[@]} == 0 )) && { printf '✓'; return; }
+  local s
+  while :; do
+    s=$(IFS=' '; printf '%s' "${segs[*]}")
+    (( ${#s} <= PILL_W || ${#segs[@]} <= 1 )) && break
+    unset 'segs[${#segs[@]}-1]'; segs=("${segs[@]}")
+  done
+  printf '%s' "$s"   # loop already bounds to PILL_W *chars*; %.Ns would byte-clip glyphs
 }
 
 gitcolor() { # "D A B" -> SGR (behind=red, dirty=yellow, ahead=cyan, clean=green)
@@ -161,7 +169,7 @@ ROW_GAP=1     # blank rows between agents
 
 pill_center() { # text -> centred/truncated to exactly PILL_W chars
   local t="$1" len=${#1} pad l
-  (( len >= PILL_W )) && { printf '%.*s' "$PILL_W" "$t"; return; }
+  (( len >= PILL_W )) && { printf '%s' "${t:0:PILL_W}"; return; }  # char-based (glyph-safe), not %.Ns bytes
   pad=$(( PILL_W - len )); l=$(( pad / 2 ))
   printf '%*s%s%*s' "$l" '' "$t" "$(( pad - l ))" ''
 }
