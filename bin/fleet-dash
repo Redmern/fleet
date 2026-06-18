@@ -505,8 +505,11 @@ list_pick() {
 # field + Base appear). j/k or ↑/↓ move between fields. Sets global `status`.
 NEWSENT="+ new branch"
 new_agent_form() {
-  local R C bw=58 prompt="" bare="no" ai=0 note="" k r x s newbranch=""
+  local R C bw=58 prompt="" bare="no" ai=0 note="" k r x s newbranch="" editing=0
   local nitems=7    # 0 Repo,1 Branch,2 Base,3 Prompt,4 Bare,5 Harness,6 Create
+  # `editing` (0/1): text fields (Prompt; new-branch name) only capture keystrokes
+  # while editing=1. Enter on a text field enters edit mode; Enter/Esc commits and
+  # returns to nav mode. In nav mode j/k/arrows navigate every field uniformly.
   read -r R C < <(tsize)
   local REPOS=() ri=0
   while IFS= read -r x; do [ -n "$x" ] && REPOS+=("$x"); done < <("$FLEET_BIN" repos 2>/dev/null)
@@ -529,13 +532,13 @@ new_agent_form() {
   (( bx < 0 )) && bx=0; (( by < 1 )) && by=1
 
   _isnew() { [ "${WT[wi]}" = "$NEWSENT" ]; }
-  _istext() { { (( ai == 1 )) && _isnew; } || (( ai == 3 )); }   # editable text now?
   _base() { (( ${#BRANCHES[@]} )) && printf '%s' "${BRANCHES[bi]}" || printf '(default)'; }
   _field() { # off idx label value type [placeholder]
     local off="$1" idx="$2" lbl="$3" v="$4" ty="$5" ph="${6:-}" disp txt
     if (( ai == idx )); then
       case "$ty" in
-        text)   disp="${v}_" ;;
+        text)   if (( editing )); then disp="${v}_"   # edit mode: trailing cursor
+                else disp="${v:-$ph}"; fi ;;          # nav mode: plain value/placeholder
         select) disp="< ${v:-$ph} >" ;;
         *)      disp="$v" ;;
       esac
@@ -559,7 +562,7 @@ new_agent_form() {
     if (( ai == 6 )); then mrow $(( by+9 )) "$bx" "$bw" "[ Create agent ]" 1
     else mrow $(( by+9 )) "$bx" "$bw" "  Create agent"; fi
     mrow $(( by+10 )) "$bx" "$bw" ""
-    mrow $(( by+11 )) "$bx" "$bw" "${note:-j/k or up/down move . <> cycle . Enter=list . Esc}"
+    mrow $(( by+11 )) "$bx" "$bw" "${note:-j/k or up/down move . <> cycle . Enter=edit/list . Esc}"
     mbot $(( by+12 )) "$bx" "$bw"
   }
   _cyc() { # field <dir:1|-1> — cycle the active select
@@ -592,6 +595,9 @@ new_agent_form() {
     case "$k" in
       $'\e')
         IFS= read -rsN2 -t 0.01 r </dev/tty || r=''
+        # In edit mode: bare Esc commits the text (does NOT cancel the form);
+        # arrow keys are swallowed so they don't navigate mid-edit.
+        if (( editing )); then [ -z "$r" ] && { editing=0; note=""; }; continue; fi
         case "$r" in
           '[A') (( ai>0 )) && ((ai--)) ;;
           '[B') (( ai<nitems-1 )) && ((ai++)) ;;
@@ -599,32 +605,36 @@ new_agent_form() {
           '[D') _cyc -1 ;;
           '') return ;;
         esac ;;
-      $'\t') ai=$(( (ai+1) % nitems )) ;;
+      $'\t') (( editing )) || ai=$(( (ai+1) % nitems )) ;;
       $'\n'|$'\r')
+        if (( editing )); then editing=0; note=""; continue; fi  # Enter commits text
         case "$ai" in
           0) s=$(list_pick "Select repo" "$ri" "${REPOS[@]}"); clear
              [ -n "$s" ] && { ri="$s"; repo="${REPOS[ri]}"; _load_repo; } ;;
-          1) s=$(list_pick "Launch on worktree" "$wi" "${WT[@]}"); clear
-             [ -n "$s" ] && wi="$s" ;;
+          1) if _isnew; then editing=1; note="type branch name . Enter/Esc commits"
+             else s=$(list_pick "Launch on worktree" "$wi" "${WT[@]}"); clear
+               [ -n "$s" ] && wi="$s"; fi ;;
           2) if _isnew && (( ${#BRANCHES[@]} )); then s=$(list_pick "Branch off of" "$bi" "${BRANCHES[@]}"); clear
                [ -n "$s" ] && bi="$s"; fi ;;
+          3) editing=1; note="type prompt . Enter/Esc commits" ;;  # enter prompt edit mode
           5) s=$(list_pick "Harness" "$hi" "${HARN[@]}"); clear
              [ -n "$s" ] && hi="$s" ;;
           6) _spawn; [ "$status" ] && return ;;
           *) (( ai<nitems-1 )) && ((ai++)) ;;
         esac ;;
       $'\177'|$'\b')
-        if (( ai == 1 )) && _isnew; then newbranch="${newbranch%?}"
-        elif (( ai == 3 )); then prompt="${prompt%?}"; fi ;;
+        if (( editing )); then
+          if (( ai == 1 )); then newbranch="${newbranch%?}"; else prompt="${prompt%?}"; fi
+        fi ;;
       ' ')
-        if (( ai == 4 )); then [ "$bare" = no ] && bare=yes || bare=no
-        elif (( ai == 1 )) && _isnew; then newbranch+=" "
-        elif (( ai == 3 )); then prompt+=" "; fi ;;
+        if (( editing )); then
+          if (( ai == 1 )); then newbranch+=" "; else prompt+=" "; fi
+        elif (( ai == 4 )); then [ "$bare" = no ] && bare=yes || bare=no
+        fi ;;
       *)
         case "$k" in
           [[:print:]])
-            if _istext; then
-              note=""
+            if (( editing )); then
               if (( ai == 1 )); then newbranch+="$k"; else prompt+="$k"; fi
             elif [ "$k" = k ]; then (( ai>0 )) && ((ai--))
             elif [ "$k" = j ]; then (( ai<nitems-1 )) && ((ai++))
