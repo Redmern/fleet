@@ -6,9 +6,9 @@
 # branch / dirty / ahead-behind, other worktrees, chezmoi-coupling, and stale
 # sibling clones. Touches nothing. Fail-silent in the fleet house style.
 #
-# Not yet wired into the `fleet` dispatch — run directly:
-#   pc-tune/fleet/main/bin/fleet-status
-# MVP follow-up is to expose it as `fleet status` and a dashboard pill.
+# Wired into the `fleet` dispatch as `fleet status` (cmd_status execs this);
+# also runnable directly:  pc-tune/fleet/main/bin/fleet-status
+# Follow-up is to surface it as a dashboard pill.
 
 ROOT="${PC_TUNE_ROOT:-$HOME/proj/pc-tune}"
 

@@ -2,7 +2,7 @@
 # fleet-dash <session> — interactive agent dashboard for the command center.
 # One row per agent (state · repo/branch · time-in-state · mode · last activity),
 # sorted by urgency. Self-refreshes ~2s. Keyboard control: select / jump / cycle
-# permission mode / send / new. Replaces the old per-agent fleet-tile column.
+# permission mode / send / new.
 #
 # Runs as the right-hand pane of the "main" window, inside the project session,
 # so the fleet sub-commands it shells out to resolve session/root from $TMUX.
@@ -64,25 +64,6 @@ fit_left() { # fit to exactly w *display chars* (char-aware, avoids printf's byt
   (( ${#s} > w )) && s="…${s: -$((w - 1))}"
   pad=$(( w - ${#s} )); (( pad < 0 )) && pad=0
   printf '%s%*s' "$s" "$pad" ''
-}
-
-last_line() { # pane_id -> last non-blank line of its claude view, trimmed
-  local pane="$1" info cmd width cap
-  info=$(tmux display -p -t "$pane" '#{pane_current_command}'$'\t''#{pane_width}' 2>/dev/null) || return 0
-  cmd=${info%%$'\t'*}; width=${info##*$'\t'}
-  cap=$(tmux capture-pane -p -t "$pane" 2>/dev/null) || return 0
-  case "$cmd" in
-    nvim|vi|vim)                          # keep the rightmost CLIP_PCT% (claude split);
-      local keep start                    # drop nvim's full-width statusline/cmdline rows
-      keep=$((width * CLIP_PCT / 100)); start=$((width - keep + 1))
-      [ "$start" -lt 1 ] && start=1
-      cap=$(printf '%s\n' "$cap" | head -n -2 | cut -c"$start"-) ;;
-  esac
-  # last line with real text (skip blanks and pure box-drawing/border rows).
-  # Reduce to ASCII so its display width is predictable — the boxed layout pads
-  # to a fixed column count and wide/unicode glyphs would break the right border.
-  printf '%s\n' "$cap" | awk '/[A-Za-z0-9]/{l=$0} END{print l}' \
-    | LC_ALL=C sed -E 's/[^ -~]//g; s/  +/ /g; s/^ +//; s/ +$//'
 }
 
 mode_label() { # pane_id -> the agent's REAL permission mode, read from claude's

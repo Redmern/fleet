@@ -66,14 +66,20 @@ def matches(pat, path, base):
 
 deny = False
 hit = None
+# Evaluate ALL patterns, not just the first match: a user's bang-prefixed hard
+# deny must win over a built-in soft-ask regardless of list order. A hard deny is
+# terminal (stop early); a soft match is only provisional — keep scanning in case
+# a later pattern denies.
 for pat in patterns:
     hard = pat.startswith("!")
     p = pat[1:] if hard else pat
     if matches(p, path, base):
-        hit = p
         if hard:
             deny = True
-        break
+            hit = p
+            break
+        if hit is None:
+            hit = p
 
 if hit is None:
     sys.exit(0)

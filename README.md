@@ -175,7 +175,6 @@ socket is missing. Everything else (hooks, bins) is identical.
 | `bin/fleet-hook` | Claude Code hook → daemon reporter + transcript recorder (fail-silent) |
 | `bin/fleet-guard` | Claude Code PreToolUse hook → write-guard for tests/CI/lockfiles |
 | `bin/fleet-dash` | interactive agent dashboard for the command center (the right pane of `main`) |
-| `bin/fleet-tile` | legacy single-pane tile renderer — no longer used by `main`, kept for a future preview pane |
 | `nvim/fleet.lua` | loaded into spawned nvim via `--cmd` — claude autostart + `FleetSend()` + `FleetCycleMode()` |
 | `FLEET.md` | orchestrator instructions, copied to project `CLAUDE.md` by `fleet up` |
 

@@ -34,7 +34,7 @@ directly via symlinks in `~/.local/bin`:
 - `systemctl --user restart fleetd` after editing `bin/fleetd`; tail it with
   `journalctl --user -u fleetd -f`.
 
-Languages: `bin/fleet` and `bin/fleet-dash` / `bin/fleet-tile` are **bash**;
+Languages: `bin/fleet` and `bin/fleet-dash` are **bash**;
 `bin/fleetd` is **Python 3 (stdlib only)**; `bin/fleet-hook` and `bin/fleet-guard`
 are **POSIX sh**. Keep `fleetd` stdlib-only and the hooks fast and dependency-light
 (they run on every Claude hook event).

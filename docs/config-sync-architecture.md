@@ -46,7 +46,7 @@ two axes and resurrect the collision.
 | nvim | `pc-tune/nvim/.git` | `pc-tune/nvim/main` | `~/.config/nvim → nvim/main` | `Redmern/nvim_0.12` | `main` |
 | tmux | `pc-tune/tmux/.git` | `pc-tune/tmux/main` | `~/.tmux.conf → tmux/main/tmux.conf` | `Redmern/tmux` | `main` |
 | tmuxinator | `pc-tune/tmuxinator/.git` | `pc-tune/tmuxinator/main` | `~/.config/tmuxinator → tmuxinator/main` | `Redmern/tmuxinator` | `main` |
-| fleet | `pc-tune/fleet/.git` | `pc-tune/fleet/main` | `~/.local/bin/{fleet,fleet-guard,fleet-hook,fleet-tile,fleetd} → fleet/main/bin/*` | `Redmern/fleet` | `main` |
+| fleet | `pc-tune/fleet/.git` | `pc-tune/fleet/main` | `~/.local/bin/{fleet,fleet-guard,fleet-hook,fleetd} → fleet/main/bin/*` | `Redmern/fleet` | `main` |
 
 > **All four repos are now `main ↔ main`.** fleet used to be the odd one out — its
 > remote default was `master` and the local live branch `main`, so push/pull
@@ -279,7 +279,7 @@ pull — if it refuses, the laptop has local commits → go to §1.6.
         │ symlink    │ symlink    │ symlink      │ symlinks
         ▼            ▼            ▼              ▼
   ~/.config/nvim  ~/.tmux.conf  ~/.config/    ~/.local/bin/{fleet,fleet-hook,
-                                tmuxinator     fleetd,fleet-guard,fleet-tile}
+                                tmuxinator     fleetd,fleet-guard}
         └──────────── THE RUNNING SYSTEM (what is actually live) ──────────┘
 
    ✗ STALE: /home/red/proj/fleet  — a SECOND, standalone clone (not a worktree,
