@@ -10,12 +10,14 @@ Stdlib only. Every tmux/notify failure is swallowed — fleetd must
 never take anything else down with it.
 """
 
+import fcntl
 import json
 import os
 import selectors
 import socket
 import re
 import subprocess
+import sys
 import time
 
 RUNTIME_DIR = os.environ.get("XDG_RUNTIME_DIR") or f"/run/user/{os.getuid()}"
@@ -66,12 +68,6 @@ class Fleet:
         cur = sessions.get(sid)
         if cur and seq <= cur["seq"]:
             return {"dropped": "stale seq"}
-        if state == "idle" and cur and cur["state"] == "working":
-            lw = self.last_working.get(pane, 0)
-            if time.time() - lw < IDLE_FLAP_GUARD and seq - cur["seq"] < int(
-                IDLE_FLAP_GUARD * 1e9
-            ):
-                pass  # keep the idle report; flap guard applies to notify only
         sessions[sid] = {
             "state": state,
             "since": time.time(),
@@ -331,6 +327,15 @@ def handle_request(fleet, line):
 
 
 def main():
+    # Single-instance guard: hold an exclusive advisory lock for our lifetime so
+    # a second fleetd can't unlink the live socket out from under the first and
+    # leave two daemons fighting over it. The fd is intentionally never closed.
+    lock_fd = os.open(SOCKET_PATH + ".lock", os.O_CREAT | os.O_RDWR, 0o600)
+    try:
+        fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        sys.stderr.write("fleetd: another instance is already running — exiting\n")
+        return
     try:
         os.unlink(SOCKET_PATH)
     except FileNotFoundError:

@@ -599,6 +599,13 @@ cmd_watch() {
   [ ${#targets[@]} -gt 0 ] || die "usage: fleet watch <agent>... -m \"message when done\""
   local pane="${TMUX_PANE:-}"
   [ -n "$pane" ] || die "run fleet watch from a tmux pane (orchestrator)"
+  # Fail fast if a target matches no agent — don't arm a watcher that never fires.
+  local tsv0 t st
+  tsv0=$(agents_tsv 2>/dev/null)
+  for t in "${targets[@]}"; do
+    st=$(printf '%s\n' "$tsv0" | awk -F'\t' -v x="$t" 'index($2,x)||index($5,x){print $1; exit}')
+    [ -n "$st" ] || die "no agent matching '$t' (try: fleet ls)"
+  done
   [ -n "$msg" ] || msg="fleet: agents now idle — ${targets[*]}"
   local self="$FLEET_DIR/bin/fleet"
   if command -v setsid >/dev/null; then
@@ -611,20 +618,30 @@ cmd_watch() {
 
 cmd_watch_run() { # watch-run <pane> <msg> <target...>  (detached; internal)
   local pane="$1" msg="$2"; shift 2
-  local targets=("$@") streak=0 i tsv state t alldone
+  local targets=("$@") streak=0 i tsv state t alldone blocked
   for (( i=0; i<2700; i++ )); do          # ~90min cap at 2s/iteration
     sleep 2
     tmux display -p -t "$pane" '#{pane_id}' >/dev/null 2>&1 || return 0   # pane gone
     tsv=$(agents_tsv 2>/dev/null)
-    alldone=1
+    alldone=1; blocked=""
     for t in "${targets[@]}"; do
       state=$(printf '%s\n' "$tsv" | awk -F'\t' -v x="$t" 'index($2,x)||index($5,x){print $1; exit}')
       [ "$state" = idle ] || alldone=0
+      [ "$state" = blocked ] && blocked="$t"
     done
+    if [ -n "$blocked" ]; then            # an agent needs input — stop waiting and say so
+      tmux send-keys -t "$pane" -l "fleet watch: agent '$blocked' is BLOCKED and needs your input (won't go idle on its own) — $msg" 2>/dev/null
+      tmux send-keys -t "$pane" Enter 2>/dev/null
+      return 0
+    fi
     if [ "$alldone" = 1 ]; then streak=$((streak+1)); else streak=0; fi
     (( streak >= 3 )) && break             # idle for ~6s straight → done (not a blip)
   done
-  tmux send-keys -t "$pane" -l "$msg" 2>/dev/null
+  if (( streak >= 3 )); then               # loop broke because agents went idle
+    tmux send-keys -t "$pane" -l "$msg" 2>/dev/null
+  else                                     # loop ran out the wait cap — still busy
+    tmux send-keys -t "$pane" -l "fleet watch: timed out after ~90min — still busy: ${targets[*]}" 2>/dev/null
+  fi
   tmux send-keys -t "$pane" Enter 2>/dev/null
 }
 
@@ -718,7 +735,13 @@ cmd_reap() { # reap [<target>] [--force] — remove worktrees flagged ready
         if   git -C "$dir" rev-parse --verify -q "$b"        >/dev/null 2>&1; then baseref="$b"
         elif git -C "$dir" rev-parse --verify -q "origin/$b" >/dev/null 2>&1; then baseref="origin/$b"; fi
       fi
-      if [ -n "$baseref" ] && ! git -C "$dir" merge-base --is-ancestor HEAD "$baseref" 2>/dev/null; then
+      if [ -z "$baseref" ]; then
+        # No resolvable base ref → we cannot verify the branch is merged. Skip
+        # rather than fall through to the unconditional `git branch -D` below,
+        # which would force-delete an unmerged branch silently.
+        echo "skip   $lbl: cannot resolve base ref${b:+ ($b)} to verify merge (use --force)"; continue
+      fi
+      if ! git -C "$dir" merge-base --is-ancestor HEAD "$baseref" 2>/dev/null; then
         echo "skip   $lbl: branch not merged into $b (use --force)"; continue
       fi
     fi
@@ -1299,8 +1322,8 @@ cmd_save() { # save [name] — save the current session as a reusable project al
 
 cmd_status() {
   # Read-only "what is LIVE" report for the pc-tune config repos. The logic lives
-  # in bin/fleet-status (single source — see docs/config-sync-architecture.md §3.1);
-  # we just exec it. Fail-silent if it's missing.
+  # in bin/fleet-status (see docs/config-sync-architecture.md §3.1); we just exec
+  # it. Fail-silent if it's missing.
   local sx="$FLEET_DIR/bin/fleet-status"
   if [ -x "$sx" ]; then exec "$sx" "$@"; fi
   [ -f "$sx" ] && exec bash "$sx" "$@"

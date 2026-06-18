@@ -96,7 +96,7 @@ PY
 
 if [ "${1:-}" = "--uninstall" ]; then
   systemctl --user disable --now fleetd 2>/dev/null || true
-  rm -f "$UNIT_DIR/fleetd.service" "$BIN_DIR/fleet" "$BIN_DIR/fleetd" "$BIN_DIR/fleet-hook" "$BIN_DIR/fleet-tile" "$BIN_DIR/fleet-guard"
+  rm -f "$UNIT_DIR/fleetd.service" "$BIN_DIR/fleet" "$BIN_DIR/fleetd" "$BIN_DIR/fleet-hook" "$BIN_DIR/fleet-guard"
   systemctl --user daemon-reload 2>/dev/null || true
   for p in "${PROFILES[@]}"; do
     [ -f "$p/settings.json" ] && unwire_hooks "$p/settings.json"
@@ -129,7 +129,7 @@ PY
 }
 
 mkdir -p "$BIN_DIR" "$UNIT_DIR"
-for b in fleet fleetd fleet-hook fleet-tile fleet-guard; do
+for b in fleet fleetd fleet-hook fleet-guard; do
   chmod +x "$FLEET_DIR/bin/$b"
   ln -sf "$FLEET_DIR/bin/$b" "$BIN_DIR/$b"
   echo "  linked $BIN_DIR/$b"
