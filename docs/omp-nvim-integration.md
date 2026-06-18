@@ -45,6 +45,48 @@ in nvim, no auth token, no port file) and is omp's blessed path.
 
 ---
 
+## 0. CRITICAL UPDATE (post-research, supersedes optimistic framing below)
+
+Live probing of `omp acp` + reading omp's **embedded** docs (`approval-mode.md`,
+`mcp-config.md`, ACP/RPC source strings in the binary) surfaced a constraint the
+first-pass doc under-weighted:
+
+**omp's editor-integration modes are HEADLESS. There is no "TUI + sidechannel".**
+- `omp acp` and `omp --mode=rpc[/-ui]` run omp as a *headless server* with **no
+  terminal UI** (binary literally prints *"Copy not available in ACP mode"*;
+  `rpc-ui` implies `--no-pty`).
+- claudecode.nvim's parity trick relies on claude running its **full TUI in the
+  `:terminal`** *and* exposing the IDE channel **at the same time**. omp cannot do
+  both at once: you either get the rich omp TUI **or** the editor protocol.
+
+Consequence — omp forces an either/or:
+- **(A) omp TUI in `:terminal`** (today's MVP): great chat UX, `FleetSend` works,
+  but **no** structured diff/selection channel.
+- **(B) `omp acp` headless**: diff-review/selection/mention possible, but you must
+  **reimplement omp's chat UI inside nvim** (render `agent_message_chunk` etc.).
+  That is a large build and a *worse* chat experience than omp's own TUI.
+
+So "ACP gives claudecode parity for free" is **false**. Realistic split:
+- **Cheap wins, keep the TUI (no ACP):** add *send-selection* and *@-file-mention*
+  by `chan_send`ing text (a fenced selection / an `@path`) into the omp TUI via
+  the existing FleetSend channel. Closes 2 of 3 gaps, no architecture change.
+- **Diff-review (the one hard gap):** genuinely needs headless ACP/RPC + a custom
+  in-nvim chat UI. Big, separate effort. (An alternative worth a spike: omp is an
+  **MCP client** — `session/new` takes `mcpServers`, and RPC mode has a
+  `RpcHostToolBridge` / `set_host_tools` letting the *host* register tools omp
+  calls back over stdio. nvim-as-MCP/host-tool-server *might* feed omp editor
+  tools while keeping a UI — unverified.)
+
+Live-verified facts (this machine, omp 16.0.6): newline-delimited JSON-RPC 2.0
+over stdio; `initialize`→`session/new`→`session/prompt`; async `session/update`
+notifications seen: `available_commands_update`, `session_info_update`,
+`usage_update`. `session/request_permission` is the documented accept/reject gate
+(kept by default unless `tools.approvalMode: yolo`). A live `tool_call`/diff frame
+was **not** captured — the sandbox model returned `end_turn` without performing
+edits; capturing a real diff frame remains the top pre-build unknown for path (B).
+
+---
+
 ## 1. How claudecode.nvim works (the parity bar)
 
 Found on disk: `~/.local/share/nvim/lazy/claudecode.nvim/` (coder/claudecode.nvim
