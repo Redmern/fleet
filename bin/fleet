@@ -507,8 +507,24 @@ cmd_new() {
         else
           local from="${base:-$(git -C "$anchor" symbolic-ref --short refs/remotes/origin/HEAD 2>/dev/null | sed 's|origin/||')}"
           from="${from:-main}"
-          git -C "$anchor" worktree add -b "$branch" "$dir" "origin/$from" \
-            || git -C "$anchor" worktree add -b "$branch" "$dir" "$from" \
+          # Pick the freshest base. Prefer the LOCAL branch when it is ahead of or
+          # diverged from origin — local merges that aren't pushed yet must not be
+          # silently ignored (a new agent based on a stale origin/<from> would
+          # revert them). Use origin/<from> only when it is strictly ahead of (or
+          # equal to) local, or when the local branch doesn't exist.
+          local lref="refs/heads/$from" oref="refs/remotes/origin/$from" baseref=""
+          git -C "$anchor" rev-parse --verify -q "$lref" >/dev/null 2>&1 && local have_l=1 || local have_l=0
+          git -C "$anchor" rev-parse --verify -q "$oref" >/dev/null 2>&1 && local have_o=1 || local have_o=0
+          if [ "$have_l" = 1 ] && [ "$have_o" = 1 ]; then
+            if git -C "$anchor" merge-base --is-ancestor "$lref" "$oref" 2>/dev/null; then
+              baseref="$oref"          # origin ahead or equal → use it
+            else
+              baseref="$lref"          # local ahead or diverged → prefer local
+            fi
+          elif [ "$have_l" = 1 ]; then baseref="$lref"
+          elif [ "$have_o" = 1 ]; then baseref="$oref"
+          else baseref="$from"; fi
+          git -C "$anchor" worktree add -b "$branch" "$dir" "$baseref" \
             || die "worktree add failed"
         fi
       fi
