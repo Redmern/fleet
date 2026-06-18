@@ -782,8 +782,9 @@ EOF
 
 # ---- mode ---------------------------------------------------------------------
 # Cycle an agent's Claude permission mode by injecting Shift+Tab into its claude.
-# claude cycles default → accept-edits → plan → bypass on each press, and prints
-# the current mode in its footer (the dash reads that back authoritatively).
+# claude cycles default → accept-edits → plan → auto on each press (bypass is not
+# in the Shift+Tab cycle), and prints the current mode in its footer (the dash
+# reads that back authoritatively).
 
 cmd_mode() {
   local target="${1:-}"

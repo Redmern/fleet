@@ -104,12 +104,15 @@ branch). Branches with `/` become `_` in directory and window names.
 ### Permission-mode discovery (notable)
 
 Claude only exposes mode *cycling* (Shift+Tab), not "set mode X". `cmd_mode`
-cycles one step per call; the dashboard's `m` popup **discovers** the available
-modes the first time it's used — cycling a full loop, recording each mode from
-claude's footer, returning to start — then caches the list. Mode is always read
-live from claude's own footer line, so it stays authoritative across claude
-versions. Sending into nvim agents prefers headless nvim RPC (`FleetCycleMode`),
-falling back to tmux `send-keys BTab` (focus-dependent).
+cycles one step per call. The dashboard's `m` popup presents the modes from the
+static `MODES` list (`bin/fleet-dash`) — the verified Shift+Tab cycle order
+`default → accept-edits → plan → auto` (looping; `bypass` is **not** in the
+Shift+Tab cycle). It then drives the agent toward the chosen mode with
+`apply_mode`, which reads the live footer after each press — so even if a claude
+version reorders the cycle, the agent still lands on the right mode and `MODES`
+only governs the picker's display order. Sending into nvim agents prefers
+headless nvim RPC (`FleetCycleMode`), falling back to tmux `send-keys BTab`
+(focus-dependent).
 
 ## Conventions
 

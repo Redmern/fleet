@@ -15,7 +15,7 @@ SELF="$(readlink -f "${BASH_SOURCE[0]}")"   # this script, for in-place self-rel
 FLEET_BIN="$(dirname "$SELF")/fleet"
 CLIP_PCT="${FLEET_TILE_CLIP:-32}"        # right-column % kept for nvim panes
 REFRESH="${FLEET_DASH_REFRESH:-1}"        # idle refresh interval, seconds
-MODES=(default accept-edits auto plan bypass)   # selectable permission modes
+MODES=(default accept-edits plan auto)   # Shift+Tab cycle order (verified); bypass is not reachable via Shift+Tab
 SELF_PANE="${TMUX_PANE:-}"                 # this dashboard's own tmux pane id
 declare -A GIT_RAW GIT_TS                  # per-pane git status cache (4s TTL)
 declare -A COST_RAW COST_TS                 # per-pane token/cost cache (10s TTL)
@@ -489,11 +489,12 @@ mrow() { # row col width text [selected]
 }
 
 # --- permission-mode selection ------------------------------------------------
-# Claude only exposes mode *cycling* (Shift+Tab), not "set mode X", and the set
-# of modes / their order varies by version. So we DISCOVER the real list once by
-# cycling a full loop (recording each mode from claude's footer, ending back at
-# the start), cache it for the session, then present it as a pick-list and drive
-# the agent to the chosen mode.
+# Claude only exposes mode *cycling* (Shift+Tab), not "set mode X". The MODES list
+# above is the Shift+Tab cycle order (verified empirically: default → accept-edits
+# → plan → auto, looping; bypass is NOT in the Shift+Tab cycle in current claude).
+# We present it as a pick-list, then drive the agent toward the chosen mode with
+# apply_mode — which reads the live footer after each press, so it stays correct
+# even if a claude version reorders the cycle (MODES only affects display order).
 
 mode_desc() { # short hint per known mode
   case "$1" in
