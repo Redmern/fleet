@@ -669,7 +669,7 @@ cmd_ready() { # ready [<agent>] [-m "reason"] [--clear]
     printf 'ts=%s\n' "$(date -Is 2>/dev/null || date)"
     printf 'by=%s\n' "$by"
     [ -n "$reason" ] && printf 'reason=%s\n' "$reason"
-  } >"$marker" 2>/dev/null
+  } 2>/dev/null >"$marker"   # 2>/dev/null FIRST so a failed open of $marker is muted too
   # Don't key success off the brace group's exit: its last statement is the
   # conditional reason line, which is "false" when no -m was given even though
   # the writes succeeded. Check the actual outcome — a non-empty marker file.
