@@ -22,16 +22,17 @@ declare -A COST_RAW COST_TS                 # per-pane token/cost cache (10s TTL
 declare -A HNS_RAW                          # per-pane harness name cache
 STALL_SEC="${FLEET_STALL:-600}"             # working longer than this = stalled
 
-# config-sync live indicator: per-config-repo "what's deployed" glance row
+# config-sync / repo glance row: one pill per repo of the dashboard's CURRENT
+# project (resolved from the session's @fleet_root), showing git state. For
+# pc-tune the row is "live"-aware: each config repo carries a symlink-integrity
+# check against its deployed path (the symlink→main deploy pattern is
+# pc-tune-specific). Other projects are plain repos with no live-deploy map, so
+# they show plain git-status pills (no `!` check) under a "repos" label.
 # (docs/config-sync-architecture.md §3.1). Read-only; recomputed at most every 30s.
-CFG_ROOT="${PC_TUNE_ROOT:-$HOME/proj/pc-tune}"
-cfg_specs=(                                  # repo|live deployed symlink path
-  "nvim|$HOME/.config/nvim"
-  "tmux|$HOME/.tmux.conf"
-  "tmuxinator|$HOME/.config/tmuxinator"
-  "fleet|$HOME/.local/bin/fleet"
-)
+PC_TUNE_ROOT="${PC_TUNE_ROOT:-$HOME/proj/pc-tune}"   # built-in live-map anchor
+CFG_PILL_MAX=8                              # cap pills/row (bound pathological roots)
 CFG_RAW=""; CFG_NP=0; CFG_TS=""             # cached pill string / count / timestamp
+CFG_LABEL="live"                            # row label ("live" for pc-tune, else "repos")
 
 sel=0                                     # selected row index
 status=""                                 # transient status line
@@ -203,26 +204,99 @@ git_pcol()   { # "D A B" -> pill colour
   else echo 2; fi
 }
 
-# --- config-sync live row ----------------------------------------------------
-# One pill per pc-tune config repo whose main worktree exists: short name +
-# state marker (clean / *dirty / +ahead / vbehind / !symlink-broken), coloured
-# like the git pill. Pills built only for repos present, so the row is a no-op
-# on non-pc-tune projects. Sets CFG_RAW (pill string) and CFG_NP (pill count).
+# --- config-sync / repo glance row -------------------------------------------
+# One pill per repo of the dashboard's current project, sorted as the live map
+# (pc-tune) declares or alphabetically (generic). Each pill: short name + git
+# state marker (clean / *dirty / +ahead / vbehind), coloured like the git pill.
+# For pc-tune repos a live-deploy symlink check adds a red `!` when the deployed
+# path no longer resolves inside the repo's primary worktree. Generic projects
+# have no live map, so they show plain git pills (no `!`) under a "repos" label.
+# Sets CFG_RAW (pill string), CFG_NP (pill count), CFG_LABEL (row label).
+
+dash_root() { # the dashboard's project root: @fleet_root → FLEET_ROOT → pwd
+  local r; r=$(tmux show -t "$SESS" -v @fleet_root 2>/dev/null)
+  [ -n "$r" ] && { printf '%s' "$r"; return 0; }
+  [ -n "${FLEET_ROOT:-}" ] && { printf '%s' "$FLEET_ROOT"; return 0; }
+  pwd
+}
+
+primary_worktree() { # container → primary worktree path; empty if no checkout
+  # main/ worktree (pc-tune shape) > plain repo > origin/HEAD default-branch
+  # worktree > first worktree. Only the generic branches touch git (pc-tune
+  # always hits the cheap main/ case, so its row stays git-call-free here).
+  local cont="$1" w anchor def path br
+  if [ -d "$cont/main" ] && [ -e "$cont/main/.git" ]; then printf '%s' "$cont/main"; return 0; fi
+  # plain working repo: a non-bare checkout directly at the container (a bare
+  # worktree-container has a .git too, but no work tree — fall through to glob).
+  if [ -e "$cont/.git" ] && [ "$(git -C "$cont" rev-parse --is-inside-work-tree 2>/dev/null)" = true ]; then
+    printf '%s' "$cont"; return 0          # a bare container prints "false" here → skip
+  fi
+  anchor=""
+  for w in "$cont"/*/; do w="${w%/}"; [ -e "$w/.git" ] || continue; anchor="$w"; break; done
+  [ -n "$anchor" ] || return 1
+  def=$(git -C "$anchor" symbolic-ref --short refs/remotes/origin/HEAD 2>/dev/null | sed 's|^origin/||')
+  if [ -n "$def" ]; then
+    while IFS=$'\t' read -r path br; do
+      [ "$br" = "$def" ] && { printf '%s' "$path"; return 0; }
+    done < <(git -C "$anchor" worktree list --porcelain 2>/dev/null \
+               | awk '/^worktree /{p=$2} /^branch /{sub("refs/heads/","",$2); print p"\t"$2}')
+  fi
+  printf '%s' "$anchor"
+}
+
+cfg_short() { # repo name → pill label: tmuxinator→tmxn, long hyphenated→last segment
+  local n="$1"
+  case "$n" in tmuxinator) printf 'tmxn'; return ;; esac
+  (( ${#n} > PILL_W )) && case "$n" in *-*) n="${n##*-}" ;; esac
+  printf '%s' "$n"
+}
+
 config_live() {
-  CFG_RAW=""; CFG_NP=0
-  local spec name link main g d a b col mark got canon symok short gap
+  CFG_RAW=""; CFG_NP=0; CFG_LABEL="repos"
+  local root; root=$(dash_root); [ -n "$root" ] || return 0
+  # Live map: built-in pc-tune set, applied only when the resolved root IS the
+  # pc-tune root. Keyed by canonical path so $PWD/symlink variants still match;
+  # both sides must be non-empty to avoid an empty==empty false positive.
+  local -a specs=(); local -A livemap=()
+  local s n p rc pc
+  rc=$(readlink -f "$root" 2>/dev/null)
+  pc=$(readlink -f "$PC_TUNE_ROOT" 2>/dev/null)
+  if [ -n "$rc" ] && [ -n "$pc" ] && [ "$rc" = "$pc" ]; then
+    specs=(
+      "nvim|$HOME/.config/nvim"
+      "tmux|$HOME/.tmux.conf"
+      "tmuxinator|$HOME/.config/tmuxinator"
+      "fleet|$HOME/.local/bin/fleet"
+    )
+    CFG_LABEL="live"
+    for s in "${specs[@]}"; do IFS='|' read -r n p <<<"$s"; livemap[$n]="$p"; done
+  fi
+  # Repo list: live-map order when present (pc-tune → byte-for-byte today),
+  # else all repos discovered under the root (alphabetical, generic projects).
+  local -a names=()
+  if (( ${#specs[@]} )); then
+    for s in "${specs[@]}"; do IFS='|' read -r n p <<<"$s"; names+=("$n"); done
+  else
+    while IFS= read -r n; do [ -n "$n" ] && names+=("$n"); done \
+      < <("$FLEET_BIN" repos 2>/dev/null)
+  fi
+  (( ${#names[@]} )) || return 0           # scratch / repo-less project → skip row
+  local name cont prim g d a b col mark link canon got symok short gap count=0
   gap=$(printf '%*s' "$PILL_GAP" '')
-  for spec in "${cfg_specs[@]}"; do
-    IFS='|' read -r name link <<<"$spec"
-    main="$CFG_ROOT/$name/main"
-    [ -d "$main" ] || continue
-    g=$(git_status "$main"); read -r d a b <<<"${g:-0 0 0}"
-    # symlink integrity: live deployed path resolves inside the main worktree
-    canon=$(readlink -f "$main" 2>/dev/null)
-    got=$(readlink -f "$link" 2>/dev/null)
-    if [ -z "$got" ] || [ -z "$canon" ]; then symok=0
-    elif [ "$got" = "$canon" ] || case "$got" in "$canon"/*) true;; *) false;; esac; then symok=1
-    else symok=0; fi
+  for name in "${names[@]}"; do
+    (( count >= CFG_PILL_MAX )) && break    # bound pathological roots (noted)
+    cont="$root/$name"
+    prim=$(primary_worktree "$cont"); [ -n "$prim" ] || continue
+    g=$(git_status "$prim"); read -r d a b <<<"${g:-0 0 0}"
+    link="${livemap[$name]:-}"
+    if [ -n "$link" ]; then
+      # symlink integrity: deployed path resolves at/under the primary worktree
+      canon=$(readlink -f "$prim" 2>/dev/null)
+      got=$(readlink -f "$link" 2>/dev/null)
+      if [ -z "$got" ] || [ -z "$canon" ]; then symok=0
+      elif [ "$got" = "$canon" ] || case "$got" in "$canon"/*) true;; *) false;; esac; then symok=1
+      else symok=0; fi
+    else symok=1; fi                        # no live mapping → no `!` check
     if (( symok == 0 )); then col=1; mark="!"
     else
       col=$(git_pcol "$g")
@@ -231,10 +305,13 @@ config_live() {
       elif (( ${a:-0} > 0 )); then mark="+"
       else mark=""; fi
     fi
-    case "$name" in tmuxinator) short=tmxn ;; *) short="$name" ;; esac
+    short=$(cfg_short "$name")
+    # state glyph is secondary: on names that fill PILL_W it truncates away, but
+    # the pill colour (git_pcol: red behind / yellow dirty / cyan ahead) still
+    # encodes state, so nothing is lost beyond the redundant glyph.
     [ -n "$CFG_RAW" ] && CFG_RAW+="$gap"
     CFG_RAW+=$(pill "$short${mark:+ $mark}" "$col")
-    (( CFG_NP++ ))
+    (( CFG_NP++ )); (( count++ ))
   done
 }
 
@@ -318,17 +395,18 @@ render() {
     printf '\033[2m│%s│\033[0m\033[K\n' "$blank"; (( drawn++ ))
   done
 
-  # config-sync live row: one pill per present config repo, then a blank spacer.
-  # Skipped on non-pc-tune projects (CFG_NP==0) or when too narrow to fit.
+  # project repo glance row: one pill per repo, then a blank spacer. Skipped on
+  # repo-less projects (CFG_NP==0) or when too narrow to fit. The label width is
+  # derived from CFG_LABEL so "live " (pc-tune) and "repos " stay in budget.
   config_live_cached
   if (( CFG_NP > 0 && drawn < slots )); then
-    local cpw=$(( PILL_W + 4 )) cused cpad cgap
-    cgap=$(printf '%*s' "$PILL_GAP" '')
-    cused=$(( CFG_NP * cpw + (CFG_NP - 1) * PILL_GAP + 5 ))   # +5 = "live " label
+    local cpw=$(( PILL_W + 4 )) cused cpad clab
+    clab="${CFG_LABEL:-live} "
+    cused=$(( CFG_NP * cpw + (CFG_NP - 1) * PILL_GAP + ${#clab} ))
     cpad=$(( cw - cused ))
     if (( cpad >= 0 )); then
-      printf '\033[2m│\033[0m%s\033[2mlive \033[0m%s%*s%s\033[2m│\033[0m\033[K\n' \
-        "$ins" "$CFG_RAW" "$cpad" '' "$ins"
+      printf '\033[2m│\033[0m%s\033[2m%s\033[0m%s%*s%s\033[2m│\033[0m\033[K\n' \
+        "$ins" "$clab" "$CFG_RAW" "$cpad" '' "$ins"
       (( drawn++ ))
       (( drawn < slots )) && { printf '\033[2m│%s│\033[0m\033[K\n' "$blank"; (( drawn++ )); }
     fi
