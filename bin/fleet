@@ -1017,7 +1017,7 @@ cmd_sessions() {
   fi
   local choice
   choice=$(printf '%s' "$rows" | fzf --ansi --delimiter='\t' --with-nth=2 \
-            --no-sort --prompt='fleet session> ' --height=100% --border=rounded) || return 0
+            --no-sort --prompt='fleet session> ' --height=100% --border=none) || return 0
   local chosen; chosen=$(printf '%s' "$choice" | cut -f1)
   [ -n "$chosen" ] && tmux switch-client -t "$chosen" 2>/dev/null
 }
