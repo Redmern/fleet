@@ -22,6 +22,17 @@ declare -A COST_RAW COST_TS                 # per-pane token/cost cache (10s TTL
 declare -A HNS_RAW                          # per-pane harness name cache
 STALL_SEC="${FLEET_STALL:-600}"             # working longer than this = stalled
 
+# config-sync live indicator: per-config-repo "what's deployed" glance row
+# (docs/config-sync-architecture.md §3.1). Read-only; recomputed at most every 30s.
+CFG_ROOT="${PC_TUNE_ROOT:-$HOME/proj/pc-tune}"
+cfg_specs=(                                  # repo|live deployed symlink path
+  "nvim|$HOME/.config/nvim"
+  "tmux|$HOME/.tmux.conf"
+  "tmuxinator|$HOME/.config/tmuxinator"
+  "fleet|$HOME/.local/bin/fleet"
+)
+CFG_RAW=""; CFG_NP=0; CFG_TS=""             # cached pill string / count / timestamp
+
 sel=0                                     # selected row index
 status=""                                 # transient status line
 
@@ -192,6 +203,45 @@ git_pcol()   { # "D A B" -> pill colour
   else echo 2; fi
 }
 
+# --- config-sync live row ----------------------------------------------------
+# One pill per pc-tune config repo whose main worktree exists: short name +
+# state marker (clean / *dirty / +ahead / vbehind / !symlink-broken), coloured
+# like the git pill. Pills built only for repos present, so the row is a no-op
+# on non-pc-tune projects. Sets CFG_RAW (pill string) and CFG_NP (pill count).
+config_live() {
+  CFG_RAW=""; CFG_NP=0
+  local spec name link main g d a b col mark got canon symok short gap
+  gap=$(printf '%*s' "$PILL_GAP" '')
+  for spec in "${cfg_specs[@]}"; do
+    IFS='|' read -r name link <<<"$spec"
+    main="$CFG_ROOT/$name/main"
+    [ -d "$main" ] || continue
+    g=$(git_status "$main"); read -r d a b <<<"${g:-0 0 0}"
+    # symlink integrity: live deployed path resolves inside the main worktree
+    canon=$(readlink -f "$main" 2>/dev/null)
+    got=$(readlink -f "$link" 2>/dev/null)
+    if [ -z "$got" ] || [ -z "$canon" ]; then symok=0
+    elif [ "$got" = "$canon" ] || case "$got" in "$canon"/*) true;; *) false;; esac; then symok=1
+    else symok=0; fi
+    if (( symok == 0 )); then col=1; mark="!"
+    else
+      col=$(git_pcol "$g")
+      if   (( ${b:-0} > 0 )); then mark="v"
+      elif (( ${d:-0} > 0 )); then mark="*"
+      elif (( ${a:-0} > 0 )); then mark="+"
+      else mark=""; fi
+    fi
+    case "$name" in tmuxinator) short=tmxn ;; *) short="$name" ;; esac
+    [ -n "$CFG_RAW" ] && CFG_RAW+="$gap"
+    CFG_RAW+=$(pill "$short${mark:+ $mark}" "$col")
+    (( CFG_NP++ ))
+  done
+}
+
+config_live_cached() { # recompute CFG_RAW/CFG_NP at most every 30s
+  if [ -z "$CFG_TS" ] || (( SECONDS - CFG_TS > 30 )); then config_live; CFG_TS=$SECONDS; fi
+}
+
 # --- data --------------------------------------------------------------------
 # ROWS[] entries: state \t label \t window_id \t window_name \t since \t pane_id \t age
 load_rows() {
@@ -267,6 +317,22 @@ render() {
   for (( i=0; i<PAD_Y && drawn<slots; i++ )); do   # top padding rows
     printf '\033[2m│%s│\033[0m\033[K\n' "$blank"; (( drawn++ ))
   done
+
+  # config-sync live row: one pill per present config repo, then a blank spacer.
+  # Skipped on non-pc-tune projects (CFG_NP==0) or when too narrow to fit.
+  config_live_cached
+  if (( CFG_NP > 0 && drawn < slots )); then
+    local cpw=$(( PILL_W + 4 )) cused cpad cgap
+    cgap=$(printf '%*s' "$PILL_GAP" '')
+    cused=$(( CFG_NP * cpw + (CFG_NP - 1) * PILL_GAP + 5 ))   # +5 = "live " label
+    cpad=$(( cw - cused ))
+    if (( cpad >= 0 )); then
+      printf '\033[2m│\033[0m%s\033[2mlive \033[0m%s%*s%s\033[2m│\033[0m\033[K\n' \
+        "$ins" "$CFG_RAW" "$cpad" '' "$ins"
+      (( drawn++ ))
+      (( drawn < slots )) && { printf '\033[2m│%s│\033[0m\033[K\n' "$blank"; (( drawn++ )); }
+    fi
+  fi
 
   if (( N == 0 )); then
     (( drawn < slots )) && { printf '\033[2m│\033[0m%s%-*s%s\033[2m│\033[0m\033[K\n' \

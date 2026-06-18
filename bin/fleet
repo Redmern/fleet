@@ -1119,12 +1119,13 @@ cmd_up() {
 # ---- status / doctor ------------------------------------------------------------
 
 cmd_status() {
-  if rpc fleet.ping >/dev/null 2>&1; then
-    local n; n=$(rpc fleet.list | python3 -c 'import json,sys; print(len(json.load(sys.stdin)["agents"]))' 2>/dev/null)
-    echo "fleetd: running ($SOCK), agents: ${n:-?}"
-  else
-    echo "fleetd: NOT running"
-  fi
+  # Read-only "what is LIVE" report for the pc-tune config repos. The logic lives
+  # in bin/fleet-status (single source — see docs/config-sync-architecture.md §3.1);
+  # we just exec it. Fail-silent if it's missing.
+  local sx="$FLEET_DIR/bin/fleet-status"
+  if [ -x "$sx" ]; then exec "$sx" "$@"; fi
+  [ -f "$sx" ] && exec bash "$sx" "$@"
+  echo "fleet status: bin/fleet-status not found" >&2; return 0
 }
 
 cmd_doctor() {
@@ -1165,7 +1166,95 @@ cmd_doctor() {
   else
     echo "ok   no systemd user bus — fleetd runs on demand (nohup via 'fleet up')"
   fi
+  doctor_config_sync   # non-fatal advisories: symlinks / chezmoi / stale clones
   return $ok
+}
+
+# config-sync guardrails (docs/config-sync-architecture.md §3.4). Read-only,
+# non-fatal advisories in doctor's pass/warn style. Guards every git/chezmoi call.
+doctor_config_sync() {
+  local root rootr
+  root="${PC_TUNE_ROOT:-$HOME/proj/pc-tune}"
+  rootr="$(readlink -f "$root" 2>/dev/null)"
+  [ -n "$rootr" ] || return 0
+  echo "--- config-sync (pc-tune) ---"
+
+  # repo -> live deployed path (the symlink the running tool reaches through)
+  local specs=(
+    "nvim|$HOME/.config/nvim"
+    "tmux|$HOME/.tmux.conf"
+    "tmuxinator|$HOME/.config/tmuxinator"
+    "fleet|$HOME/.local/bin/fleet"
+  )
+
+  local spec name link gd mains nmain canon canonr got
+  for spec in "${specs[@]}"; do
+    IFS='|' read -r name link <<<"$spec"
+    gd="$root/$name/.git"
+
+    # canonical main = the worktree whose branch is main, per git itself (NOT
+    # a hardcoded path). May be a bare-repo .git or a worktree's .git file.
+    mains="$(git --git-dir="$gd" worktree list --porcelain 2>/dev/null | awk '
+      /^worktree /{wt=substr($0,10)}
+      /^branch /{ if ($2=="refs/heads/main") print wt }')"
+    nmain="$(printf '%s\n' "$mains" | grep -c . 2>/dev/null)"
+    canon="$(printf '%s\n' "$mains" | head -1)"
+
+    if [ -z "$canon" ]; then
+      echo "warn $name: no worktree claims branch main (cannot verify live link)"
+      continue
+    fi
+    [ "${nmain:-0}" -gt 1 ] && echo "warn $name: >1 worktree claims main — ambiguous live target"
+    canonr="$(readlink -f "$canon" 2>/dev/null)"
+
+    # canonical main must live under a known container root (~/proj/pc-tune)
+    case "$canonr/" in
+      "$rootr"/*) ;;
+      *) echo "warn $name: main worktree '$canon' is outside container root $root" ;;
+    esac
+
+    # the live deployed path must be a symlink resolving inside canonical main
+    if [ -L "$link" ]; then
+      got="$(readlink -f "$link" 2>/dev/null)"
+      if [ -z "$got" ]; then
+        echo "warn $name: live link $link is DANGLING"
+      elif [ "$got" = "$canonr" ] || case "$got" in "$canonr"/*) true;; *) false;; esac; then
+        echo "ok   $name: live $link → $canon (canonical main)"
+      else
+        echo "warn $name: live $link → $got NOT under canonical main $canon"
+      fi
+    elif [ -e "$link" ]; then
+      echo "warn $name: $link is a COPY, not a symlink — config drifted out of git"
+    else
+      echo "warn $name: live link $link is missing"
+    fi
+  done
+
+  # chezmoi must manage NONE of the exact live targets. Anchored exact match —
+  # NOT a loose 'tmux' grep (that false-positives on the TPM external + omarchy).
+  if command -v chezmoi >/dev/null 2>&1; then
+    local hit
+    hit="$(chezmoi managed 2>/dev/null | grep -Ex '\.config/nvim|\.tmux\.conf|\.config/tmuxinator|\.local/bin/fleet' || true)"
+    if [ -z "$hit" ]; then
+      echo "ok   chezmoi: no config-repo path managed (axes decoupled)"
+    else
+      echo "warn chezmoi MANAGES config-repo path(s) — re-coupling, 'chezmoi forget' them:"
+      printf '%s\n' "$hit" | sed 's/^/       /'
+    fi
+  else
+    echo "ok   chezmoi not installed (decoupling N/A)"
+  fi
+
+  # stale sibling clones of these repos directly under ~/proj (outside pc-tune)
+  local r d stale=
+  for r in fleet nvim tmux tmuxinator; do
+    d="$HOME/proj/$r"
+    if git -C "$d" rev-parse --git-dir >/dev/null 2>&1; then
+      echo "warn stale clone at $d (outside pc-tune) — a trap; see doc §3.4"
+      stale=1
+    fi
+  done
+  [ -n "$stale" ] || echo "ok   no stale sibling clones in ~/proj"
 }
 
 # ---- dispatch -------------------------------------------------------------------
@@ -1220,7 +1309,7 @@ fleet — agent fleet manager (tmux + nvim + Claude Code)
   fleet menu             feature menu (bound to prefix+$menu_key by fleet up)
   fleet keys             list feature keybinds
   fleet rebind           change a keybind interactively
-  fleet status           daemon status
+  fleet status           live config report (what's deployed, per config repo)
   fleet doctor           dependency / wiring check
 EOF
   ;;
