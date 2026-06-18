@@ -41,7 +41,7 @@ harness_list() { # names of installed harness adapters
 harness_load() { # populate H_* for <name>; defaults first, then the conf overrides
   local name="${1:-claude}"
   H_NAME="$name"
-  H_BIN="$name"; H_PROMPT_FLAG=""; H_TERM_MATCH="$name"; H_NVIM_PLUGIN=0
+  H_BIN="$name"; H_ARGS=""; H_PROMPT_FLAG=""; H_TERM_MATCH="$name"; H_NVIM_PLUGIN=0
   H_STATE_SRC="scrape"; H_MODE_KEYS=""; H_MODE_LIST=""; H_COST_KIND=""
   H_GUARD_KIND="none"; H_BUSY_RE=""
   local conf="$HARNESS_DIR/$name.conf"
@@ -457,6 +457,8 @@ cmd_new() {
     # bare pane: run the harness directly; prompt is one arg, via the flag (or
     # positional when H_PROMPT_FLAG is empty, e.g. claude).
     local argv=("$hbin")
+    # shellcheck disable=SC2206
+    [ -n "$H_ARGS" ] && argv+=($H_ARGS)
     if [ -n "$prompt" ]; then
       [ -n "$H_PROMPT_FLAG" ] && argv+=("$H_PROMPT_FLAG")
       argv+=("$prompt")
@@ -470,7 +472,7 @@ cmd_new() {
     mkdir -p "$RUNTIME_DIR/fleet"
     win_id=$(tmux new-window -P -F '#{window_id}' -t "$sess" -n "$wname" -c "$dir" \
       -e FLEET_AUTOCLAUDE="$([ "$H_NVIM_PLUGIN" = 1 ] && echo 1 || echo 0)" \
-      -e FLEET_HARNESS="$H_NAME" -e FLEET_HARNESS_BIN="$hbin" \
+      -e FLEET_HARNESS="$H_NAME" -e FLEET_HARNESS_BIN="$hbin${H_ARGS:+ $H_ARGS}" \
       -e FLEET_TERM_MATCH="$H_TERM_MATCH" -e FLEET_PROMPT="$prompt" \
       nvim . --cmd "lua pcall(dofile, '$FLEET_DIR/nvim/fleet.lua')" --listen "$nsock")
     tmux set -w -t "$win_id" @fleet_nvim_sock "$nsock"
@@ -656,6 +658,9 @@ reload_dash() { # restart the dash process in place — keeps pane size/position
 load_orch() { # <harness>; sets ORCH_BIN + H_* in the caller
   harness_load "${1:-claude}"
   ORCH_BIN=$(harness_bin) || die "$H_NAME not found (looked for: $H_BIN)"
+  # fold in harness launch flags (e.g. omp --allow-home); tmux runs the string
+  # via the shell, so a multi-token command is fine here.
+  ORCH_BIN="$ORCH_BIN${H_ARGS:+ $H_ARGS}"
 }
 tag_orch_window() { # <window_id> — tag with current H_* so hookless orchestrators
   local win="$1"     # still get a status glyph via fleetd's scrape loop
@@ -694,6 +699,28 @@ cmd_main() {
   echo "command center ready (window 'main', orchestrator: ${oh:-claude})"
 }
 
+# Install the fleet orchestrator guide so EVERY harness reads identical
+# instructions. claude reads CLAUDE.md; omp (and the cross-tool convention)
+# reads AGENTS.md (and CLAUDE.md). Writing BOTH means whatever harness drives
+# the orchestrator gets the same fleet instructions. Idempotent + non-destructive:
+# creates the file if absent, appends under a marker if present without the guide,
+# and leaves a file that already has it untouched.
+install_orch_guide() { # <root>
+  local root="$1"; local marker="<!-- fleet:orchestrator-guide -->"
+  [ -n "$root" ] && [ -f "$FLEET_DIR/FLEET.md" ] || return 0
+  local f path
+  for f in CLAUDE.md AGENTS.md; do
+    path="$root/$f"
+    if [ ! -f "$path" ]; then
+      { printf '%s\n\n' "$marker"; cat "$FLEET_DIR/FLEET.md"; } > "$path" 2>/dev/null \
+        && echo "installed orchestrator guide → $path"
+    elif ! grep -qF "$marker" "$path" 2>/dev/null && ! grep -q "fleet new" "$path" 2>/dev/null; then
+      { printf '\n%s\n\n' "$marker"; cat "$FLEET_DIR/FLEET.md"; } >> "$path" 2>/dev/null \
+        && echo "appended orchestrator guide → $path"
+    fi
+  done
+}
+
 # Switch the orchestrator harness on a running session: respawn just the
 # orchestrator pane (left pane of 'main') with the new harness, in place. The
 # dashboard pane and every agent window keep running. The previous orchestrator
@@ -714,6 +741,9 @@ cmd_orchestrator() {
   tmux respawn-pane -k -t "$pane" "$ORCH_BIN"
   tag_orch_window "$win"
   tmux set -t "$sess" @fleet_orch_harness "$h"
+  # ensure the new harness can read the guide (AGENTS.md if it wasn't there yet)
+  local root; root=$(tmux show -t "$sess" -v @fleet_root 2>/dev/null)
+  install_orch_guide "$root"
   echo "orchestrator → $h (the previous ${cur:-claude} agent's context ended)"
 }
 
@@ -918,13 +948,9 @@ cmd_up() {
   # runtime keybinds (server-global; re-applied each `up`, never in tmux.conf)
   apply_keybinds
 
-  # offer FLEET.md to the orchestrator
-  if [ -f "$root/CLAUDE.md" ] && ! grep -q "fleet new" "$root/CLAUDE.md" 2>/dev/null; then
-    echo "tip: append $FLEET_DIR/FLEET.md to $root/CLAUDE.md so the orchestrator knows fleet commands"
-  elif [ ! -f "$root/CLAUDE.md" ]; then
-    cp "$FLEET_DIR/FLEET.md" "$root/CLAUDE.md" 2>/dev/null \
-      && echo "installed orchestrator instructions at $root/CLAUDE.md"
-  fi
+  # install the fleet guide for whatever harness drives the orchestrator
+  # (CLAUDE.md for claude, AGENTS.md for omp/others — write both, same content)
+  install_orch_guide "$root"
 
   # build command center, explicitly targeting the project session
   FLEET_SESSION="$name" FLEET_ROOT="$root" cmd_main || true

@@ -105,7 +105,15 @@ fail-silent — if the daemon or any app is down, the rest keeps working.
   `m` key; cost works for any harness that writes a usage log. Harnesses that
   don't emit Claude-style hooks (omp) get their state from a fleetd **scrape**
   loop (the window carries a `busy` regex fleet stamps on it) instead — so
-  working/idle still light up with zero integration on the tool's side.
+  working/idle still light up with zero integration on the tool's side. The
+  **orchestrator guide** is installed harness-neutrally: `fleet up` (and a live
+  `fleet orchestrator` switch) writes the same `FLEET.md` content into **both**
+  `CLAUDE.md` (claude) and `AGENTS.md` (omp / the cross-tool convention) at the
+  project root, so whichever harness drives the orchestrator reads identical
+  fleet instructions. A harness can also carry launch flags (`H_ARGS` in its
+  `.conf`) — e.g. omp gets `--allow-home` so an orchestrator rooted at `~`
+  stays in the project dir instead of auto-jumping to a temp dir (which would
+  hide the repos and the guide).
 - **Orchestration** — the orchestrator (or you) can `fleet ls`, `fleet new`,
   `fleet send <agent> "msg"` (delivered via nvim RPC into the claude terminal),
   and `fleet mode <agent>` to cycle an agent's permission mode. See `FLEET.md`
