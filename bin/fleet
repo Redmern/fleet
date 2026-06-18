@@ -132,14 +132,26 @@ agents_tsv() { # state<TAB>label<TAB>session<TAB>window_id<TAB>window_name<TAB>s
   local json
   if json=$(rpc fleet.list); then
     python3 - "$json" <<'PY'
-import json, sys, time
+import json, sys, time, os
 for a in json.loads(sys.argv[1]).get("agents", []):
     cwd = (a.get("cwd") or "").rstrip("/")
     label = "/".join(cwd.split("/")[-2:]) if cwd else a.get("window_name", "?")
     age = int(time.time() - a.get("since", time.time()))
+    # "ready for deletion" marker: <worktree>/.fleet/ready (see `fleet ready`).
+    # Field is "" when absent, else the reason (or "ready" with no reason given).
+    ready = ""
+    rp = os.path.join(cwd, ".fleet", "ready") if cwd else ""
+    if rp and os.path.exists(rp):
+        ready = "ready"
+        try:
+            for ln in open(rp):
+                if ln.startswith("reason="):
+                    ready = ln[7:].strip() or "ready"
+        except OSError:
+            pass
     print("\t".join([a.get("state","?"), label, a.get("session",""),
                      a.get("window_id",""), a.get("window_name",""),
-                     f"{age//60}m{age%60:02d}s", a.get("pane_id",""), str(age)]))
+                     f"{age//60}m{age%60:02d}s", a.get("pane_id",""), str(age), ready]))
 PY
   else
     # daemon down: fall back to window options mirrored earlier (may be stale)
@@ -155,7 +167,13 @@ cmd_ls() {
   local out; out=$(agents_tsv)
   [ -n "$out" ] || { echo "no agents registered"; return 0; }
   printf 'STATE\tAGENT\tWINDOW\tIN-STATE\n'
-  echo "$out" | sort -t$'\t' -k1,1 | awk -F'\t' '{printf "%s\t%s\t%s:%s\t%s\n", $1, $2, $3, $5, $6}'
+  # $9 is the "ready for deletion" flag (reason text, or empty). When set, show
+  # the state as "done" and append the reason so reapable agents stand out.
+  echo "$out" | sort -t$'\t' -k1,1 | awk -F'\t' '{
+    st=$1; extra=""
+    if ($9 != "") { st="done"; extra="  (ready: " $9 ")" }
+    printf "%s\t%s\t%s:%s\t%s%s\n", st, $2, $3, $5, $6, extra
+  }'
 }
 
 # ---- pick ---------------------------------------------------------------------
@@ -556,6 +574,116 @@ cmd_watch_run() { # watch-run <pane> <msg> <target...>  (detached; internal)
   done
   tmux send-keys -t "$pane" -l "$msg" 2>/dev/null
   tmux send-keys -t "$pane" Enter 2>/dev/null
+}
+
+# ---- ready / reap (signal a worktree is done, then remove it) ------------------
+# A worker signals its own work item is finished by running `fleet ready` from
+# inside its worktree; the orchestrator can flag any agent with
+# `fleet ready <agent>`. Either way it drops a marker file <worktree>/.fleet/ready
+# (timestamp, who, optional reason). The flag surfaces in `fleet ls` and the
+# dashboard, and `fleet reap` then tears down every flagged worktree — refusing
+# any with uncommitted changes or an unmerged branch unless --force.
+
+cmd_ready() { # ready [<agent>] [-m "reason"] [--clear]
+  local target="" reason="" clear=0
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      -m) reason="$2"; shift 2 ;;
+      --clear) clear=1; shift ;;
+      -*) die "unknown flag $1" ;;
+      *) target="$1"; shift ;;
+    esac
+  done
+  local dir by
+  if [ -n "$target" ]; then            # orchestrator flagging another agent
+    local line pane
+    line=$(agents_tsv | awk -F'\t' -v t="$target" 'index($2,t)||index($5,t){print; exit}')
+    [ -n "$line" ] || die "no agent matching '$target' (try: fleet ls)"
+    pane=$(echo "$line" | cut -f7)
+    dir=$(tmux display -p -t "$pane" '#{pane_current_path}' 2>/dev/null)
+    by=orchestrator
+  else                                 # a worker flagging its own worktree
+    dir="$PWD"; by=worker
+  fi
+  [ -n "$dir" ] || die "could not resolve a worktree directory"
+  local root; root=$(git -C "$dir" rev-parse --show-toplevel 2>/dev/null) || root="$dir"
+  local marker="$root/.fleet/ready"
+  if [ "$clear" = 1 ]; then
+    rm -f "$marker" 2>/dev/null; echo "cleared ready flag: $root"; return 0
+  fi
+  mkdir -p "$root/.fleet" 2>/dev/null || true
+  reason=$(printf '%s' "$reason" | tr '\t\n' '  ')   # keep the marker a clean line
+  {
+    printf 'ts=%s\n' "$(date -Is 2>/dev/null || date)"
+    printf 'by=%s\n' "$by"
+    [ -n "$reason" ] && printf 'reason=%s\n' "$reason"
+  } >"$marker" 2>/dev/null \
+    && echo "marked ready for deletion: $root${reason:+ ($reason)}" \
+    || { echo "could not write marker at $marker" >&2; return 1; }
+}
+
+cmd_reap() { # reap [<target>] [--force] — remove worktrees flagged ready
+  local force=0 target=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --force|-f) force=1; shift ;;
+      -*) die "unknown flag $1" ;;
+      *) target="$1"; shift ;;
+    esac
+  done
+  local sess; sess=$(session_name) || die "not inside a fleet session"
+  local f; f=$(agents_file "$sess")
+  [ -f "$f" ] || { echo "no saved agents for this session"; return 0; }
+  local lines; lines=$(cat "$f" 2>/dev/null)   # snapshot: cmd_forget mutates $f
+  local any=0 reaped=0 dir repo branch base
+  while IFS=$'\t' read -r dir repo branch _bare base _rest; do
+    [ -n "$dir" ] || continue
+    [ -e "$dir/.fleet/ready" ] || continue       # only flagged worktrees
+    local lbl="${repo:-?}/${branch:-?}"
+    [ -n "$target" ] && ! printf '%s' "$lbl $dir" | grep -qF -- "$target" && continue
+    any=1
+    if [ ! -d "$dir" ]; then
+      cmd_forget "$dir"; echo "drop   $lbl: dir gone (stale)"; continue
+    fi
+    local gd; gd=$(git -C "$dir" rev-parse --git-dir 2>/dev/null)
+    case "$gd" in *"/worktrees/"*) ;; *) echo "skip   $lbl: not a linked worktree"; continue ;; esac
+    if [ "$force" != 1 ]; then
+      # ignore fleet's own .fleet/ metadata (the ready marker shows as "?? .fleet/")
+      local dirty; dirty=$(git -C "$dir" status --porcelain 2>/dev/null | grep -vE '^...\.fleet/')
+      if [ -n "$dirty" ]; then
+        echo "skip   $lbl: $(printf '%s\n' "$dirty" | grep -c .) uncommitted file(s) (use --force)"; continue
+      fi
+      local b="${base:-}"
+      [ -n "$b" ] || b=$(git -C "$dir" symbolic-ref --short refs/remotes/origin/HEAD 2>/dev/null | sed 's|^origin/||')
+      local baseref=""
+      if [ -n "$b" ]; then
+        if   git -C "$dir" rev-parse --verify -q "$b"        >/dev/null 2>&1; then baseref="$b"
+        elif git -C "$dir" rev-parse --verify -q "origin/$b" >/dev/null 2>&1; then baseref="origin/$b"; fi
+      fi
+      if [ -n "$baseref" ] && ! git -C "$dir" merge-base --is-ancestor HEAD "$baseref" 2>/dev/null; then
+        echo "skip   $lbl: branch not merged into $b (use --force)"; continue
+      fi
+    fi
+    local win; win=$(tmux list-panes -a -F '#{pane_current_path}'$'\t''#{window_id}' 2>/dev/null \
+                      | awk -F'\t' -v d="$dir" '$1==d{print $2; exit}')
+    [ -n "$win" ] && tmux kill-window -t "$win" 2>/dev/null
+    cmd_forget "$dir"
+    rm -f "$dir/.fleet/ready" 2>/dev/null; rmdir "$dir/.fleet" 2>/dev/null || true  # else it blocks remove
+    local main; main=$(git -C "$dir" worktree list --porcelain 2>/dev/null | awk '/^worktree /{print $2; exit}')
+    local rmflag=""; [ "$force" = 1 ] && rmflag="--force"
+    if git -C "${main:-$dir}" worktree remove $rmflag "$dir" 2>/dev/null; then
+      if [ -n "$branch" ] && [ -n "$main" ]; then
+        if [ "$force" = 1 ]; then git -C "$main" branch -D "$branch" 2>/dev/null || true
+        else                     git -C "$main" branch -d "$branch" 2>/dev/null || true; fi
+      fi
+      echo "reaped $lbl"; reaped=$((reaped+1))
+    else
+      echo "skip   $lbl: worktree remove failed (uncommitted? use --force)"
+    fi
+  done <<EOF
+$lines
+EOF
+  [ "$any" = 1 ] || echo "nothing flagged ready (mark one with 'fleet ready')"
 }
 
 # ---- mode ---------------------------------------------------------------------
@@ -1033,6 +1161,8 @@ case "${1:-}" in
   send)    shift; cmd_send "$@" ;;
   watch)     shift; cmd_watch "$@" ;;
   watch-run) shift; cmd_watch_run "$@" ;;  # internal: detached watcher
+  ready)   shift; cmd_ready "$@" ;;        # flag a worktree done/ready for reap
+  reap)    shift; cmd_reap "$@" ;;         # remove flagged-ready worktrees
   mode)    shift; cmd_mode "$@" ;;
   main)       shift; cmd_main "$@" ;;
   orchestrator|orch) shift; cmd_orchestrator "$@" ;;  # switch orchestrator harness live
@@ -1051,6 +1181,8 @@ fleet — agent fleet manager (tmux + nvim + Claude Code)
   fleet ls               list agents and states
   fleet pick             fzf jump-to-agent
   fleet send <a> "msg"   send message to an agent's claude
+  fleet ready [a] [-m r]  flag a worktree done/ready for deletion (no arg = the one you're in) [--clear]
+  fleet reap             remove all worktrees flagged ready (skips unmerged/dirty unless --force)
   fleet fan <repo> <nm>  best-of-N: spawn N agents on one prompt [-n N] [-p prompt] [--base br] [--bare]
   fleet cost <a>         show an agent's token spend
   fleet guard on|off     test/CI write-guard (asks before editing tests/CI/lockfiles)

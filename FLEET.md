@@ -24,6 +24,14 @@ this project with the `fleet` CLI.
   immediately and arms a background watcher; when every named agent goes idle it
   delivers `"message"` into your pane, waking you. Use this to wait on agents
   without burning your own turn in a `sleep`/`fleet ls` loop.
+- `fleet ready [<agent>] [-m "reason"]` — signal that a work item is **done and
+  its worktree is ready for deletion.** A worker runs bare `fleet ready` from
+  inside its own worktree; you flag someone else's with `fleet ready <agent>`.
+  This drops a `.fleet/ready` marker, so the agent shows as `done` in `fleet ls`
+  and the dashboard. `--clear` removes the flag.
+- `fleet reap [<target>] [--force]` — remove every worktree flagged ready (close
+  its window, delete the worktree and its merged branch). Refuses any worktree
+  with uncommitted changes or a branch not merged into its base unless `--force`.
 
 ## Delegate first
 
@@ -47,3 +55,7 @@ turn hostage for minutes and burns context). After dispatching, run one
 tell the user you've dispatched and will report when done. The watcher pings you
 when they're all idle; you resume then, read their results with `fleet ls` /
 their diffs, and report consolidated status.
+
+When a delegated task is finished, the worker (or you) flags its worktree with
+`fleet ready`; once you've reviewed and merged the diff, `fleet reap` clears out
+all the finished worktrees in one step (it refuses unmerged or dirty ones).

@@ -197,11 +197,11 @@ git_pcol()   { # "D A B" -> pill colour
 load_rows() {
   ROWS=()
   local line state label sess win wname since pane age order
-  while IFS=$'\t' read -r state label sess win wname since pane age; do
+  while IFS=$'\t' read -r state label sess win wname since pane age ready; do
     [ -n "$pane" ] || continue
     [ "$sess" = "$SESS" ] || continue     # this project only
     [ "$wname" = "main" ] && continue     # skip the orchestrator itself
-    ROWS+=("$state"$'\t'"$label"$'\t'"$win"$'\t'"$wname"$'\t'"$since"$'\t'"$pane"$'\t'"${age:-0}")
+    ROWS+=("$state"$'\t'"$label"$'\t'"$win"$'\t'"$wname"$'\t'"$since"$'\t'"$pane"$'\t'"${age:-0}"$'\t'"$ready")
   done < <("$FLEET_BIN" agents 2>/dev/null | sort -t$'\t' -k1,1 \
             | awk -F'\t' '
                 $1=="blocked"{o=0} $1=="idle"{o=1} $1=="working"{o=2} $1!~/blocked|idle|working/{o=3}
@@ -297,6 +297,8 @@ render() {
       # stall: an agent stuck "working" too long shows a red 'stalled' pill
       sdisp="$state"; scol=$(state_pcol "$state")
       if [ "$state" = working ] && (( ${age:-0} > STALL_SEC )); then sdisp="stalled"; scol=1; fi
+      # flagged ready for deletion (fleet ready) → magenta 'done' pill, overrides all
+      [ -n "$(field "$i" 8)" ] && { sdisp="done"; scol=5; }
       (( i == sel )) && lblsgr='\033[1m' || lblsgr='\033[2m'
       content=$(pill "$sdisp" "$scol")
       content+=$(printf "%s${lblsgr}%b\033[22m" "$gap" "$(fit_left "$label" "$LW")")
