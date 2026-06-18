@@ -28,6 +28,11 @@ SWEEP_INTERVAL = 60
 SCRAPE_INTERVAL = 2          # how often hookless harnesses (omp, …) are polled
 NOTIFY_COOLDOWN = 30
 IDLE_FLAP_GUARD = 2.0
+# A window stamped @fleet_harness that has never reported a hook is surfaced as a
+# synthetic placeholder so a freshly-spawned agent shows immediately and a
+# hook-broken agent never goes invisible. Recently-active -> "starting"
+# (transient), idle past this grace -> "stale" (a loud "no hook arrived" signal).
+SYNTH_STALE_AFTER = 45
 
 
 def tmux(*args):
@@ -223,23 +228,29 @@ class Fleet:
 
     def list_agents(self):
         self.sweep(force=True)
+        # One tmux round-trip; also pulls @fleet_harness + pane_active +
+        # window_activity so we can surface stamped-but-unreported windows below.
         out = tmux(
             "list-panes", "-a", "-F",
-            "#{pane_id}\t#{window_id}\t#{session_name}\t#{window_name}\t#{pane_current_path}",
+            "#{pane_id}\t#{window_id}\t#{session_name}\t#{window_name}"
+            "\t#{pane_current_path}\t#{pane_active}\t#{@fleet_harness}"
+            "\t#{window_activity}",
         ) or ""
         meta = {}
         for line in out.splitlines():
             parts = line.split("\t")
-            if len(parts) == 5:
+            if len(parts) == 8:
                 meta[parts[0]] = parts[1:]
         agents = []
+        covered = set()  # window_ids that already have a real reported pane
         for pane, sessions in self.panes.items():
             cur = self.pane_state(pane)
             if not cur:
                 continue
-            window_id, session, window_name, path = meta.get(
-                pane, ("", "", "", "")
-            )
+            m = meta.get(pane)
+            window_id, session, window_name, path = (m[0], m[1], m[2], m[3]) if m else ("", "", "", "")
+            if window_id:
+                covered.add(window_id)
             agents.append(
                 {
                     "pane_id": pane,
@@ -249,6 +260,42 @@ class Fleet:
                     "state": cur["state"],
                     "since": cur["since"],
                     "cwd": cur.get("cwd") or path,
+                }
+            )
+
+        # Synthetic pass: any window stamped @fleet_harness with no reported pane
+        # gets one placeholder row, keyed to a real agent pane so the dashboard
+        # (which drops empty-pane rows) and `fleet send`/mode can target it. The
+        # orchestrator's own "main" window is excluded — it reports on its own and
+        # listing itself as an agent is confusing.
+        now = time.time()
+        synth = {}  # window_id -> chosen meta row
+        for pane, m in meta.items():
+            window_id, session, window_name, path, pane_active, harness, activity = m
+            if not harness or not window_id or window_id in covered:
+                continue
+            if window_name == "main":
+                continue
+            prev = synth.get(window_id)
+            # prefer the active pane as the window's representative agent pane
+            if prev is None or (pane_active == "1" and prev[5] != "1"):
+                synth[window_id] = (pane,) + tuple(m)
+        for window_id, row in synth.items():
+            pane, _wid, session, window_name, path, _pa, harness, activity = row
+            try:
+                since = float(activity)
+            except (TypeError, ValueError):
+                since = now
+            state = "stale" if now - since > SYNTH_STALE_AFTER else "starting"
+            agents.append(
+                {
+                    "pane_id": pane,
+                    "window_id": window_id,
+                    "session": session,
+                    "window_name": window_name,
+                    "state": state,
+                    "since": since,
+                    "cwd": path,
                 }
             )
         return {"agents": agents}

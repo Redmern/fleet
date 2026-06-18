@@ -783,8 +783,11 @@ while :; do
     m)             # permission-mode pick-list for the selected agent (sets status)
       (( N == 0 )) && continue
       label=$(field "$sel" 2); pane=$(field "$sel" 6)
-      if harness_has_modes "$(harness_of "$pane")"; then pick_mode "$pane" "$label"; clear
-      else status="$(harness_of "$pane") has no permission modes"; fi ;;
+      case "$(field "$sel" 1)" in
+        starting|stale) status="$label still starting — no hook yet" ;;
+        *) if harness_has_modes "$(harness_of "$pane")"; then pick_mode "$pane" "$label"; clear
+           else status="$(harness_of "$pane") has no permission modes"; fi ;;
+      esac ;;
     s)             # send a message to selected agent
       (( N == 0 )) && continue
       label=$(field "$sel" 2)

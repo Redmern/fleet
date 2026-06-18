@@ -1144,6 +1144,15 @@ cmd_doctor() {
   done
   echo "     default harness: $(harness_select)"
   [ -S "$SOCK" ] && rpc fleet.ping >/dev/null 2>&1 && echo "ok   fleetd socket" || echo "warn fleetd not running (fleet up starts it)"
+  # The hook bin must resolve to a real executable: a dangling fleet-hook symlink
+  # (e.g. installed from a clone that was later deleted) makes every Claude hook
+  # exit non-zero, so no agent ever reports and the dashboard shows 0 agents.
+  local hookbin; hookbin=$(command -v fleet-hook 2>/dev/null)
+  if [ -n "$hookbin" ] && [ -x "$hookbin" ] && [ -e "$(readlink -f "$hookbin" 2>/dev/null)" ]; then
+    echo "ok   fleet-hook -> $(readlink -f "$hookbin")"
+  else
+    echo "MISS fleet-hook missing or dangling symlink (run install.sh) — agents won't report"; ok=1
+  fi
   local prof hooked
   for prof in "$HOME/.claude" "$HOME/.claude_personal"; do
     [ -f "$prof/settings.json" ] || continue
