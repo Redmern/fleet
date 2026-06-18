@@ -46,12 +46,13 @@ two axes and resurrect the collision.
 | nvim | `pc-tune/nvim/.git` | `pc-tune/nvim/main` | `~/.config/nvim → nvim/main` | `Redmern/nvim_0.12` | `main` |
 | tmux | `pc-tune/tmux/.git` | `pc-tune/tmux/main` | `~/.tmux.conf → tmux/main/tmux.conf` | `Redmern/tmux` | `main` |
 | tmuxinator | `pc-tune/tmuxinator/.git` | `pc-tune/tmuxinator/main` | `~/.config/tmuxinator → tmuxinator/main` | `Redmern/tmuxinator` | `main` |
-| fleet | `pc-tune/fleet/.git` | `pc-tune/fleet/main` | `~/.local/bin/{fleet,fleet-guard,fleet-hook,fleet-tile,fleetd} → fleet/main/bin/*` | `Redmern/fleet` | **`master`** ⚠ |
+| fleet | `pc-tune/fleet/.git` | `pc-tune/fleet/main` | `~/.local/bin/{fleet,fleet-guard,fleet-hook,fleet-tile,fleetd} → fleet/main/bin/*` | `Redmern/fleet` | `main` |
 
-> ⚠ **fleet is the odd one out.** Its remote default branch is `master`; the local
-> live branch is `main` (an alias recreated from `master` by `bootstrap.sh`). So
-> for fleet, *push* and *pull* cross the `main ↔ master` boundary — see the fleet
-> rows below. The other three are `main ↔ main`.
+> **All four repos are now `main ↔ main`.** fleet used to be the odd one out — its
+> remote default was `master` and the local live branch `main`, so push/pull
+> crossed a `main ↔ master` boundary. That split was collapsed (2026-06-18):
+> `origin/main` now holds the canonical history, the GitHub default is `main`, and
+> the stale `master` branch was deleted. Treat fleet exactly like the others.
 
 The **apply** step (what makes a merged change take effect in the running tool):
 
@@ -98,8 +99,7 @@ git -C "$MAIN" merge --ff-only "$BR"        # FF-only: live main just advances
 # ── 5. VERIFY it actually loaded (table in §1.1), e.g. fleet doctor ────────
 
 # ── 6. PUSH to origin (see §1.3 — fleet differs) ──────────────────────────
-git -C "$MAIN" push origin main            # nvim / tmux / tmuxinator
-#   fleet only:  git -C "$MAIN" push origin main:master
+git -C "$MAIN" push origin main            # all repos (incl. fleet) — main ↔ main
 
 # ── 7. REAP the now-merged agent worktree ──────────────────────────────────
 fleet reap "$REPO/$BR"                      # refuses if unmerged/dirty — good
@@ -116,16 +116,12 @@ merged branch is safe to delete — `reap` enforces this).
 - **When:** after step 5 (applied + verified) of any deploy. Push so the *other
   laptop* and GitHub reflect the live state. There is no auto-push; an unpushed
   `main` is the #1 source of two-laptop divergence.
-- **nvim / tmux / tmuxinator** — branch is `main` both ends:
+- **all repos (nvim / tmux / tmuxinator / fleet)** — branch is `main` both ends:
   ```sh
   git -C "$ROOT/$REPO/main" push origin main
   ```
-- **fleet** — local live branch `main`, remote default `master`:
-  ```sh
-  git -C "$ROOT/fleet/main" push origin main:master
-  ```
-  (Today `fleet/main` is *ahead 1* of `origin/master` — one unpushed live commit.
-  Push it to converge.)
+  (fleet was migrated off its old `master` default on 2026-06-18; it now pushes
+  `main → origin/main` like the rest.)
 - **Quick "am I ahead?" check** before/after:
   ```sh
   git -C "$ROOT/$REPO/main" status -sb        # shows ahead/behind origin
@@ -165,7 +161,7 @@ MAIN=$ROOT/nvim/main
 git -C "$MAIN" add -A
 git -C "$MAIN" rm lua/plugins/opencode.lua 2>/dev/null   # record the deletion
 git -C "$MAIN" commit -m "config: <describe live edits>"
-git -C "$MAIN" push origin main          # nvim → main ; fleet → main:master
+git -C "$MAIN" push origin main          # all repos → origin/main
 # clean up stray backups that are cluttering the tree:
 git -C "$MAIN" clean -n                  # DRY RUN first — review what it'd remove
 # then, only the .bak.* you don't want:  git -C "$MAIN" clean -f -- '*.bak.*'
@@ -206,11 +202,11 @@ MAIN=$ROOT/$REPO/main
 git -C "$MAIN" fetch origin
 git -C "$MAIN" status -sb                 # see ahead/behind
 # integrate remote work under your local (linear history; you're solo per repo):
-git -C "$MAIN" pull --rebase origin main           # fleet: origin master
+git -C "$MAIN" pull --rebase origin main           # all repos → origin/main
 #   resolve any conflicts, then:
 #   git -C "$MAIN" rebase --continue
 # re-APPLY (§1.1 table) so the running tool matches the merged result, then:
-git -C "$MAIN" push origin main                     # fleet: main:master
+git -C "$MAIN" push origin main                     # all repos → origin/main
 ```
 
 **For chezmoi-managed desktop dotfiles** (separate axis):
@@ -234,10 +230,9 @@ On the second machine (already bootstrapped per `pc-tune/bootstrap.sh`):
 ROOT=$HOME/proj/pc-tune
 
 # 1. the four config repos — plain git pull into each LIVE worktree:
-for r in nvim tmux tmuxinator; do
+for r in nvim tmux tmuxinator fleet; do
   git -C "$ROOT/$r/main" pull --ff-only origin main
 done
-git -C "$ROOT/fleet/main" pull --ff-only origin master   # fleet: master → local main
 
 # 2. APPLY each so the running tools pick it up (§1.1 table):
 #    nvim: restart nvim
@@ -309,7 +304,7 @@ sharing no files with the four repos.
 | F4 | **Symlink target ambiguity** | a live symlink silently points at a non-`main` worktree or a stale clone → "what I edited" ≠ "what runs" | resolved today (all symlinks verified → container `main`), but nothing *prevents* recurrence |
 | F5 | **chezmoi ↔ worktree re-coupling** | a `chezmoi add` / re-added external on `~/.config/nvim` or `~/.tmux.conf` makes `chezmoi apply` overwrite the live symlink | resolved (no such entry now), but only by discipline |
 | F6 | **Two-laptop divergence** | unpushed `main`, or each laptop committing to `main` independently → different live config, same repo | latent (`fleet/main` ahead 1 of origin; nvim live edits unpushed) |
-| F7 | **fleet `main`↔`master` skew** | fleet's local live branch is `main`, remote is `master`; a naive `push origin main` creates a stray remote `main`, and "is it pushed?" is ambiguous | latent (structural) |
+| F7 | **fleet `main`↔`master` skew** | fleet's local live branch was `main`, remote default `master`; a naive `push origin main` created a stray remote `main`, and "is it pushed?" was ambiguous | **resolved 2026-06-18** — collapsed to `main` everywhere (default + sole branch); `master` deleted |
 
 ---
 
@@ -392,9 +387,10 @@ model still confusing after the status view lands.
   (§1.2). FF-only keeps live history linear so the deployed HEAD is unambiguous.
 - Surface **`git log main..<branch>` ("N commits not yet live")** in the dashboard
   per scratch worktree, so "this branch is NOT live yet" is explicit (F1).
-- **fleet `main`↔`master`:** standardize the push as `main:master` (§1.3) and
-  teach the status helper to compare `main` against `origin/master` (not
-  `origin/main`) for fleet, so "is it pushed?" stops being ambiguous (F7).
+- **fleet `main`↔`master`:** ~~standardize the push as `main:master`~~ — **done
+  (2026-06-18):** fleet's remote default is now `main` and `master` is deleted, so
+  the status helper compares `main` against `origin/main` like every other repo and
+  "is it pushed?" is unambiguous (F7 resolved).
 
 ### 3.6 Cross-laptop (the real chezmoi gap)
 
@@ -412,7 +408,8 @@ in `PLAN.md §12`). Do **not** try to fold the four repos into chezmoi externals
    `*.bak.*`.
 2. ~~Delete the stale `/home/red/proj/fleet`~~ — **done this session** (verify it's
    gone; salvage its `AGENTS.md` from a backup if it wasn't preserved) (F3).
-3. Push `fleet/main → origin master` (F6/F7 — `fleet-status` confirms ahead 1).
+3. ~~Push `fleet/main → origin master`~~ — superseded by the main standardization
+   (2026-06-18): `fleet/main → origin main`, `master` deleted (F6/F7 resolved).
 
 **Phase 1 — MVP visibility (clarity first):**
 4. Land `bin/fleet-status` and wire it as `fleet status` + a dashboard pill (3.1).
@@ -434,9 +431,8 @@ in `PLAN.md §12`). Do **not** try to fold the four repos into chezmoi externals
 - **Direct vs indirection symlink (3.2):** is atomic rollback worth the extra hop,
   or is the status view enough to kill the confusion? Recommend deferring B until
   after the MVP proves insufficient.
-- **fleet `main`/`master` duality:** simplest long-term fix is to make the fleet
-  remote default `main` (rename/track), eliminating F7 entirely. Worth a one-time
-  cleanup, or keep the `main:master` convention?
+- ~~**fleet `main`/`master` duality:**~~ **resolved (2026-06-18)** — the fleet
+  remote default was made `main` and `master` deleted, eliminating F7 entirely.
 - **AGENTS.md churn:** both `pc-tune` and the stale clone carry an untracked
   `AGENTS.md` (fleet's orchestrator guidance for omp harnesses). Decide where it's
   canonical (the meta-repo? the fleet repo?) and commit it, so it stops showing as

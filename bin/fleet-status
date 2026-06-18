@@ -24,7 +24,7 @@ specs=(
   "nvim|$HOME/.config/nvim|nvim/main|main"
   "tmux|$HOME/.tmux.conf|tmux/main/tmux.conf|main"
   "tmuxinator|$HOME/.config/tmuxinator|tmuxinator/main|main"
-  "fleet|$HOME/.local/bin/fleet|fleet/main/bin/fleet|master"
+  "fleet|$HOME/.local/bin/fleet|fleet/main/bin/fleet|main"
 )
 
 printf '%sLIVE CONFIG STATUS%s  (root: %s)\n\n' "$c_b" "$c_0" "$ROOT"
@@ -61,13 +61,13 @@ for spec in "${specs[@]}"; do
     else
       ok "clean"
     fi
-    # ahead/behind vs the correct remote branch (fleet → origin/master)
+    # ahead/behind vs the remote branch (all repos → origin/main)
     git -C "$main" fetch -q origin "$remotebr" 2>/dev/null || true
     counts="$(git -C "$main" rev-list --left-right --count HEAD...origin/"$remotebr" 2>/dev/null)"
     if [ -n "$counts" ]; then
       ahead="${counts%%	*}"; behind="${counts##*	}"
       [ "$ahead" = 0 ] && [ "$behind" = 0 ] && ok "in sync with origin/$remotebr" \
-        || warn "vs origin/$remotebr: ahead $ahead, behind $behind  (push: git -C $name/main push origin main:$remotebr)"
+        || warn "vs origin/$remotebr: ahead $ahead, behind $behind  (push: git -C $name/main push origin main)"
     fi
   else
     bad "no main worktree at $main"
