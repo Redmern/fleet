@@ -8,6 +8,7 @@
 set -u
 
 FLEET_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)"
+FLEET_LIB="$FLEET_DIR/lib"          # vendored node driver + node_modules (playwright-core)
 RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
 SOCK="$RUNTIME_DIR/fleet.sock"
 CONF_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/fleet"
@@ -890,6 +891,110 @@ cmd_reap() { # reap [<target>] [--force] — remove worktrees flagged ready
 $lines
 EOF
   [ "$any" = 1 ] || echo "nothing flagged ready (mark one with 'fleet ready')"
+  # Best-effort: free any headed `fleet browser --watch` debug port left open.
+  [ "$reaped" -gt 0 ] && fuser -k "${FLEET_DEBUG_PORT:-9222}/tcp" >/dev/null 2>&1 || true
+}
+
+# ---- browser-test (drive a real Chromium against the worker's dev app) ---------
+# A worker functionally tests the web app it started by driving the system
+# Chromium with Playwright (vendored playwright-core in $FLEET_LIB). Headless by
+# default (screenshots always paint); --watch flips to a Hyprland-tiled VISIBLE
+# headed window the human also sees, driven over CDP (a headed Wayland surface
+# must be on-screen to screenshot — RESEARCH-agent-testing.md §a).
+#
+# The worker advertises its dev port in <worktree>/.fleet/devport (mirrors the
+# .fleet/ready marker); a bare port or full URL on the CLI overrides it.
+
+# Resolve the worktree root of the current dir (git toplevel, else $PWD).
+browser_root() {
+  local dir="${1:-$PWD}" root
+  root=$(git -C "$dir" rev-parse --show-toplevel 2>/dev/null) || root="$dir"
+  echo "$root"
+}
+
+cmd_devport() { # devport [<port>]  — write/show the dev-server port marker
+  local root; root=$(browser_root)
+  local marker="$root/.fleet/devport"
+  if [ -z "${1:-}" ]; then
+    [ -f "$marker" ] && cat "$marker" || { echo "no .fleet/devport (set with: fleet devport <port>)" >&2; return 1; }
+    return 0
+  fi
+  case "$1" in *[!0-9]*) die "devport must be a number: $1" ;; esac
+  mkdir -p "$root/.fleet" 2>/dev/null || true
+  printf '%s\n' "$1" >"$marker" 2>/dev/null && echo "dev port $1 → $marker" \
+    || { echo "could not write $marker" >&2; return 1; }
+}
+
+cmd_browser() { # browser [<url|port>] [--watch] [agent]
+  local headed=0 url="" agent="" debug_port="${FLEET_DEBUG_PORT:-9222}"
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --watch|--headed) headed=1; shift ;;
+      --port) debug_port="$2"; shift 2 ;;
+      -*) die "unknown flag $1" ;;
+      *) if [ -z "$url" ]; then url="$1"; else agent="$1"; fi; shift ;;
+    esac
+  done
+
+  # If an agent is named, resolve its worktree dir; else use the current dir.
+  local root
+  if [ -n "$agent" ]; then
+    local line pane dir
+    line=$(agents_tsv | awk -F'\t' -v t="$agent" 'index($2,t)||index($5,t){print; exit}')
+    [ -n "$line" ] || die "no agent matching '$agent' (try: fleet ls)"
+    pane=$(echo "$line" | cut -f7)
+    dir=$(tmux display -p -t "$pane" '#{pane_current_path}' 2>/dev/null)
+    root=$(browser_root "${dir:-$PWD}")
+  else
+    root=$(browser_root)
+  fi
+
+  # Resolve URL: explicit url/port wins; else the .fleet/devport marker.
+  case "$url" in
+    '') ;;                                  # fall through to marker
+    *[!0-9]*) ;;                            # already a URL/host
+    *) url="http://localhost:$url" ;;       # bare port
+  esac
+  if [ -z "$url" ]; then
+    local port; port=$(head -1 "$root/.fleet/devport" 2>/dev/null | tr -d '[:space:]')
+    [ -n "$port" ] || die "no URL given and no $root/.fleet/devport marker (set with: fleet devport <port>)"
+    url="http://localhost:$port"
+  fi
+
+  [ -f "$FLEET_LIB/browser-test.js" ] || die "driver missing: $FLEET_LIB/browser-test.js"
+  command -v node >/dev/null 2>&1 || die "node not found (needed to run the Playwright driver)"
+  if [ ! -d "$FLEET_LIB/node_modules/playwright-core" ]; then
+    die "playwright-core not vendored — run: (cd '$FLEET_LIB' && npm i)"
+  fi
+
+  local shotdir="$root/.fleet/shots"
+  mkdir -p "$shotdir" 2>/dev/null || true
+  local shot="$shotdir/shot.png"
+  # Optional agent-supplied interaction/assert hook: <worktree>/.fleet/hook.js
+  local hook=""; [ -f "$root/.fleet/hook.js" ] && hook="$root/.fleet/hook.js"
+
+  if [ "$headed" = 1 ]; then
+    echo "fleet browser: headed/watch mode → $url (debug port $debug_port)" >&2
+    # Free a stale debug port, then launch a VISIBLE headed Chromium tiled by
+    # Hyprland next to the agent (on-screen so screenshots composite).
+    fuser -k "$debug_port/tcp" >/dev/null 2>&1 || true
+    local profile; profile=$(mktemp -d "${TMPDIR:-/tmp}/fleet-cdp.XXXXXX" 2>/dev/null)
+    hyprctl dispatch exec "[float; size 1000 700] chromium --remote-debugging-port=$debug_port --user-data-dir='$profile' --no-first-run --no-default-browser-check --app='$url'" >/dev/null 2>&1 || \
+      echo "fleet browser: hyprctl exec failed (no Hyprland?) — driving headless-style over CDP if it came up" >&2
+    # Wait for the CDP endpoint to come up (the wrapper owns this process).
+    local i; for i in 1 2 3 4 5 6 7 8 9 10; do
+      curl -fs "http://localhost:$debug_port/json/version" >/dev/null 2>&1 && break
+      sleep 0.5
+    done
+    env FLEET_URL="$url" FLEET_HEADED=1 FLEET_CDP="http://localhost:$debug_port" \
+      FLEET_SHOT="$shot" ${hook:+FLEET_HOOK="$hook"} node "$FLEET_LIB/browser-test.js"
+    echo "fleet browser: headed window left open at $url (PID owns debug port $debug_port)." >&2
+    echo "  close it with: fuser -k $debug_port/tcp" >&2
+  else
+    env FLEET_URL="$url" FLEET_SHOT="$shot" ${hook:+FLEET_HOOK="$hook"} \
+      node "$FLEET_LIB/browser-test.js"
+  fi
+  echo "fleet browser: screenshot → $shot" >&2
 }
 
 # ---- mode ---------------------------------------------------------------------
@@ -1612,6 +1717,8 @@ fleet — agent fleet manager (tmux + nvim + Claude Code)
   fleet send <a> "msg"   send message to an agent's claude
   fleet ready [a] [-m r]  flag a worktree done/ready for deletion (no arg = the one you're in) [--clear]
   fleet reap             remove all worktrees flagged ready (skips unmerged/dirty unless --force)
+  fleet browser [u] [a]  drive a real Chromium against the dev app (headless; --watch = visible tiled window) [url|port] [agent]
+  fleet devport <port>   record the worktree's dev-server port (read by 'fleet browser')
   fleet fan <repo> <nm>  best-of-N: spawn N agents on one prompt [-n N] [-p prompt] [--base br] [--bare]
   fleet cost <a>         show an agent's token spend
   fleet guard on|off     test/CI write-guard (asks before editing tests/CI/lockfiles)
@@ -1649,6 +1756,8 @@ case "${1:-}" in
   watch-run) shift; cmd_watch_run "$@" ;;  # internal: detached watcher
   ready)   shift; cmd_ready "$@" ;;        # flag a worktree done/ready for reap
   reap)    shift; cmd_reap "$@" ;;         # remove flagged-ready worktrees
+  browser) shift; cmd_browser "$@" ;;      # drive a real Chromium against the dev app
+  devport) shift; cmd_devport "$@" ;;      # write/show the .fleet/devport marker
   mode)    shift; cmd_mode "$@" ;;
   main)       shift; cmd_main "$@" ;;
   orch-jump)  shift; cmd_orch_jump "$@" ;;            # internal: prefix-key jump to orchestrator pane
