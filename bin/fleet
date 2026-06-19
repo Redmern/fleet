@@ -169,10 +169,12 @@ cmd_ls() {
   [ -n "$out" ] || { echo "no agents registered"; return 0; }
   printf 'STATE\tAGENT\tWINDOW\tIN-STATE\n'
   # $9 is the "ready for deletion" flag (reason text, or empty). When set, show
-  # the state as "done" and append the reason so reapable agents stand out.
+  # the state as "done" — but only when the agent is not actively live: a stale or
+  # inherited marker on a working/blocked agent must not mask its real state.
   echo "$out" | sort -t$'\t' -k1,1 | awk -F'\t' '{
     st=$1; extra=""
-    if ($9 != "") { st="done"; extra="  (ready: " $9 ")" }
+    if ($9 != "" && $1 != "working" && $1 != "blocked") { st="done"; extra="  (ready: " $9 ")" }
+    else if ($9 != "")                                  { extra="  (ready? " $9 " — but " $1 ")" }
     printf "%s\t%s\t%s:%s\t%s%s\n", st, $2, $3, $5, $6, extra
   }'
 }

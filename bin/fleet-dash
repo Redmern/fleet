@@ -446,8 +446,14 @@ render() {
       # stall: an agent stuck "working" too long shows a red 'stalled' pill
       sdisp="$state"; scol=$(state_pcol "$state")
       if [ "$state" = working ] && (( ${age:-0} > STALL_SEC )); then sdisp="stalled"; scol=1; fi
-      # flagged ready for deletion (fleet ready) → magenta 'done' pill, overrides all
-      [ -n "$(field "$i" 8)" ] && { sdisp="done"; scol=5; }
+      # flagged ready for deletion (fleet ready) → magenta 'done' pill. Only
+      # override a NON-live state: a working/blocked agent carrying a stale or
+      # inherited .fleet/ready marker is still busy, so keep its live pill.
+      # idle/stalled/dead/unknown + flagged = genuinely done.
+      case "$state" in
+        working|blocked) ;;
+        *) [ -n "$(field "$i" 8)" ] && { sdisp="done"; scol=5; } ;;
+      esac
       (( i == sel )) && lblsgr='\033[1m' || lblsgr='\033[2m'
       content=$(pill "$sdisp" "$scol")
       content+=$(printf "%s${lblsgr}%b\033[22m" "$gap" "$(fit_left "$label" "$LW")")
