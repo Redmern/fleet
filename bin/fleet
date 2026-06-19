@@ -554,6 +554,10 @@ cmd_new() {
       [ -n "$H_PROMPT_FLAG" ] && argv+=("$H_PROMPT_FLAG")
       argv+=("$prompt")
     fi
+    # -e FLEET_ROLE=worker: every cmd_new pane (scratch sub-orch OR code worker) is
+    # non-main, so its seed prompt must hard pass-through the dispatch hook (§1).
+    # Combined with C-v2 scratch parking: scratch panes spawn into the hidden
+    # sibling session yet STILL carry FLEET_ROLE=worker on every spawn primitive.
     if [ "$scratch" = 1 ]; then
       # Park scratch windows in a DETACHED sibling session "<sess>_hidden" so they
       # are completely off the visible session's window bar AND unreachable by
@@ -573,14 +577,14 @@ cmd_new() {
       #              new-window. Exact-match (=$hidden) so fnmatch can't mis-target.
       if tmux has-session -t "=$hidden" 2>/dev/null; then
         win_id=$(tmux new-window -d -P -F '#{window_id}' -t "=$hidden" -n "$wname" -c "$dir" \
-          "${argv[@]}" 2>/dev/null)
+          -e FLEET_ROLE=worker "${argv[@]}" 2>/dev/null)
         [ -n "$win_id" ] || win_id=$(tmux new-session -d -P -F '#{window_id}' -s "$hidden" -n "$wname" -c "$dir" \
-          "${argv[@]}" 2>/dev/null)
+          -e FLEET_ROLE=worker "${argv[@]}" 2>/dev/null)
       else
         win_id=$(tmux new-session -d -P -F '#{window_id}' -s "$hidden" -n "$wname" -c "$dir" \
-          "${argv[@]}" 2>/dev/null)
+          -e FLEET_ROLE=worker "${argv[@]}" 2>/dev/null)
         [ -n "$win_id" ] || win_id=$(tmux new-window -d -P -F '#{window_id}' -t "=$hidden" -n "$wname" -c "$dir" \
-          "${argv[@]}" 2>/dev/null)
+          -e FLEET_ROLE=worker "${argv[@]}" 2>/dev/null)
       fi
       # Mirror @fleet_root onto the hidden session (idempotent) so `fleet`
       # sub-commands run from INSIDE a scratch agent resolve the project root.
@@ -591,7 +595,7 @@ cmd_new() {
       tmux set -t "$hidden" @fleet_root "$root" 2>/dev/null || true
     else
       win_id=$(tmux new-window -d -P -F '#{window_id}' -t "$sess" -n "$wname" -c "$dir" \
-        "${argv[@]}")
+        -e FLEET_ROLE=worker "${argv[@]}")
     fi
   else
     # nvim pane: claude autostarts via claudecode.nvim; other harnesses open in a
@@ -599,6 +603,7 @@ cmd_new() {
     local nsock="$RUNTIME_DIR/fleet/nvim-$(date +%s%N).sock"
     mkdir -p "$RUNTIME_DIR/fleet"
     win_id=$(tmux new-window -d -P -F '#{window_id}' -t "$sess" -n "$wname" -c "$dir" \
+      -e FLEET_ROLE=worker \
       -e FLEET_AUTOCLAUDE="$([ "$H_NVIM_PLUGIN" = 1 ] && echo 1 || echo 0)" \
       -e FLEET_HARNESS="$H_NAME" -e FLEET_HARNESS_BIN="$hbin${H_ARGS:+ $H_ARGS}" \
       -e FLEET_TERM_MATCH="$H_TERM_MATCH" -e FLEET_PROMPT="$prompt" \
@@ -607,6 +612,8 @@ cmd_new() {
     tmux set -w -t "$win_id" @fleet_nvim_sock "$nsock"
   fi
   tmux set -w -t "$win_id" @fleet_harness "$H_NAME"
+  # optional pane-role registry entry (cross-check for the dispatch hook's env gate)
+  record_pane_role "$root" "$(tmux list-panes -t "$win_id" -F '#{pane_id}' 2>/dev/null | head -1)" worker
   # Let fleetd derive state for hookless harnesses without knowing them: stamp
   # the state source + the "busy" scrape pattern onto the window.
   tmux set -w -t "$win_id" @fleet_state_src "$H_STATE_SRC"
@@ -745,19 +752,349 @@ cmd_watch_run() { # watch-run <pane> <msg> <target...>  (detached; internal)
       [ "$state" = blocked ] && blocked="$t"
     done
     if [ -n "$blocked" ]; then            # an agent needs input — stop waiting and say so
-      tmux send-keys -t "$pane" -l "fleet watch: agent '$blocked' is BLOCKED and needs your input (won't go idle on its own) — $msg" 2>/dev/null
-      tmux send-keys -t "$pane" Enter 2>/dev/null
+      # Route through the one safe-delivery primitive. The main pane is auto-pinned
+      # out-of-band inside cmd_notify; a sub-orch pane gets the in-band wake iff its
+      # input is provably empty/generating. NOTE: the trailing unconditional Enter
+      # the old code sent is deliberately gone — cmd_notify owns delivery now.
+      cmd_notify "$pane" "fleet watch: agent '$blocked' is BLOCKED and needs your input (won't go idle on its own) — $msg" inband-ok blocked
       return 0
     fi
     if [ "$alldone" = 1 ]; then streak=$((streak+1)); else streak=0; fi
     (( streak >= 3 )) && break             # idle for ~6s straight → done (not a blip)
   done
   if (( streak >= 3 )); then               # loop broke because agents went idle
-    tmux send-keys -t "$pane" -l "$msg" 2>/dev/null
+    cmd_notify "$pane" "$msg" inband-ok
   else                                     # loop ran out the wait cap — still busy
-    tmux send-keys -t "$pane" -l "fleet watch: timed out after ~90min — still busy: ${targets[*]}" 2>/dev/null
+    cmd_notify "$pane" "fleet watch: timed out after ~90min — still busy: ${targets[*]}" inband-ok
   fi
-  tmux send-keys -t "$pane" Enter 2>/dev/null
+}
+
+# ---- orchestration layer (dispatch) -------------------------------------------
+# The "dispatch" feature: a UserPromptSubmit hook in the MAIN pane intercepts
+# sigil-prefixed prompts with ZERO model turn, writes the instruction to a durable
+# on-disk ledger, and spawns an ephemeral sub-orchestrator (a --scratch agent) that
+# reads the ledger, decomposes, spawns fleet workers, and watches on its OWN pane.
+# Everything here is deterministic shell — no LLM on the forward path. See
+# DESIGN-v3 in _reports/orch-layer for the rationale; this is fail-silent bash.
+
+LOCK_STALE_SECS=30   # > worst-case held duration; tune vs the hook's timeout
+
+# Acquire a mkdir-lock, reaping it when the prior holder is dead (pid) or the lock
+# is older than LOCK_STALE_SECS (mtime). mkdir is the POSIX-atomic arbiter, so even
+# two racers that both decide to steal re-converge: exactly one wins the re-mkdir.
+acquire_lock() { # <lockdir>
+  local lk="$1" tries=0 owner now age
+  while ! mkdir "$lk" 2>/dev/null; do
+    owner=$(cat "$lk/pid" 2>/dev/null)
+    now=$(date +%s 2>/dev/null)
+    age=$(( now - $(stat -c %Y "$lk" 2>/dev/null || echo "$now") ))
+    if { [ -n "$owner" ] && ! kill -0 "$owner" 2>/dev/null; } \
+       || [ "$age" -ge "$LOCK_STALE_SECS" ]; then
+      rmdir "$lk" 2>/dev/null      # steal: holder dead OR lock too old
+      continue
+    fi
+    sleep 0.05
+    tries=$((tries+1))
+    [ "$tries" -gt 600 ] && return 1   # ~30s ceiling — fail loud rather than hang
+  done
+  echo "$$" > "$lk/pid" 2>/dev/null    # stamp ownership
+  return 0
+}
+# Pid-guarded release (FINAL-b §1): a late/slow legitimate holder whose lock was
+# already stolen must NOT blindly rmdir the stealer's lock. Only free it if the pid
+# stamp is ours (or absent).
+release_lock() { # <lockdir>
+  local lk="$1" owner
+  owner=$(cat "$lk/pid" 2>/dev/null)
+  [ -z "$owner" ] || [ "$owner" = "$$" ] || return 0   # a stealer holds it now
+  rm -f "$lk/pid" 2>/dev/null
+  rmdir "$lk" 2>/dev/null
+}
+
+alloc_id() { # <led> -> echoes d<N> (atomic, under a reaped lock)
+  local led="$1" n
+  acquire_lock "$led/.seqlock" || return 1
+  n=$(( $(cat "$led/seq" 2>/dev/null || echo 0) + 1 ))
+  echo "$n" > "$led/seq"
+  release_lock "$led/.seqlock"
+  echo "d$n"
+}
+
+meta_get() { # <dispatch-dir> <key> -> value (tab-separated meta.tsv)
+  awk -F'\t' -v k="$2" '$1==k{print $2; exit}' "$1/meta.tsv" 2>/dev/null
+}
+meta_set() { # <dispatch-dir> <key> <value> — upsert one key, atomic tmp+mv
+  local d="$1" k="$2" v="$3" f="$1/meta.tsv"
+  mkdir -p "$d" 2>/dev/null || return 0
+  { [ -f "$f" ] && awk -F'\t' -v k="$k" '$1!=k' "$f"; printf '%s\t%s\n' "$k" "$v"; } \
+    > "$f.tmp" 2>/dev/null && mv "$f.tmp" "$f" 2>/dev/null
+}
+
+# Record an optional pane-role registry entry (cross-check for the hook's env gate).
+record_pane_role() { # <root> <pane_id> <role>
+  [ -n "$1" ] && [ -n "$2" ] && [ -n "$3" ] || return 0
+  mkdir -p "$1/.fleet/roles" 2>/dev/null || return 0
+  printf '%s\n' "$3" > "$1/.fleet/roles/$2" 2>/dev/null || true
+}
+
+suborch_seed() { cat "$FLEET_DIR/FLEET_SUBORCH.md" 2>/dev/null; }
+
+# Liveness = window exists AND its foreground proc is the harness (not a dead shell).
+suborch_live() { # <sess> <wname>
+  local sess="$1" wname="$2" pane cmd
+  pane=$(tmux list-panes -t "$sess:$wname" -F '#{pane_id} #{pane_current_command}' \
+         2>/dev/null | head -1) || return 1
+  [ -n "$pane" ] || return 1
+  cmd=${pane#* }
+  case "$cmd" in claude|node|*claude*|nvim) return 0 ;; *) return 1 ;; esac
+}
+
+# Resolve-or-spawn the sub-orch for an id, under a stale-reaped spawn lock. Spawning
+# goes through cmd_new --scratch, which tags the new pane FLEET_ROLE=worker (so its
+# seed prompt can never re-enter the dispatch branch — the fork-bomb gate, §1).
+resolve_or_spawn_suborch() { # <sess> <wname> <id> <root>
+  local sess="$1" wname="$2" id="$3" root="$4" led="$root/.fleet/dispatch"
+  acquire_lock "$led/.spawnlock-$wname" || return 1
+  if suborch_live "$sess" "$wname"; then
+    : # already up, harness alive — idempotent no-op (replay/reconcile-safe)
+  else
+    FLEET_SESSION="$sess" FLEET_ROOT="$root" cmd_new --scratch "$wname" -p "$(suborch_seed)
+DISPATCH ID: $id"
+  fi
+  release_lock "$led/.spawnlock-$wname"
+}
+
+# `fleet dispatch <id>` — deterministic spawn, no LLM. Also fans out to the
+# enable/disable/status verbs (the opt-in hook installer).
+cmd_dispatch() { # dispatch <id> | enable | disable | status
+  case "${1:-}" in
+    enable)  shift; dispatch_enable  "$@"; return $? ;;
+    disable) shift; dispatch_disable "$@"; return $? ;;
+    status)  shift; dispatch_status  "$@"; return $? ;;
+  esac
+  local id="${1:-}"
+  [ -n "$id" ] || die "usage: fleet dispatch <id> | enable | disable | status"
+  local sess root led wname
+  sess=$(session_name) || die "not inside tmux"
+  root=$(fleet_root)   || die "not inside tmux"
+  led="$root/.fleet/dispatch/$id"
+  [ -f "$led/instruction.txt" ] || die "no such dispatch $id (no instruction.txt)"
+  wname="so-$id"                                    # one sub-orch per instruction
+  resolve_or_spawn_suborch "$sess" "$wname" "$id" "$root"
+  meta_set "$led" window "$wname"
+  meta_set "$led" state planning
+  echo "dispatched $id → $wname"
+}
+
+# `fleet dispatch-alloc` (internal, called by the hook): allocate an id, create its
+# ledger dir + initial meta, and echo the dir path. The hook then writes
+# instruction.txt itself with printf — the prompt body never crosses a command line.
+cmd_dispatch_alloc() {
+  local root led id d
+  root=$(fleet_root) || die "not inside tmux"
+  led="$root/.fleet/dispatch"
+  mkdir -p "$led" 2>/dev/null || die "cannot create ledger $led"
+  id=$(alloc_id "$led") || die "id allocation failed (lock contention?)"
+  d="$led/$id"
+  mkdir -p "$d" 2>/dev/null
+  meta_set "$d" state queued
+  meta_set "$d" created "$(date -Is 2>/dev/null || date)"
+  printf '%s\n' "$d"
+}
+
+# `fleet reconcile` — one-shot sweep: re-animate stranded dispatches (unfinished
+# state + dead sub-orch window). Idempotent: resolve_or_spawn is a no-op when the
+# sub-orch is live. Invoked explicitly, opportunistically by the hook, or on a timer.
+cmd_reconcile() {
+  local sess root led d id state
+  sess=$(session_name) || return 0
+  root=$(fleet_root)   || return 0
+  led="$root/.fleet/dispatch"
+  [ -d "$led" ] || return 0
+  for d in "$led"/d*/; do
+    [ -d "$d" ] || continue
+    id=$(basename "$d")
+    state=$(meta_get "$d" state)
+    case "$state" in done|failed|cancelled) continue ;; esac
+    if ! suborch_live "$sess" "so-$id"; then
+      resolve_or_spawn_suborch "$sess" "so-$id" "$id" "$root"
+    fi
+  done
+}
+
+# `fleet slug <text...>` — deterministic kebab slug. Pins worker-key/branch
+# determinism (FINAL-b §2): two sub-orchs that emit the SAME canonical intent phrase
+# get the SAME slug, so they dedup onto one (repo,branch) worker instead of racing.
+cmd_slug() {
+  local s="$*"
+  s=$(printf '%s' "$s" | tr '[:upper:]' '[:lower:]' \
+      | sed 's/[^a-z0-9]\+/-/g; s/^-\+//; s/-\+$//')
+  printf '%s\n' "${s:-task}"
+}
+
+# Strict POSITIVE-whitelist input classifier (§6.1a). Emits an in-band-eligible
+# verdict ONLY on an exact signature; everything else (draft/modal/parse-miss/
+# capture-fail) -> a non-safe verdict that forces out-of-band. Modal detection here
+# is a UX nicety (popup vs toast) — it NEVER gates in-band delivery.
+orch_input_state() { # <pane> -> empty|generating|draft|modal|unknown
+  local pane="$1" cap footer line rest clean
+  cap=$(tmux capture-pane -p -t "$pane" 2>/dev/null) || { echo unknown; return; }
+  [ -n "$cap" ] || { echo unknown; return; }
+
+  # generating: "esc to interrupt" matched ONLY in the footer region (below the
+  # last horizontal-rule line). If no rule is found, the footer is empty and we do
+  # NOT match — so a pasted/typed "esc to interrupt" elsewhere cannot forge it.
+  footer=$(printf '%s\n' "$cap" | awk '
+    /─/      { rule=NR }
+    { line[NR]=$0; n=NR }
+    END      { if (rule>0) for (i=rule+1;i<=n;i++) print line[i] }')
+  if [ -n "$footer" ] && printf '%s\n' "$footer" | grep -qi 'esc to interrupt'; then
+    echo generating; return
+  fi
+
+  # modal signature (UX only): numbered option lists / confirm prompts.
+  if printf '%s\n' "$cap" | grep -qE '(❯|>|│)[[:space:]]*[0-9]+\.|Do you want|Would you like'; then
+    echo modal; return
+  fi
+
+  # empty-box signature: the LAST prompt line carrying ❯ has nothing after the
+  # marker once box-borders, nbsp (U+00A0) and whitespace are stripped. A
+  # whitelisted placeholder also counts as empty.
+  line=$(printf '%s\n' "$cap" | grep -n '❯' | tail -1 | cut -d: -f2-)
+  if [ -n "$line" ]; then
+    rest=${line#*❯}
+    clean=$(printf '%s' "$rest" | sed 's/│//g' | tr -d '\302\240' | tr -d '[:space:]')
+    [ -z "$clean" ] && { echo empty; return; }
+    case "$rest" in *"Press up to edit queued messages"*) echo empty; return ;; esac
+    echo draft; return
+  fi
+  echo unknown
+}
+
+# Durable out-of-band record — always written, regardless of in/out-of-band choice,
+# so the dashboard alerts strip is the source of truth for exceptional events.
+append_dashboard_alert() { # <msg>
+  local root f; root=$(fleet_root 2>/dev/null) || return 0
+  f="$root/.fleet/dispatch/alerts.log"
+  mkdir -p "$(dirname "$f")" 2>/dev/null || return 0
+  printf '%s\t%s\n' "$(date -Is 2>/dev/null || date)" "$1" >> "$f" 2>/dev/null || true
+}
+
+# The single safe-delivery primitive (§6.4). policy: inband-ok (sub-orch/worker) |
+# oob (out-of-band only). class: normal | blocked (blocked = the only popup-worthy
+# class). The MAIN pane is HARD-PINNED to oob here regardless of caller, so no
+# security boundary rides on the scraper for the pane a human drives.
+cmd_notify() { # notify <pane> <msg> [policy] [class]
+  local pane="${1:-}" msg="${2:-}" policy="${3:-inband-ok}" class="${4:-normal}" wname state tty
+  [ -n "$pane" ] && [ -n "$msg" ] || die "usage: fleet notify <pane> \"msg\" [inband-ok|oob] [normal|blocked]"
+
+  # Hard pin: never send-keys into the main (human) pane. Detect it by window name
+  # and force oob, overriding any caller that passed inband-ok.
+  wname=$(tmux display -p -t "$pane" '#{window_name}' 2>/dev/null)
+  [ "$wname" = main ] && policy=oob
+
+  if [ "$policy" = inband-ok ]; then
+    state=$(orch_input_state "$pane")
+    if [ "$state" = empty ] || [ "$state" = generating ]; then
+      tmux send-keys -t "$pane" -l "$msg" 2>/dev/null
+      tmux send-keys -t "$pane" Enter     2>/dev/null
+      return 0
+    fi
+  fi
+
+  # OUT-OF-BAND: toast + (blocked only) a non-blocking popup + verbatim bell + panel.
+  tmux display-message -t "$pane" "fleet: $msg" 2>/dev/null
+  if [ "$class" = blocked ]; then
+    # Pass the message via tmux's own -e env (not shell interpolation) so a ' or "
+    # in $msg cannot break the popup command (FINAL-b §5). No read, no & → the
+    # popup is non-blocking; the dashboard alert is the durable record.
+    tmux display-popup -t "$pane" -E -e "FLEET_MSG=$msg" \
+      'printf "fleet: %s\n" "$FLEET_MSG"' 2>/dev/null
+  fi
+  tty=$(tmux display -p -t "$pane" '#{pane_tty}' 2>/dev/null)   # verbatim — no /dev/pts strip
+  [ -n "$tty" ] && printf '\a' > "$tty" 2>/dev/null
+  append_dashboard_alert "$msg"
+}
+
+# ---- dispatch enable / disable (opt-in hook installer) ------------------------
+# DELIBERATELY opt-in: the UserPromptSubmit dispatch hook is NOT wired by install.sh
+# and NOT active until the operator runs `fleet dispatch enable`. Activating it
+# intercepts the main pane's prompts, so it must be a conscious step.
+
+DISPATCH_HOOK_SRC="$FLEET_DIR/bin/fleet-dispatch.sh"
+
+dispatch_settings_path() { # echo the project-local settings.json path
+  local root; root=$(fleet_root) || return 1
+  printf '%s\n' "$root/.claude/settings.json"
+}
+
+dispatch_enable() { # install the hook into <root>/.claude/ and wire settings.json
+  local root; root=$(fleet_root) || die "not inside tmux"
+  [ -f "$DISPATCH_HOOK_SRC" ] || die "hook source missing: $DISPATCH_HOOK_SRC"
+  local hookdir="$root/.claude/hooks" hookdst="$root/.claude/hooks/fleet-dispatch.sh"
+  mkdir -p "$hookdir" 2>/dev/null || die "cannot create $hookdir"
+  cp "$DISPATCH_HOOK_SRC" "$hookdst" && chmod +x "$hookdst"
+  local settings="$root/.claude/settings.json"
+  [ -f "$settings" ] || echo '{}' > "$settings"
+  python3 - "$settings" "$hookdst" <<'PY' || die "settings wiring failed"
+import json, sys
+path, hook = sys.argv[1], sys.argv[2]
+with open(path) as f: s = json.load(f)
+hooks = s.setdefault("hooks", {})
+entries = hooks.setdefault("UserPromptSubmit", [])
+for e in entries:                                   # drop any prior dispatch entry
+    e["hooks"] = [h for h in e.get("hooks", []) if "fleet-dispatch" not in h.get("command","")]
+entries[:] = [e for e in entries if e.get("hooks")]
+entries.append({
+    "matcher": "*",
+    "hooks": [{"type": "command", "command": f"sh '{hook}'", "timeout": 30}],
+})
+with open(path, "w") as f:
+    json.dump(s, f, indent=2); f.write("\n")
+print(f"  wired dispatch hook: {path}")
+PY
+  echo "dispatch ENABLED for $root"
+  echo "  hook:     $hookdst"
+  echo "  settings: $settings"
+  echo "  the main pane must export FLEET_ROLE=main (fleet up/main do this) for the"
+  echo "  gate to arm; non-main panes hard pass-through. Disable: fleet dispatch disable"
+}
+
+dispatch_disable() { # unwire the hook from settings.json (leaves the script on disk)
+  local root; root=$(fleet_root) || die "not inside tmux"
+  local settings="$root/.claude/settings.json"
+  [ -f "$settings" ] || { echo "dispatch already off (no $settings)"; return 0; }
+  python3 - "$settings" <<'PY' || die "settings unwiring failed"
+import json, sys
+path = sys.argv[1]
+with open(path) as f: s = json.load(f)
+hooks = s.get("hooks", {})
+for ev in list(hooks):
+    for e in hooks[ev]:
+        e["hooks"] = [h for h in e.get("hooks", []) if "fleet-dispatch" not in h.get("command","")]
+    hooks[ev] = [e for e in hooks[ev] if e.get("hooks")]
+    if not hooks[ev]: del hooks[ev]
+with open(path, "w") as f:
+    json.dump(s, f, indent=2); f.write("\n")
+print(f"  unwired dispatch hook: {path}")
+PY
+  echo "dispatch DISABLED for $root"
+}
+
+dispatch_status() { # report whether the hook is wired + the ledger rollup
+  local root settings on=no
+  root=$(fleet_root) || die "not inside tmux"
+  settings="$root/.claude/settings.json"
+  [ -f "$settings" ] && grep -q "fleet-dispatch" "$settings" 2>/dev/null && on=yes
+  echo "dispatch hook wired: $on  ($settings)"
+  local led="$root/.fleet/dispatch" d id st
+  [ -d "$led" ] || { echo "no dispatches yet"; return 0; }
+  printf 'ID\tSTATE\tWINDOW\n'
+  for d in "$led"/d*/; do
+    [ -d "$d" ] || continue
+    id=$(basename "$d"); st=$(meta_get "$d" state)
+    printf '%s\t%s\t%s\n' "$id" "${st:-?}" "$(meta_get "$d" window)"
+  done
 }
 
 # ---- ready / reap (signal a worktree is done, then remove it) ------------------
@@ -1128,8 +1465,14 @@ cmd_main() {
     [ -n "$harness" ] || harness=$(tmux show -t "$sess" -v @fleet_orch_harness 2>/dev/null)
     [ -n "$harness" ] || harness=claude
     local ORCH_BIN; load_orch "$harness"
-    win=$(tmux new-window -P -F '#{window_id}' -t "$sess" -n main -c "$root" "$ORCH_BIN")
+    # FLEET_ROLE=main via tmux -e (pane-local env, NOT inherited by sibling
+    # new-window panes, NOT a global tmux env) — this is the load-bearing fork-bomb
+    # gate the dispatch hook reads. A plain shell export or `set-environment -g`
+    # would leak `main` into every spawned pane and re-arm the fork-bomb (§1).
+    win=$(tmux new-window -P -F '#{window_id}' -t "$sess" -n main -c "$root" \
+      -e FLEET_ROLE=main "$ORCH_BIN")
     tag_orch_window "$win"
+    record_pane_role "$root" "$(tmux list-panes -t "$win" -F '#{pane_id}' 2>/dev/null | head -1)" main
     tmux set -t "$sess" @fleet_orch_harness "$harness"
     tmux move-window -t "$sess" -s "$win" 2>/dev/null || true
   fi
@@ -1145,18 +1488,41 @@ cmd_main() {
 # the orchestrator gets the same fleet instructions. Idempotent + non-destructive:
 # creates the file if absent, appends under a marker if present without the guide,
 # and leaves a file that already has it untouched.
-install_orch_guide() { # <root>
-  local root="$1"; local marker="<!-- fleet:orchestrator-guide -->"
+install_orch_guide() { # [--restamp] <root>
+  local restamp=0
+  [ "${1:-}" = --restamp ] && { restamp=1; shift; }
+  local root="$1"
+  # Reuse the EXACT marker string already written by earlier installs (FINAL-b §3) —
+  # keying off a different marker would double-append on existing checkouts. A
+  # trailing end marker is added going forward so re-stamps splice cleanly without
+  # clobbering anything the user wrote outside the block; legacy files (begin only,
+  # guide-to-EOF) re-stamp by replacing begin→EOF.
+  local marker="<!-- fleet:orchestrator-guide -->"
+  local endm="<!-- /fleet:orchestrator-guide -->"
   [ -n "$root" ] && [ -f "$FLEET_DIR/FLEET.md" ] || return 0
-  local f path
+  local f path tmp
   for f in CLAUDE.md AGENTS.md; do
     path="$root/$f"
     if [ ! -f "$path" ]; then
-      { printf '%s\n\n' "$marker"; cat "$FLEET_DIR/FLEET.md"; } > "$path" 2>/dev/null \
+      { printf '%s\n\n' "$marker"; cat "$FLEET_DIR/FLEET.md"; printf '\n%s\n' "$endm"; } > "$path" 2>/dev/null \
         && echo "installed orchestrator guide → $path"
     elif ! grep -qF "$marker" "$path" 2>/dev/null && ! grep -q "fleet new" "$path" 2>/dev/null; then
-      { printf '\n%s\n\n' "$marker"; cat "$FLEET_DIR/FLEET.md"; } >> "$path" 2>/dev/null \
+      { printf '\n%s\n\n' "$marker"; cat "$FLEET_DIR/FLEET.md"; printf '\n%s\n' "$endm"; } >> "$path" 2>/dev/null \
         && echo "appended orchestrator guide → $path"
+    elif [ "$restamp" = 1 ] && grep -qF "$marker" "$path" 2>/dev/null; then
+      # Splice the marked block in place: replace begin..end (or begin..EOF when no
+      # end marker exists) with the current FLEET.md body. Atomic via tmp+mv.
+      tmp=$(mktemp) || continue
+      if awk -v beg="$marker" -v endm="$endm" -v bodyfile="$FLEET_DIR/FLEET.md" '
+        BEGIN { body=""; while ((getline l < bodyfile) > 0) body = body l "\n" }
+        !inblock && $0==beg { printf "%s\n\n%s%s\n", beg, body, endm; inblock=1; next }
+        inblock { if ($0==endm) inblock=0; next }   # drop old block lines (incl end)
+        { print }
+      ' "$path" > "$tmp" 2>/dev/null && [ -s "$tmp" ]; then
+        mv "$tmp" "$path" 2>/dev/null && echo "re-stamped orchestrator guide → $path"
+      else
+        rm -f "$tmp" 2>/dev/null
+      fi
     fi
   done
 }
@@ -1500,8 +1866,12 @@ cmd_up() {
       fi
       [ -n "$orch" ] || orch=claude
       local ORCH_BIN; load_orch "$orch"
-      tmux new-session -d -s "$name" -c "$root" -n main "$ORCH_BIN"
-      tag_orch_window "$(tmux list-windows -t "$name" -F '#{window_id}' | head -1)"
+      # -e FLEET_ROLE=main: arms the dispatch hook's role gate in the main pane only
+      # (pane-local, not inherited by sibling new-window panes). See cmd_main.
+      tmux new-session -d -s "$name" -c "$root" -n main -e FLEET_ROLE=main "$ORCH_BIN"
+      local _mainwin; _mainwin=$(tmux list-windows -t "$name" -F '#{window_id}' | head -1)
+      tag_orch_window "$_mainwin"
+      record_pane_role "$root" "$(tmux list-panes -t "$_mainwin" -F '#{pane_id}' 2>/dev/null | head -1)" main
       tmux set -t "$name" @fleet_orch_harness "$orch"
     fi
   fi
@@ -1723,6 +2093,11 @@ fleet — agent fleet manager (tmux + nvim + Claude Code)
   fleet cost <a>         show an agent's token spend
   fleet guard on|off     test/CI write-guard (asks before editing tests/CI/lockfiles)
   fleet mode <a>         cycle an agent's Claude permission mode (Shift+Tab)
+  fleet dispatch <id>    spawn the ephemeral sub-orchestrator for a ledger id (zero LLM)
+  fleet dispatch enable  OPT-IN: wire the UserPromptSubmit dispatch hook (enable|disable|status)
+  fleet reconcile        sweep + re-animate stranded dispatches (dead sub-orch windows)
+  fleet notify <p> "m"   safe-deliver a message to a pane (in-band iff proven safe, else out-of-band)
+  fleet restamp          re-propagate the edited FLEET.md guide into bootstrapped CLAUDE.md/AGENTS.md
   fleet main [--reload]  (re)build command center window (--reload restarts just the dashboard)
   fleet sessions         fzf switch between open fleet sessions (prefix+$(keybind_for sessions))
   fleet quit             tear down THIS fleet session — kills all its windows (prefix+$(keybind_for quit))
@@ -1759,6 +2134,12 @@ case "${1:-}" in
   browser) shift; cmd_browser "$@" ;;      # drive a real Chromium against the dev app
   devport) shift; cmd_devport "$@" ;;      # write/show the .fleet/devport marker
   mode)    shift; cmd_mode "$@" ;;
+  dispatch)      shift; cmd_dispatch "$@" ;;        # <id> spawn, or enable|disable|status
+  dispatch-alloc) shift; cmd_dispatch_alloc "$@" ;; # internal: alloc id + ledger dir (hook)
+  reconcile)     shift; cmd_reconcile "$@" ;;       # sweep stranded dispatches
+  notify)        shift; cmd_notify "$@" ;;          # safe-delivery primitive
+  slug)          shift; cmd_slug "$@" ;;            # deterministic kebab slug (worker keys)
+  restamp)       shift; install_orch_guide --restamp "$(fleet_root)" ;;  # re-propagate FLEET.md
   main)       shift; cmd_main "$@" ;;
   orch-jump)  shift; cmd_orch_jump "$@" ;;            # internal: prefix-key jump to orchestrator pane
   apply-keybinds) shift; apply_keybinds ;;            # internal: re-apply runtime keybinds live

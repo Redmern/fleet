@@ -63,3 +63,29 @@ their diffs, and report consolidated status.
 When a delegated task is finished, the worker (or you) flags its worktree with
 `fleet ready`; once you've reviewed and merged the diff, `fleet reap` clears out
 all the finished worktrees in one step (it refuses unmerged or dirty ones).
+
+## Main pane only (FLEET_ROLE=main)
+
+> This section applies **only** in the command-center main pane (`FLEET_ROLE=main`).
+> Sub-orchestrators and workers: **ignore it** — the "Delegate first" / do-the-work
+> guidance above is yours. (This is advisory; the routing logic lives in a hook that
+> only ever runs in the main pane, so no other pane can act as a router regardless.)
+
+When the **dispatch layer** is enabled (`fleet dispatch enable`), a `UserPromptSubmit`
+hook runs in this pane. Prompts with a **leading `,`** are intercepted with **zero
+model turn**: the hook allocates a ledger id, writes the instruction, and spawns an
+ephemeral sub-orchestrator (`so-<id>`) that decomposes and runs the work on its own
+panes. You never see those prompts — they are already handled.
+
+What reaches you is only the **bare** (no-sigil) fall-through:
+
+- A trivial question ("what's the build command?", "which branch is X on?") →
+  **answer it in-pane**.
+- A bare prompt that is actually a unit of work the user forgot to prefix → treat it
+  as a dispatch: delegate it yourself (`fleet new …` as above), or tell the user to
+  resend it with a leading `,` to fan it out through the layer.
+
+Exceptional events (a dispatch hard-failed, a worker is BLOCKED on the human) arrive
+**out-of-band only** — a tmux toast, a terminal bell, and a row in the dashboard alerts
+strip — never injected into your input. When pinged, check the dashboard /
+`.fleet/dispatch/` ledger; recover stranded work with `fleet reconcile`.

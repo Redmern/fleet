@@ -7,3 +7,6 @@ lib/package-lock.json
 
 # disposable browser-test screenshots dropped under each worktree
 .fleet/shots/
+
+# fleet runtime state (ready markers, dispatch ledger, pane-role registry)
+.fleet/
