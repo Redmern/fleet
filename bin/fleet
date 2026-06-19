@@ -612,6 +612,11 @@ cmd_new() {
     tmux set -w -t "$win_id" @fleet_nvim_sock "$nsock"
   fi
   tmux set -w -t "$win_id" @fleet_harness "$H_NAME"
+  # Hand the freshly-spawned window_id back to a caller that asked for it (the
+  # dispatch layer: resolve_or_spawn_suborch records it in the ledger so the
+  # sub-orch can be resolved session-independently — a scratch sub-orch lives in
+  # the detached <sess>_hidden session, so a "$sess:$wname" lookup never finds it).
+  [ -n "${FLEET_NEW_WID_FILE:-}" ] && printf '%s\n' "$win_id" > "$FLEET_NEW_WID_FILE" 2>/dev/null
   # optional pane-role registry entry (cross-check for the dispatch hook's env gate)
   record_pane_role "$root" "$(tmux list-panes -t "$win_id" -F '#{pane_id}' 2>/dev/null | head -1)" worker
   # Let fleetd derive state for hookless harnesses without knowing them: stamp
@@ -839,10 +844,31 @@ record_pane_role() { # <root> <pane_id> <role>
 
 suborch_seed() { cat "$FLEET_DIR/FLEET_SUBORCH.md" 2>/dev/null; }
 
+# Find a sub-orch window's id by NAME across both the visible session and its
+# detached "<sess>_hidden" sibling (C-v2 parks scratch panes — and thus sub-orchs
+# spawned via `cmd_new --scratch` — in the hidden session). Used only as a fallback
+# when the ledger has no recorded window_id (legacy dispatches / capture miss).
+suborch_find_wid() { # <sess> <wname> -> window_id
+  local sess="$1" wname="$2" s wid=""
+  for s in "$sess" "${sess}_hidden"; do
+    wid=$(tmux list-windows -t "=$s" -F '#{window_id} #{window_name}' 2>/dev/null \
+          | awk -v n="$wname" '$2==n{print $1; exit}')
+    [ -n "$wid" ] && break
+  done
+  printf '%s' "$wid"
+}
+
 # Liveness = window exists AND its foreground proc is the harness (not a dead shell).
-suborch_live() { # <sess> <wname>
-  local sess="$1" wname="$2" pane cmd
-  pane=$(tmux list-panes -t "$sess:$wname" -F '#{pane_id} #{pane_current_command}' \
+# Resolve by the window_id recorded in the ledger at spawn (session-independent: a
+# scratch sub-orch lives in <sess>_hidden, so a "$sess:$wname" pane lookup never
+# finds it -> false-dead -> respawn loop). Fall back to a both-sessions name search
+# when no id was recorded.
+suborch_live() { # <dispatch-dir> <sess> <wname>
+  local d="$1" sess="$2" wname="$3" wid pane cmd
+  wid=$(meta_get "$d" window_id)
+  [ -n "$wid" ] || wid=$(suborch_find_wid "$sess" "$wname")
+  [ -n "$wid" ] || return 1
+  pane=$(tmux list-panes -t "$wid" -F '#{pane_id} #{pane_current_command}' \
          2>/dev/null | head -1) || return 1
   [ -n "$pane" ] || return 1
   cmd=${pane#* }
@@ -854,12 +880,21 @@ suborch_live() { # <sess> <wname>
 # seed prompt can never re-enter the dispatch branch — the fork-bomb gate, §1).
 resolve_or_spawn_suborch() { # <sess> <wname> <id> <root>
   local sess="$1" wname="$2" id="$3" root="$4" led="$root/.fleet/dispatch"
+  local d="$led/$id"
   acquire_lock "$led/.spawnlock-$wname" || return 1
-  if suborch_live "$sess" "$wname"; then
+  if suborch_live "$d" "$sess" "$wname"; then
     : # already up, harness alive — idempotent no-op (replay/reconcile-safe)
   else
-    FLEET_SESSION="$sess" FLEET_ROOT="$root" cmd_new --scratch "$wname" -p "$(suborch_seed)
+    # Capture the spawned window_id (FLEET_NEW_WID_FILE) and pin it in the ledger so
+    # later liveness checks resolve session-independently — cmd_new --scratch parks
+    # the sub-orch in <sess>_hidden, which "$sess:$wname" can't see.
+    local widf="$led/.wid-$wname.$$"
+    rm -f "$widf" 2>/dev/null
+    FLEET_NEW_WID_FILE="$widf" FLEET_SESSION="$sess" FLEET_ROOT="$root" \
+      cmd_new --scratch "$wname" -p "$(suborch_seed)
 DISPATCH ID: $id"
+    local wid; wid=$(cat "$widf" 2>/dev/null); rm -f "$widf" 2>/dev/null
+    [ -n "$wid" ] && meta_set "$d" window_id "$wid"
   fi
   release_lock "$led/.spawnlock-$wname"
 }
@@ -916,7 +951,7 @@ cmd_reconcile() {
     id=$(basename "$d")
     state=$(meta_get "$d" state)
     case "$state" in done|failed|cancelled) continue ;; esac
-    if ! suborch_live "$sess" "so-$id"; then
+    if ! suborch_live "$d" "$sess" "so-$id"; then
       resolve_or_spawn_suborch "$sess" "so-$id" "$id" "$root"
     fi
   done
