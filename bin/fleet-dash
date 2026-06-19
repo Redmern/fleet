@@ -38,10 +38,22 @@ sel=0                                     # selected row index
 status=""                                 # transient status line
 
 # --- terminal setup ----------------------------------------------------------
-cleanup() { printf '\033[?1004l' 2>/dev/null; tput rmcup 2>/dev/null; tput cnorm 2>/dev/null; }
+# The loop runs load_rows+render between key reads; in cooked mode the tty echoes
+# keys pressed in that window (the stray j/k) and line-buffers them. `read -s`
+# only suppresses echo *during* the read syscall. So hold -echo -icanon for the
+# whole lifetime: nav keys are consumed raw, never echoed. read -rsN1/-N2 read
+# raw byte counts regardless of canon mode, so they keep working. The one
+# unrecoverable path is SIGKILL with a surviving pane (untrappable) — rare and
+# the pane's pty is usually destroyed with the process anyway.
+STTY_SAVED=""
+[ -t 0 ] && STTY_SAVED=$(stty -g 2>/dev/null)
+raw_mode()    { stty -echo -icanon min 1 time 0 2>/dev/null; }
+cooked_mode() { [ -n "$STTY_SAVED" ] && stty "$STTY_SAVED" 2>/dev/null; }
+cleanup() { cooked_mode; printf '\033[?1004l' 2>/dev/null; tput rmcup 2>/dev/null; tput cnorm 2>/dev/null; }
 trap cleanup EXIT INT TERM
 tput smcup 2>/dev/null                    # alternate screen
 tput civis 2>/dev/null                    # hide cursor
+raw_mode                                  # no echo, char-at-a-time (see above)
 # Focus reporting: ask the terminal to send \033[I / \033[O on focus change, and
 # have tmux forward them. They wake the read loop so the focus marker updates
 # instantly instead of on the next ~2s refresh.
@@ -478,7 +490,9 @@ ask() { # ask "prompt> " -> echoes reply
   local reply; local rows; rows=$(tput lines)
   tput cnorm 2>/dev/null
   tput cup $((rows - 1)) 0 2>/dev/null; tput el 2>/dev/null
+  cooked_mode                       # readline (read -ep) needs echo + canonical input
   IFS= read -rep "$1" reply
+  raw_mode                          # back to no-echo char-at-a-time
   tput civis 2>/dev/null
   printf '%s' "$reply"
 }
@@ -894,26 +908,60 @@ view_diff() {
   tmux display-popup -E -b rounded -w 90% -h 90% -T " diff · $label " "$cmd" 2>/dev/null
 }
 
+# drain_nav -> apply any *already-buffered* j/k/g/G/arrow keys to `sel` WITHOUT
+# rendering, so a fast nav burst collapses into ~one render instead of N. The 3ms
+# timeout is BELOW the key-autorepeat gap (~33ms), so it coalesces only genuine
+# backlog (keys queued during a slow render, or a paste), not normal repeat — the
+# bar still tracks each held-key step smoothly. Stops at the first non-nav key,
+# stashing it in PENDING for the main loop (the tty has no pushback).
+drain_nav() {
+  local k2 r2
+  while IFS= read -rsN1 -t 0.003 k2; do
+    case "$k2" in
+      k) (( sel > 0 )) && ((sel--)) ;;
+      j) (( sel < N-1 )) && ((sel++)) ;;
+      g) sel=0 ;;
+      G) (( N > 0 )) && sel=$((N - 1)) ;;
+      $'\e') IFS= read -rsN2 -t 0.01 r2 || r2=''
+        case "$r2" in
+          '[A') (( sel > 0 )) && ((sel--)) ;;
+          '[B') (( sel < N-1 )) && ((sel++)) ;;
+          *) : ;;                       # focus/other ESC seq: ignore, keep draining
+        esac ;;
+      *) PENDING="$k2"; return ;;        # non-nav: stash, stop draining
+    esac
+  done
+}
+
 # --- main loop ---------------------------------------------------------------
 clear
+load_rows                       # initial data; thereafter only on refresh/actions
+last_load=$SECONDS
+PENDING=""                      # a non-nav key stashed by drain_nav (tty has no pushback)
 while :; do
-  load_rows
+  # Cap staleness at ~REFRESH regardless of nav activity. A sustained key-hold
+  # keeps resetting the `read -t` timer so the idle timeout alone never fires
+  # (load_rows would starve); this forces a reload when data is older than
+  # REFRESH while keeping the ~34ms `fleet agents` RPC off every keypress
+  # (≤1 RPC/sec even under a mash). Nav itself never reloads — it only moves sel.
+  if (( SECONDS - last_load >= REFRESH )); then load_rows; last_load=$SECONDS; fi
   render
 
-  key=''
-  IFS= read -rsN1 -t "$REFRESH" key || { status=""; continue; }   # timeout -> refresh
+  if [ -n "$PENDING" ]; then key="$PENDING"; PENDING=""        # handle stashed key first
+  elif ! IFS= read -rsN1 -t "$REFRESH" key; then status=""; continue; fi   # timeout -> top reloads
   case "$key" in
-    $'\e')  # arrow keys: ESC [ A/B
+    $'\e')  # arrow keys: ESC [ A/B  (also swallows focus \033[I/O harmlessly)
       IFS= read -rsN2 -t 0.01 rest || rest=''
       case "$rest" in
         '[A') (( sel > 0 )) && ((sel--)) ;;
         '[B') (( sel < N-1 )) && ((sel++)) ;;
-      esac ;;
-    k) (( sel > 0 )) && ((sel--)) ;;
-    j) (( sel < N-1 )) && ((sel++)) ;;
-    g) sel=0 ;;
-    G) (( N > 0 )) && sel=$((N - 1)) ;;
-    r) status="" ;;
+      esac
+      drain_nav ;;
+    k) (( sel > 0 )) && ((sel--)); drain_nav ;;
+    j) (( sel < N-1 )) && ((sel++)); drain_nav ;;
+    g) sel=0; drain_nav ;;
+    G) (( N > 0 )) && sel=$((N - 1)); drain_nav ;;
+    r) status=""; load_rows; last_load=$SECONDS ;;   # manual refresh
     R) cleanup; exec "$SELF" "$SESS" ;;   # reload the dashboard with fresh code
     $'\n'|$'\r')   # jump to selected agent's window
       (( N == 0 )) && continue
@@ -925,20 +973,22 @@ while :; do
         starting|stale) status="$label still starting — no hook yet" ;;
         *) if harness_has_modes "$(harness_of "$pane")"; then pick_mode "$pane" "$label"; clear
            else status="$(harness_of "$pane") has no permission modes"; fi ;;
-      esac ;;
+      esac
+      load_rows; last_load=$SECONDS ;;
     s)             # send a message to selected agent
       (( N == 0 )) && continue
       label=$(field "$sel" 2)
       msg=$(ask "send to $label> "); clear   # repaint: read -e may have scrolled
       [ -n "$msg" ] && { "$FLEET_BIN" send "$label" "$msg" >/dev/null 2>&1 \
-        && status="sent → $label" || status="send failed → $label"; } ;;
+        && status="sent → $label" || status="send failed → $label"; }
+      load_rows; last_load=$SECONDS ;;
     n)             # spawn a new agent via the in-box form (sets status)
-      new_agent_form; clear ;;
+      new_agent_form; clear; load_rows; last_load=$SECONDS ;;
     d)             # close/teardown the selected agent (confirm popup)
       (( N == 0 )) && continue
       label=$(field "$sel" 2); win=$(field "$sel" 3); pane=$(field "$sel" 6)
       dir=$(tmux display -p -t "$pane" '#{pane_current_path}' 2>/dev/null)
-      confirm_teardown "$label" "$win" "$pane" "$dir"; clear ;;
+      confirm_teardown "$label" "$win" "$pane" "$dir"; clear; load_rows; last_load=$SECONDS ;;
     v)             # view the selected agent's git diff in a popup pager
       (( N == 0 )) && continue
       label=$(field "$sel" 2); pane=$(field "$sel" 6)
