@@ -569,6 +569,18 @@ cmd_new() {
   # the state source + the "busy" scrape pattern onto the window.
   tmux set -w -t "$win_id" @fleet_state_src "$H_STATE_SRC"
   [ -n "$H_BUSY_RE" ] && tmux set -w -t "$win_id" @fleet_busy_re "$H_BUSY_RE"
+  if [ "$scratch" = 1 ]; then
+    # Hide scratch windows from the tmux tab bar — they stay in the fleet
+    # dashboard (which lists every agent). A per-window window-status-format
+    # override renders the window empty in the status list; it beats the global
+    # format and survives pill/theme regeneration (which only re-sets the
+    # global). window-status-current-format is left global+unconditional, so a
+    # scratch window REAPPEARS as the current pill while focused — including when
+    # reached via the dashboard's select-window (Enter) — and auto-hides again on
+    # navigate-away. @fleet_hidden is the semantic marker for fleet/dash to key off.
+    tmux set -w -t "$win_id" @fleet_hidden 1 2>/dev/null || true
+    tmux set -w -t "$win_id" window-status-format "" 2>/dev/null || true
+  fi
   echo "spawned $wname ($H_NAME) in window $win_id"
   # Window is created detached (-d) so focus stays put; jump only on --switch.
   [ "$switch" = 1 ] && tmux select-window -t "$win_id" 2>/dev/null || true
