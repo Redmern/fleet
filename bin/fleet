@@ -134,7 +134,12 @@ agents_tsv() { # state<TAB>label<TAB>session<TAB>window_id<TAB>window_name<TAB>s
   if json=$(rpc fleet.list); then
     python3 - "$json" <<'PY'
 import json, sys, time, os
-for a in json.loads(sys.argv[1]).get("agents", []):
+agents = json.loads(sys.argv[1]).get("agents", [])
+# Set of currently-live panes — used to tell a stale marker pane (a server
+# restart reassigned pane ids; the stamped pane matches no live agent) from a
+# genuinely-different live occupant of a shared cwd.
+live_panes = {a.get("pane_id", "") for a in agents}
+for a in agents:
     cwd = (a.get("cwd") or "").rstrip("/")
     label = "/".join(cwd.split("/")[-2:]) if cwd else a.get("window_name", "?")
     age = int(time.time() - a.get("since", time.time()))
@@ -144,12 +149,26 @@ for a in json.loads(sys.argv[1]).get("agents", []):
     rp = os.path.join(cwd, ".fleet", "ready") if cwd else ""
     if rp and os.path.exists(rp):
         ready = "ready"
+        marker_pane = ""
         try:
             for ln in open(rp):
                 if ln.startswith("reason="):
                     ready = ln[7:].strip() or "ready"
+                elif ln.startswith("pane="):
+                    marker_pane = ln[5:].strip()
         except OSError:
             pass
+        # The marker is keyed by cwd, which several agents can share (a reused
+        # worktree, or scratch agents + the orchestrator at the project root).
+        # Honor it only for the pane that wrote it. A different *live* occupant
+        # inherits nothing. Unstamped (legacy) markers — and stamps whose pane
+        # matches no live agent (a stale pane from a tmux server restart; the
+        # done worker was respawned with a fresh pane) — fall back to the legacy
+        # cwd behavior so a restored done worker keeps its pill. This is safe
+        # because cmd_new clears the marker on worktree reuse, so a stale-pane
+        # marker can't survive into a new occupant of the same cwd.
+        if marker_pane and marker_pane != a.get("pane_id", "") and marker_pane in live_panes:
+            ready = ""
     print("\t".join([a.get("state","?"), label, a.get("session",""),
                      a.get("window_id",""), a.get("window_name",""),
                      f"{age//60}m{age%60:02d}s", a.get("pane_id",""), str(age), ready]))
@@ -1152,16 +1171,16 @@ cmd_ready() { # ready [<agent>] [-m "reason"] [--clear]
       *) target="$1"; shift ;;
     esac
   done
-  local dir by
+  local dir by pane=""
   if [ -n "$target" ]; then            # orchestrator flagging another agent
-    local line pane
+    local line
     line=$(agents_tsv | awk -F'\t' -v t="$target" 'index($2,t)||index($5,t){print; exit}')
     [ -n "$line" ] || die "no agent matching '$target' (try: fleet ls)"
     pane=$(echo "$line" | cut -f7)
     dir=$(tmux display -p -t "$pane" '#{pane_current_path}' 2>/dev/null)
     by=orchestrator
   else                                 # a worker flagging its own worktree
-    dir="$PWD"; by=worker
+    dir="$PWD"; by=worker; pane="${TMUX_PANE:-}"
   fi
   [ -n "$dir" ] || die "could not resolve a worktree directory"
   local root; root=$(git -C "$dir" rev-parse --show-toplevel 2>/dev/null) || root="$dir"
@@ -1174,6 +1193,12 @@ cmd_ready() { # ready [<agent>] [-m "reason"] [--clear]
   {
     printf 'ts=%s\n' "$(date -Is 2>/dev/null || date)"
     printf 'by=%s\n' "$by"
+    # pane= binds the marker to the agent that wrote it, so agents_tsv honors it
+    # only for that pane — a different occupant of the same cwd (reused worktree,
+    # or scratch agents + the orchestrator sharing the project root) inherits
+    # nothing. cmd_reap reads the marker FILE directly and ignores pane=, so the
+    # done→reap flow is unaffected.
+    [ -n "$pane" ]   && printf 'pane=%s\n' "$pane"
     [ -n "$reason" ] && printf 'reason=%s\n' "$reason"
   } 2>/dev/null >"$marker"   # 2>/dev/null FIRST so a failed open of $marker is muted too
   # Don't key success off the brace group's exit: its last statement is the
