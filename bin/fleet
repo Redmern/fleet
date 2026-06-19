@@ -563,6 +563,13 @@ cmd_new() {
   local hbin
   hbin=$(harness_bin) || die "$H_NAME not found (looked for: $H_BIN)"
 
+  # A (re)used worktree — or the shared project root for a scratch agent — may
+  # carry a previous occupant's .fleet/ready. The agent we are about to start is
+  # not done, so clear it. REAP-SAFETY: an inherited marker would otherwise let
+  # `fleet reap` tear down the new agent's worktree mid-work. $dir is the cwd in
+  # both the scratch (dir=$root) and worktree paths.
+  rm -f "$dir/.fleet/ready" 2>/dev/null || true
+
   local win_id
   if [ "$bare" = 1 ]; then
     # bare pane: run the harness directly; prompt is one arg, via the flag (or
@@ -700,6 +707,12 @@ cmd_send() {
   win=$(printf '%s' "$line"   | cut -f4)
   wname=$(printf '%s' "$line" | cut -f5)
   pane=$(printf '%s' "$line"  | cut -f7)
+
+  # Re-tasking un-readies the target's worktree: it is going back to work, so a
+  # leftover .fleet/ready must not survive. REAP-SAFETY — without this, `fleet
+  # reap` could tear down a worktree we just sent work into. Best-effort.
+  local sdir; sdir=$(tmux display -p -t "$pane" '#{pane_current_path}' 2>/dev/null)
+  [ -n "$sdir" ] && rm -f "$sdir/.fleet/ready" 2>/dev/null || true
 
   # nvim-hosted agent: the tmux PANE is nvim, so `send-keys -t <pane>` lands in
   # whatever nvim buffer currently has focus — focus-dependent and unreliable.
