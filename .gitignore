@@ -1,2 +1,9 @@
 __pycache__/
 *.pyc
+
+# vendored Playwright driver deps (one-time `cd lib && npm i`; see install.sh)
+lib/node_modules/
+lib/package-lock.json
+
+# disposable browser-test screenshots dropped under each worktree
+.fleet/shots/
