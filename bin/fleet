@@ -181,7 +181,11 @@ cmd_ls() {
 cmd_pick() {
   command -v fzf >/dev/null || die "fzf not installed"
   local rows
+  # Drop parked scratch agents (session "*_hidden"): this picker ends in
+  # switch-client -t "$sess", which would teleport the client into the bare hidden
+  # session (no main/dash). Surface scratch from the dashboard (Enter) instead.
   rows=$(agents_tsv | sort -t$'\t' -k1,1 | awk -F'\t' '
+    $3 ~ /_hidden$/{next}
     $1=="blocked"{c="\033[31m"; o=0}
     $1=="idle"   {c="\033[32m"; o=1}
     $1=="working"{c="\033[34m"; o=2}
@@ -549,8 +553,45 @@ cmd_new() {
       [ -n "$H_PROMPT_FLAG" ] && argv+=("$H_PROMPT_FLAG")
       argv+=("$prompt")
     fi
-    win_id=$(tmux new-window -d -P -F '#{window_id}' -t "$sess" -n "$wname" -c "$dir" \
-      "${argv[@]}")
+    if [ "$scratch" = 1 ]; then
+      # Park scratch windows in a DETACHED sibling session "<sess>_hidden" so they
+      # are completely off the visible session's window bar AND unreachable by
+      # next/prev (tmux has no per-window skip-in-next/prev flag, so the window
+      # must live OUTSIDE the visible session). fleetd still lists them
+      # (list-panes -a is server-global), so they stay in the dashboard; the
+      # dashboard moves them into "$sess" on Enter and back out on 'h'.
+      local hidden="${sess}_hidden"
+      win_id=""
+      # has-session||new-session is TOCTOU: two concurrent scratch spawns when the
+      # hidden session is absent both miss has-session and race new-session — the
+      # loser gets rc=1 / empty win_id and the agent is LOST. So try BOTH primitives
+      # and fall back across the race in EITHER direction:
+      #   present -> new-window; if it fails (session just auto-destroyed by an Enter
+      #              move-in of its last window), retry as new-session.
+      #   absent  -> new-session; if it fails (a racer just created it), retry as
+      #              new-window. Exact-match (=$hidden) so fnmatch can't mis-target.
+      if tmux has-session -t "=$hidden" 2>/dev/null; then
+        win_id=$(tmux new-window -d -P -F '#{window_id}' -t "=$hidden" -n "$wname" -c "$dir" \
+          "${argv[@]}" 2>/dev/null)
+        [ -n "$win_id" ] || win_id=$(tmux new-session -d -P -F '#{window_id}' -s "$hidden" -n "$wname" -c "$dir" \
+          "${argv[@]}" 2>/dev/null)
+      else
+        win_id=$(tmux new-session -d -P -F '#{window_id}' -s "$hidden" -n "$wname" -c "$dir" \
+          "${argv[@]}" 2>/dev/null)
+        [ -n "$win_id" ] || win_id=$(tmux new-window -d -P -F '#{window_id}' -t "=$hidden" -n "$wname" -c "$dir" \
+          "${argv[@]}" 2>/dev/null)
+      fi
+      # Mirror @fleet_root onto the hidden session (idempotent) so `fleet`
+      # sub-commands run from INSIDE a scratch agent resolve the project root.
+      # cmd_sessions excludes *_hidden, so this never leaks into the switcher.
+      # NB: set-option on a SESSION target rejects the "=" exact-match prefix
+      # ("no such session: =..."), unlike has-session/move-window/kill-session —
+      # so plain "$hidden" here (a session name has no glob chars → exact anyway).
+      tmux set -t "$hidden" @fleet_root "$root" 2>/dev/null || true
+    else
+      win_id=$(tmux new-window -d -P -F '#{window_id}' -t "$sess" -n "$wname" -c "$dir" \
+        "${argv[@]}")
+    fi
   else
     # nvim pane: claude autostarts via claudecode.nvim; other harnesses open in a
     # generic :terminal. Both seed the prompt + take FleetSend over the nvim RPC.
@@ -570,20 +611,26 @@ cmd_new() {
   tmux set -w -t "$win_id" @fleet_state_src "$H_STATE_SRC"
   [ -n "$H_BUSY_RE" ] && tmux set -w -t "$win_id" @fleet_busy_re "$H_BUSY_RE"
   if [ "$scratch" = 1 ]; then
-    # Hide scratch windows from the tmux tab bar — they stay in the fleet
-    # dashboard (which lists every agent). A per-window window-status-format
-    # override renders the window empty in the status list; it beats the global
-    # format and survives pill/theme regeneration (which only re-sets the
-    # global). window-status-current-format is left global+unconditional, so a
-    # scratch window REAPPEARS as the current pill while focused — including when
-    # reached via the dashboard's select-window (Enter) — and auto-hides again on
-    # navigate-away. @fleet_hidden is the semantic marker for fleet/dash to key off.
+    # Semantic marker: this scratch agent is currently PARKED in the hidden sibling
+    # session (off the bar / non-navigable). The dashboard keys off it to label
+    # "(hidden)" and to decide move-in on Enter / move-out on 'h'; fleetd keys off
+    # it to suppress notifications while parked. Bar-hiding is achieved by living
+    # in <sess>_hidden (above), NOT by a window-status-format override — leaving
+    # one set would blank the window even after it is surfaced into the visible
+    # session.
     tmux set -w -t "$win_id" @fleet_hidden 1 2>/dev/null || true
-    tmux set -w -t "$win_id" window-status-format "" 2>/dev/null || true
   fi
   echo "spawned $wname ($H_NAME) in window $win_id"
-  # Window is created detached (-d) so focus stays put; jump only on --switch.
-  [ "$switch" = 1 ] && tmux select-window -t "$win_id" 2>/dev/null || true
+  # Window is created detached (-d) so focus stays put; jump only on --switch. A
+  # parked scratch window must be moved INTO the visible session first (a bare
+  # select-window only changes the active window of the session that owns it).
+  if [ "$switch" = 1 ]; then
+    if [ "$scratch" = 1 ]; then
+      tmux move-window -s "$win_id" -t "$sess:" 2>/dev/null || true
+      tmux set -w -t "$win_id" @fleet_hidden 0 2>/dev/null || true
+    fi
+    tmux select-window -t "$win_id" 2>/dev/null || true
+  fi
   # scratch agents are repo-less + ephemeral — nothing to restore, so don't persist.
   [ "$scratch" = 1 ] || persist_agent "$sess" "$dir" "$(basename "$repo_base")" "$branch" "$bare" "$base" "$H_NAME"
   sync_main_tiles "$sess" 2>/dev/null || true
@@ -1068,13 +1115,19 @@ cmd_quit() {
   [ -n "$sess" ] || exit 0
   # hop the attached client elsewhere before the kill (switch if another session
   # exists, else detach); ignore failures — the kill is what matters.
+  # Exclude *_hidden from the hop target: switching the client into the bare hidden
+  # session (no main/dash) then killing only $sess would orphan it + its scratch
+  # agents. So skip _hidden sessions when picking `other`, AND kill ${sess}_hidden
+  # alongside $sess so teardown never leaves the parked session behind.
   local other
-  other=$(tmux list-sessions -F '#{session_name}' 2>/dev/null | grep -vxF "$sess" | head -1)
+  other=$(tmux list-sessions -F '#{session_name}' 2>/dev/null \
+            | grep -vxF "$sess" | grep -v '_hidden$' | head -1)
   if [ -n "$other" ]; then
     tmux switch-client -t "$other" 2>/dev/null || true
   else
     tmux detach-client -s "$sess" 2>/dev/null || true
   fi
+  tmux kill-session -t "=${sess}_hidden" 2>/dev/null || true
   tmux kill-session -t "$sess" 2>/dev/null || true
   exit 0
 }
@@ -1087,8 +1140,11 @@ cmd_quit() {
 cmd_sessions() {
   local cur; cur=$(session_name 2>/dev/null)
   local list
+  # Exclude *_hidden: scratch agents are parked in a "<sess>_hidden" sibling that
+  # carries a mirrored @fleet_root (so in-agent `fleet` resolves root) but must
+  # never be offered as a switchable project.
   list=$(tmux list-sessions -F $'#{session_name}\t#{@fleet_root}' 2>/dev/null \
-          | awk -F'\t' '$2!=""')
+          | awk -F'\t' '$2!="" && $1 !~ /_hidden$/')
   [ -n "$list" ] || { echo "no open fleet sessions"; return 0; }
   local n; n=$(printf '%s\n' "$list" | grep -c .)
   if [ "$n" -le 1 ]; then
@@ -1305,6 +1361,18 @@ cmd_up() {
   [ -d "$root" ] || die "project root $root does not exist"
 
   ensure_daemon
+
+  # tmux-continuum/resurrect may restore a GHOST "<name>_hidden" session of dead
+  # shells after a server restart: resurrect re-runs no procs and does NOT persist
+  # our @fleet_* window options, so such a session has no live agent and a broken
+  # (unmirrored) @fleet_root. Sweep it before booting. A legit hidden session that
+  # fleet is still driving keeps @fleet_harness stamped on its windows, so it is
+  # never matched here. Fail-silent.
+  local stale_hidden="${name}_hidden"
+  if tmux has-session -t "=$stale_hidden" 2>/dev/null \
+     && ! tmux list-windows -t "=$stale_hidden" -F '#{@fleet_harness}' 2>/dev/null | grep -q .; then
+    tmux kill-session -t "=$stale_hidden" 2>/dev/null || true
+  fi
 
   local created=0
   if ! tmux has-session -t "=$name" 2>/dev/null; then
