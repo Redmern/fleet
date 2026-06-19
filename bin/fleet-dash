@@ -327,7 +327,7 @@ load_rows() {
   local line state label sess win wname since pane age order
   while IFS=$'\t' read -r state label sess win wname since pane age ready; do
     [ -n "$pane" ] || continue
-    [ "$sess" = "$SESS" ] || continue     # this project only
+    [ "$sess" = "$SESS" ] || [ "$sess" = "${SESS}_hidden" ] || continue   # this project + its parked scratch
     [ "$wname" = "main" ] && continue     # skip the orchestrator itself
     ROWS+=("$state"$'\t'"$label"$'\t'"$win"$'\t'"$wname"$'\t'"$since"$'\t'"$pane"$'\t'"${age:-0}"$'\t'"$ready")
   done < <("$FLEET_BIN" agents 2>/dev/null | sort -t$'\t' -k1,1 \
@@ -480,7 +480,7 @@ render() {
   # bottom border with key hints (or a transient status)
   local hint
   if [ -n "$status" ]; then hint="$status"
-  else hint="j/k · Ent jump · v diff · m mode · s send · n new · d close · r/R refresh/reload"; fi
+  else hint="j/k · Ent jump · h hide · v diff · m mode · s send · n new · d close · r/R refresh/reload"; fi
   tput cup $(( rows - 1 )) 0 2>/dev/null
   printf '\033[2m%s\033[0m\033[K' "$(hrule '╰' '╯' "$inner" "$hint")"
 }
@@ -963,9 +963,47 @@ while :; do
     G) (( N > 0 )) && sel=$((N - 1)); drain_nav ;;
     r) status=""; load_rows; last_load=$SECONDS ;;   # manual refresh
     R) cleanup; exec "$SELF" "$SESS" ;;   # reload the dashboard with fresh code
-    $'\n'|$'\r')   # jump to selected agent's window
+    $'\n'|$'\r')   # jump to selected agent; surface a parked scratch window first
       (( N == 0 )) && continue
-      tmux select-window -t "$(field "$sel" 3)" 2>/dev/null ;;
+      win=$(field "$sel" 3)
+      # A window parked in <sess>_hidden is not a member of $SESS, so a bare
+      # select-window only changes the active window of the OWNING session and the
+      # $SESS client never sees it. Re-derive the window's session (avoids threading
+      # a session column through ROWS[]) and move it onto the bar first.
+      wsess=$(tmux display -p -t "$win" '#{session_name}' 2>/dev/null)
+      if [ -n "$wsess" ] && [ "$wsess" != "$SESS" ]; then
+        tmux move-window -s "$win" -t "$SESS:" 2>/dev/null   # pull onto the bar + make navigable
+        tmux set -w -t "$win" @fleet_hidden 0 2>/dev/null    # surfaced: re-enable notifications
+      fi
+      tmux select-window -t "$win" 2>/dev/null
+      load_rows; last_load=$SECONDS ;;
+    h)             # hide the selected scratch agent back off the bar (into <sess>_hidden)
+      (( N == 0 )) && continue
+      win=$(field "$sel" 3); wname=$(field "$sel" 4)
+      # Gate on the @fleet_hidden marker so ONLY scratch agents are hideable —
+      # worker windows must never be yanked off the bar. (Unset on workers; 0/1 on
+      # scratch depending on surfaced/parked.)
+      if [ -z "$(tmux show -w -t "$win" -v @fleet_hidden 2>/dev/null)" ]; then
+        status="$wname is not a scratch agent"; continue
+      fi
+      hidden="${SESS}_hidden"; ph=""
+      if ! tmux has-session -t "=$hidden" 2>/dev/null; then
+        # tmux cannot create an EMPTY session: spin a throwaway placeholder window,
+        # move the scratch window in, then drop the placeholder. _hold is a plain
+        # sh with no @agent_state, so it never flickers into the dashboard.
+        ph=$(tmux new-session -d -P -F '#{window_id}' -s "$hidden" -n _hold sh 2>/dev/null)
+        # set-option on a SESSION rejects the "=" prefix (unlike move-window/etc.),
+        # so plain "$hidden" — exact anyway, no glob chars in a session name.
+        tmux set -t "$hidden" @fleet_root "$(tmux show -t "$SESS" -v @fleet_root 2>/dev/null)" 2>/dev/null
+      fi
+      tmux move-window -s "$win" -t "=$hidden:" 2>/dev/null
+      tmux set -w -t "$win" @fleet_hidden 1 2>/dev/null
+      # LOAD-BEARING guard: do NOT drop the [ -n "$ph" ] test. Under a concurrent 'h'
+      # the loser's new-session fails and $ph is EMPTY; `kill-window -t ""` falls
+      # through to the CURRENT window and would kill a live scratch agent. The
+      # loser's move-window still succeeds (the winner created the session).
+      [ -n "$ph" ] && tmux kill-window -t "$ph" 2>/dev/null
+      status="hid $wname"; load_rows; last_load=$SECONDS ;;
     m)             # permission-mode pick-list for the selected agent (sets status)
       (( N == 0 )) && continue
       label=$(field "$sel" 2); pane=$(field "$sel" 6)
