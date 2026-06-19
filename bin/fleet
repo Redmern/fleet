@@ -582,23 +582,58 @@ cmd_new() {
 cmd_send() {
   local target="${1:-}" text="${2:-}"
   [ -n "$target" ] && [ -n "$text" ] || die "usage: fleet send <agent> \"message\""
-  local line
-  line=$(agents_tsv | awk -F'\t' -v t="$target" 'index($2,t)||index($5,t){print; exit}')
-  [ -n "$line" ] || die "no agent matching '$target' (try: fleet ls)"
-  local win pane
-  win=$(echo "$line" | cut -f4)
-  pane=$(echo "$line" | cut -f7)
+
+  # Resolve the target PRECISELY. The old matcher took the first substring hit on
+  # label OR window_name, which silently delivered to the wrong agent when several
+  # shared a label (e.g. scratch agents whose cwd sits inside another agent's
+  # worktree all report the same repo/branch label). Rank exact window_name >
+  # exact label > substring, and refuse on a tie so we never guess.
+  local all t1 t2 t3 pick n
+  all=$(agents_tsv)
+  t1=$(printf '%s\n' "$all" | awk -F'\t' -v t="$target" '$5==t')              # exact window name
+  t2=$(printf '%s\n' "$all" | awk -F'\t' -v t="$target" '$2==t')              # exact label
+  t3=$(printf '%s\n' "$all" | awk -F'\t' -v t="$target" 'index($5,t)||index($2,t)') # substring
+  if   [ -n "$t1" ]; then pick="$t1"
+  elif [ -n "$t2" ]; then pick="$t2"
+  else pick="$t3"; fi
+  n=$(printf '%s\n' "$pick" | grep -c .)
+  [ "$n" -eq 0 ] && die "no agent matching '$target' (try: fleet ls)"
+  if [ "$n" -gt 1 ]; then
+    echo "ambiguous target '$target' matches $n agents:" >&2
+    printf '%s\n' "$pick" | awk -F'\t' '{printf "  %-8s window=%-28s repo=%s [win %s]\n",$1,$5,$2,$4}' >&2
+    die "be more specific — use the exact window name"
+  fi
+  local line="$pick" win pane wname
+  win=$(printf '%s' "$line"   | cut -f4)
+  wname=$(printf '%s' "$line" | cut -f5)
+  pane=$(printf '%s' "$line"  | cut -f7)
+
+  # nvim-hosted agent: the tmux PANE is nvim, so `send-keys -t <pane>` lands in
+  # whatever nvim buffer currently has focus — focus-dependent and unreliable.
+  # Deliver over the nvim RPC instead: FleetSend chan_sends straight into the
+  # agent terminal buffer regardless of focus. @fleet_nvim_sock is set only for
+  # nvim agents (cmd_new), so its presence is how we tell nvim from bare panes.
   local nsock; nsock=$(tmux show -w -t "$win" -v @fleet_nvim_sock 2>/dev/null)
   if [ -n "$nsock" ] && [ -S "$nsock" ]; then
-    local res
-    res=$(nvim --headless --server "$nsock" --remote-expr "v:lua.FleetSend(\"$(printf '%s' "$text" | sed 's/[\\"]/\\&/g')\")" 2>/dev/null)
-    case "$res" in
-      sent|opening) echo "delivered via nvim ($res)"; return 0 ;;
-    esac
-    echo "nvim RPC failed ($res), falling back to send-keys" >&2
+    local res esc try
+    esc=$(printf '%s' "$text" | sed 's/[\\"]/\\&/g')
+    for try in 1 2 3; do
+      res=$(nvim --headless --server "$nsock" --remote-expr "v:lua.FleetSend(\"$esc\")" 2>/dev/null)
+      case "$res" in
+        sent|opening) echo "delivered to $wname via nvim RPC ($res)"; return 0 ;;
+      esac
+      sleep 0.4   # socket momentarily busy / terminal opening — retry briefly
+    done
+    # No reliable non-RPC path into an nvim buffer; fail loudly rather than send
+    # focus-dependent keystrokes that may land in the wrong buffer.
+    die "nvim RPC delivery to '$wname' failed (last: ${res:-no-response}) — agent terminal unreachable; is the window still alive?"
   fi
+
+  # bare/scratch agent: claude is the pane's own foreground process, so
+  # `send-keys -t <pane_id>` targets it directly and is reliable regardless of
+  # which pane/window is currently active.
   tmux send-keys -t "$pane" -l "$text" && tmux send-keys -t "$pane" Enter \
-    && echo "delivered via send-keys (focus-dependent for nvim agents)"
+    && echo "delivered to $wname via pane send-keys"
 }
 
 # ---- watch (don't busy-poll: get pinged when agents finish) --------------------
