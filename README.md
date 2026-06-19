@@ -170,7 +170,8 @@ socket is missing. Everything else (hooks, bins) is identical.
 | Path | What |
 |---|---|
 | `bin/fleetd` | unix-socket daemon (`$XDG_RUNTIME_DIR/fleet.sock`), state + tmux mirroring + notifications |
-| `bin/fleet` | CLI: `up new fan ls pick send watch mode cost guard main orchestrator restore menu keys rebind harnesses status doctor` |
+| `bin/fleet` | CLI: `up new fan ls pick send watch mode cost guard browser devport main orchestrator restore menu keys rebind harnesses status doctor` |
+| `lib/browser-test.js` | vendored Playwright driver — `fleet browser` drives the system Chromium to test a worker's dev app ([docs](docs/browser-testing.md)) |
 | `harness.d/` | one `<name>.conf` per supported agent CLI (claude, omp); drop in a file to add a harness |
 | `bin/fleet-hook` | Claude Code hook → daemon reporter + transcript recorder (fail-silent) |
 | `bin/fleet-guard` | Claude Code PreToolUse hook → write-guard for tests/CI/lockfiles |
