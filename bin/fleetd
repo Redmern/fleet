@@ -127,11 +127,21 @@ class Fleet:
         key = (pane, state)
         if now - self.last_notify.get(key, 0) < NOTIFY_COOLDOWN:
             return
-        focus = tmux(
-            "display", "-p", "-t", pane, "#{window_active}#{session_attached}"
+        info = tmux(
+            "display", "-p", "-t", pane,
+            "#{window_active}#{session_attached}\t#{@fleet_hidden}",
         )
-        if focus is not None and focus.strip().startswith("11"):
-            return  # window active in an attached session — user is looking at it
+        if info is not None:
+            focus, _, hidden = info.strip().partition("\t")
+            if focus.startswith("11"):
+                return  # window active in an attached session — user is looking at it
+            # Parked/hidden agents (scratch helpers, dispatch sub-orchs) live in a
+            # detached <sess>_hidden session — never focused, so they would notify on
+            # EVERY block/finish. They're an internal mechanism the user usually
+            # can't act on; stay quiet. Surfaced scratch (move-in sets @fleet_hidden
+            # 0) and all main/worker agents (unset) still notify.
+            if hidden not in ("", "0"):
+                return
         self.last_notify[key] = now
         label = agent_label(cur.get("cwd") or pane)
         title, urgency = (
