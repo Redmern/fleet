@@ -790,7 +790,7 @@ acquire_lock() { # <lockdir>
     age=$(( now - $(stat -c %Y "$lk" 2>/dev/null || echo "$now") ))
     if { [ -n "$owner" ] && ! kill -0 "$owner" 2>/dev/null; } \
        || [ "$age" -ge "$LOCK_STALE_SECS" ]; then
-      rmdir "$lk" 2>/dev/null      # steal: holder dead OR lock too old
+      rm -f "$lk/pid" 2>/dev/null; rmdir "$lk" 2>/dev/null   # steal: holder dead OR lock too old (pid file must be removed first — rmdir fails on a non-empty dir)
       continue
     fi
     sleep 0.05
@@ -1866,10 +1866,16 @@ cmd_up() {
       fi
       [ -n "$orch" ] || orch=claude
       local ORCH_BIN; load_orch "$orch"
-      # -e FLEET_ROLE=main: arms the dispatch hook's role gate in the main pane only
-      # (pane-local, not inherited by sibling new-window panes). See cmd_main.
-      tmux new-session -d -s "$name" -c "$root" -n main -e FLEET_ROLE=main "$ORCH_BIN"
-      local _mainwin; _mainwin=$(tmux list-windows -t "$name" -F '#{window_id}' | head -1)
+      # FLEET_ROLE=main must be PANE-LOCAL (the dispatch hook's fork-bomb gate).
+      # `new-session -e` sets the SESSION environment, which IS inherited by every
+      # later pane → re-arms the gate in manually-opened sibling panes. So create
+      # the session with a throwaway holder window (no -e), then add the real main
+      # window with a pane-local `new-window -e FLEET_ROLE=main` (exactly like
+      # cmd_main), and drop the holder.
+      tmux new-session -d -s "$name" -c "$root" -n _boot sh
+      local _mainwin; _mainwin=$(tmux new-window -P -F '#{window_id}' -t "$name" -n main -c "$root" \
+        -e FLEET_ROLE=main "$ORCH_BIN")
+      tmux kill-window -t "$name:_boot" 2>/dev/null || true
       tag_orch_window "$_mainwin"
       record_pane_role "$root" "$(tmux list-panes -t "$_mainwin" -F '#{pane_id}' 2>/dev/null | head -1)" main
       tmux set -t "$name" @fleet_orch_harness "$orch"
