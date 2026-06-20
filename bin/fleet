@@ -729,11 +729,15 @@ cmd_send() {
   wname=$(printf '%s' "$line" | cut -f5)
   pane=$(printf '%s' "$line"  | cut -f7)
 
-  # Never send-keys into the orchestrator (human) pane. STOPGAP until step 2:
-  # once `fleet inbox put` exists this becomes a redirect (file the summary,
-  # warn, exit 0); for now refuse rather than clobber the human's input line.
+  # Never send-keys into the orchestrator (human) pane. A worker/sub-orch that
+  # (mis)aims a send at main does NOT get a clobber and does NOT get a silent
+  # drop — the message is REDIRECTED into the durable inbox (advisor §2: turn the
+  # floor into a safe success, "right outcome via the wrong verb"). The human's
+  # input line is never touched; the summary lands where it is read on demand.
   if is_main_pane "$pane"; then
-    die "refusing to send into the orchestrator pane; will redirect to inbox in step 2"
+    echo "fleet send: '$wname' is the orchestrator pane — redirecting to the inbox (the human input is never clobbered)" >&2
+    inbox_put --sev info -t "message for orchestrator (via fleet send)" -m "$text" >&2
+    exit 0
   fi
 
   # Re-tasking un-readies the target's worktree: it is going back to work, so a
@@ -1112,6 +1116,207 @@ cmd_notify() { # notify <pane> <msg> [policy] [class]
   tty=$(tmux display -p -t "$pane" '#{pane_tty}' 2>/dev/null)   # verbatim — no /dev/pts strip
   [ -n "$tty" ] && printf '\a' > "$tty" 2>/dev/null
   append_dashboard_alert "$msg"
+}
+
+# ---- inbox (durable worker→orchestrator message queue) ------------------------
+# The never-clobber guarantee's BEHAVIORAL half: a worker/sub-orch NEVER
+# send-keys into the orchestrator input — it writes a FILE here, and the human
+# reads it on demand (pager + ambient unread badge in the status bar). One file
+# per message, atomic tmp+mv, LOCK-FREE — a finishing worker must never block on a
+# shared lock, so (unlike the dispatch seq lock) the inbox takes none. The id
+# <epoch_s>.<nanos>.<pane> makes filenames sort chronologically AND collision-free
+# without coordination (sub-second component + pane id).
+#
+# Root is the PROJECT root (fleet_root) — the single store the orchestrator,
+# fleetd and the dashboard all read — NOT a per-worktree dir. fleet_root resolves
+# identically from a hidden sub-orch (its <sess>_hidden session carries a mirrored
+# @fleet_root, set by cmd_new --scratch), so a parked sub-orch enqueues into the
+# very inbox the human reads. That is the "resolve like cmd_ready" intent at the
+# correct (project) granularity — cmd_ready's git-toplevel would scatter one inbox
+# per worktree, which the orchestrator could never find.
+
+INBOX_KEEP=200           # entries kept live in .fleet/inbox/ before gc archives
+INBOX_ARCHIVE_KEEP=500   # entries kept in archive/ before gc deletes the oldest
+
+inbox_dir() { # echo <root>/.fleet/inbox, or fail (fail-silent: no root -> rc 1)
+  local root; root=$(fleet_root 2>/dev/null) || return 1
+  [ -n "$root" ] || return 1
+  printf '%s/.fleet/inbox' "$root"
+}
+
+inbox_id() { # <epoch_s>.<nanos>.<pane> — sortable + collision-free, lock-free
+  local pane="${TMUX_PANE:-$$}"; pane="${pane#%}"
+  local now; now=$(date +%s.%N 2>/dev/null) || now="$(date +%s 2>/dev/null).000000000"
+  printf '%s.%s' "$now" "$pane"
+}
+
+# Header accessors: scan only the key=value region (stop at the `--` separator) so
+# a `--` inside the body can never be mistaken for the header end.
+inbox_field() { sed -n "/^--$/q; s/^$2=//p" "$1" 2>/dev/null | head -1; }
+inbox_body()  { sed -n '/^--$/,$p' "$1" 2>/dev/null | sed '1d'; }
+
+# Advance the durable read cursor MONOTONICALLY (max id wins) — a slow reader can
+# never regress the unread count. Atomic tmp+mv.
+inbox_advance_cursor() { # <dir> <id>
+  local dir="$1" id="$2" cur
+  [ -n "$id" ] || return 0
+  cur=$(cat "$dir/.cursor" 2>/dev/null)
+  if [ -z "$cur" ] || [ "$id" \> "$cur" ]; then
+    printf '%s\n' "$id" > "$dir/.cursor.tmp.$$" 2>/dev/null \
+      && mv -f "$dir/.cursor.tmp.$$" "$dir/.cursor" 2>/dev/null
+  fi
+}
+
+inbox_count() { # unread count (id > .cursor) — feeds the status badge
+  local dir cur f id n=0
+  dir=$(inbox_dir) || { echo 0; return 0; }
+  [ -d "$dir" ] || { echo 0; return 0; }
+  cur=$(cat "$dir/.cursor" 2>/dev/null)
+  for f in "$dir"/*.msg; do
+    [ -e "$f" ] || continue
+    id=$(basename "$f" .msg)
+    { [ -z "$cur" ] || [ "$id" \> "$cur" ]; } && n=$((n+1))
+  done
+  echo "$n"
+}
+
+# THE ONLY new write path. Worker-facing; touches NO pane, never send-keys — it
+# printf's one entry to a tmp file and mv's it in (atomic, lock-free).
+inbox_put() { # put [--from X] [-d dN] [--sev info|warn|blocked] [--key K] -t "title" [-m "body"]
+  local from="" dispatch="-" sev="info" key="" title="" body="" got_body=0
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --from)        from="$2"; shift 2 ;;
+      -d|--dispatch) dispatch="$2"; shift 2 ;;
+      --sev)         sev="$2"; shift 2 ;;
+      --key)         key="$2"; shift 2 ;;
+      -t|--title)    title="$2"; shift 2 ;;
+      -m|--message)  body="$2"; got_body=1; shift 2 ;;
+      --)            shift; body="$*"; got_body=1; break ;;
+      -*)            die "fleet inbox put: unknown flag $1" ;;
+      *)             if [ -z "$title" ]; then title="$1"; else body="$body$1"; got_body=1; fi; shift ;;
+    esac
+  done
+  # body via stdin when nothing inline and input is piped
+  [ "$got_body" = 0 ] && [ ! -t 0 ] && body=$(cat 2>/dev/null)
+  case "$sev" in info|warn|blocked) ;; *) sev=info ;; esac
+  [ -n "$title" ] || title=$(printf '%s' "$body" | sed -n '1p' | cut -c1-80)
+  [ -n "$title" ] || title="(no title)"
+  if [ -z "$from" ]; then                       # default sender = caller's window
+    from=$(tmux display -p '#{window_name}' 2>/dev/null); [ -n "$from" ] || from="-"
+  fi
+  local dir; dir=$(inbox_dir) || { echo "inbox: no project root (run inside a fleet session)" >&2; return 1; }
+  mkdir -p "$dir" 2>/dev/null || return 1
+  local id ts f tmp
+  id=$(inbox_id); ts=$(date -Is 2>/dev/null || date)
+  f="$dir/$id.msg"; tmp="$dir/.tmp.$id.$$"       # .tmp. prefix: the *.msg glob never sees it
+  title=$(printf '%s' "$title" | tr '\t\n' '  ')  # keep the header one clean line
+  from=$(printf '%s' "$from" | tr '\t\n' '  ')
+  {
+    printf 'id=%s\n'       "$id"
+    printf 'from=%s\n'     "$from"
+    printf 'dispatch=%s\n' "${dispatch:--}"
+    printf 'ts=%s\n'       "$ts"
+    printf 'sev=%s\n'      "$sev"
+    [ -n "$key" ] && printf 'key=%s\n' "$key"
+    printf 'title=%s\n'    "$title"
+    printf -- '--\n'
+    printf '%s\n'          "$body"
+  } > "$tmp" 2>/dev/null && mv -f "$tmp" "$f" 2>/dev/null
+  if [ -s "$f" ]; then
+    echo "inbox: queued $id [$sev] — $title"
+  else
+    rm -f "$tmp" 2>/dev/null; echo "inbox: could not write entry" >&2; return 1
+  fi
+}
+
+inbox_list() { # titles newest-first with an unread (*) marker — no cursor change
+  local dir cur f id mark sev from title any=0
+  dir=$(inbox_dir) || { echo "inbox: no project root"; return 0; }
+  [ -d "$dir" ] || { echo "inbox empty"; return 0; }
+  cur=$(cat "$dir/.cursor" 2>/dev/null)
+  while IFS= read -r f; do
+    [ -e "$f" ] || continue
+    any=1; id=$(basename "$f" .msg)
+    mark=" "; { [ -z "$cur" ] || [ "$id" \> "$cur" ]; } && mark="*"
+    sev=$(inbox_field "$f" sev); from=$(inbox_field "$f" from); title=$(inbox_field "$f" title)
+    printf '%s %-9s %-24s %s\n' "$mark" "[$sev]" "$from" "$title"
+  done < <(ls -1 "$dir"/*.msg 2>/dev/null | sort -r)
+  [ "$any" = 1 ] || echo "inbox empty"
+}
+
+inbox_read() { # [id|all] — show full bodies newest-first, then advance .cursor
+  local want="${1:-all}" dir f id newest="" files sev from disp ts title
+  dir=$(inbox_dir) || { echo "inbox: no project root"; return 0; }
+  [ -d "$dir" ] || { echo "inbox empty"; return 0; }
+  files=$(ls -1 "$dir"/*.msg 2>/dev/null | sort -r)
+  [ -n "$files" ] || { echo "inbox empty"; return 0; }
+  while IFS= read -r f; do
+    [ -e "$f" ] || continue
+    id=$(basename "$f" .msg); [ -z "$newest" ] && newest="$id"
+    [ "$want" != all ] && [ "$id" != "$want" ] && continue
+    sev=$(inbox_field "$f" sev);   from=$(inbox_field "$f" from)
+    disp=$(inbox_field "$f" dispatch); ts=$(inbox_field "$f" ts)
+    title=$(inbox_field "$f" title)
+    printf '── [%s] %s%s\n' "$sev" "$from" "$([ -n "$disp" ] && [ "$disp" != - ] && printf '  (%s)' "$disp")"
+    printf '   %s  %s\n\n' "$ts" "$title"
+    inbox_body "$f"; printf '\n'
+  done <<< "$files"
+  inbox_advance_cursor "$dir" "$newest"
+}
+
+inbox_clear() { # mark all read (advance cursor to newest) — no display
+  local dir newest
+  dir=$(inbox_dir) || return 0
+  [ -d "$dir" ] || { echo "inbox empty"; return 0; }
+  newest=$(ls -1 "$dir"/*.msg 2>/dev/null | sort -r | head -1)
+  [ -n "$newest" ] && inbox_advance_cursor "$dir" "$(basename "$newest" .msg)"
+  echo "inbox: marked all read"
+}
+
+inbox_gc() { # cap newest-N -> MOVE overflow to archive/; cap archive too. Never silent.
+  local dir; dir=$(inbox_dir) || return 0
+  [ -d "$dir" ] || { echo "inbox gc: nothing to trim"; return 0; }
+  mkdir -p "$dir/archive" 2>/dev/null || true
+  local n f archived=0 deleted=0
+  n=$(ls -1 "$dir"/*.msg 2>/dev/null | wc -l)
+  if [ "$n" -gt "$INBOX_KEEP" ]; then            # move oldest overflow out of the live dir
+    while IFS= read -r f; do
+      [ -e "$f" ] || continue
+      mv -f "$f" "$dir/archive/" 2>/dev/null && archived=$((archived+1))
+    done < <(ls -1 "$dir"/*.msg 2>/dev/null | sort | head -n "$((n - INBOX_KEEP))")
+  fi
+  n=$(ls -1 "$dir/archive"/*.msg 2>/dev/null | wc -l)
+  if [ "$n" -gt "$INBOX_ARCHIVE_KEEP" ]; then     # advisor: cap the archive too, then delete
+    while IFS= read -r f; do
+      [ -e "$f" ] || continue
+      rm -f "$f" 2>/dev/null && deleted=$((deleted+1))
+    done < <(ls -1 "$dir/archive"/*.msg 2>/dev/null | sort | head -n "$((n - INBOX_ARCHIVE_KEEP))")
+  fi
+  if [ "$archived" -gt 0 ] || [ "$deleted" -gt 0 ]; then
+    append_dashboard_alert "inbox: archived $archived old summaries, deleted $deleted from archive"
+    echo "inbox gc: archived $archived, deleted $deleted"
+  else
+    echo "inbox gc: nothing to trim"
+  fi
+}
+
+cmd_inbox() { # inbox [put|list|read|count|gc|clear] — bare = read pager (marks read)
+  local sub="${1:-}"; [ $# -gt 0 ] && shift
+  case "$sub" in
+    put)   inbox_put   "$@" ;;
+    list)  inbox_list  "$@" ;;
+    read)  inbox_read  "$@" ;;
+    count) inbox_count "$@" ;;
+    gc)    inbox_gc    "$@" ;;
+    clear) inbox_clear "$@" ;;
+    ""|view)
+      local pager=cat
+      [ -t 1 ] && command -v less >/dev/null 2>&1 && pager="less -R"
+      { inbox_list; echo; inbox_read all; } | $pager
+      ;;
+    *) die "usage: fleet inbox [put|list|read|count|gc|clear]" ;;
+  esac
 }
 
 # ---- dispatch enable / disable (opt-in hook installer) ------------------------
@@ -1784,6 +1989,14 @@ inject_status_format() { # append agent glyph to window-status formats.
     [ -n "$fmt" ] || continue
     case "$fmt" in *@agent_glyph*) ;; *) tmux set -g "$opt" "$fmt#{?@agent_glyph, #{@agent_glyph},}" ;; esac
   done
+  # Ambient inbox unread badge: fleetd sets @fleet_inbox per session each tick
+  # (heal_status_right), but inject it here too so the badge appears at boot
+  # before the first tick. Prepended so it sits at the left of status-right.
+  fmt=$(tmux show -g -v status-right 2>/dev/null)
+  case "$fmt" in
+    *@fleet_inbox*) ;;
+    *) [ -n "$fmt" ] && tmux set -g status-right "#{?@fleet_inbox,#{@fleet_inbox} ,}$fmt" ;;
+  esac
 }
 
 # ---- keybinds -----------------------------------------------------------------
@@ -1805,6 +2018,7 @@ orch-jump|m|Orchestrator|Jump to the main window's orchestrator pane
 main|M|Rebuild command center|Re-tile the main window
 reload|R|Reload dashboard|Restart the dashboard pane in place (picks up new code)
 ls|l|List agents|Show agent states in a popup
+inbox|i|Inbox|Read worker→orchestrator summaries (unread badge rides the status bar)
 sessions|o|Fleet sessions|Switch between open fleet sessions
 quit|Q|Quit fleet|Kill this fleet session (closes all agents)
 EOF
@@ -1830,6 +2044,7 @@ action_tmux_command() { # tmux command string run when an action's key is presse
     orch-jump) echo "run-shell '$self orch-jump'" ;;
     reload) echo "display-menu -b rounded -T '#[align=centre]Reload dashboard?' -x C -y C 'Yes, reload' y \"run-shell '$self main --reload'\" 'Cancel' n ''" ;;
     ls)     echo "display-popup -E -b rounded -w 70% -h 60% \"$self ls; echo; read -n1 -r -p 'press any key'\"" ;;
+    inbox)  echo "display-popup -E -b rounded -w 80% -h 70% '$self inbox'" ;;
     sessions) echo "display-popup -E -b rounded -w 70% -h 60% '$self sessions'" ;;
     quit)   echo "display-menu -b rounded -T '#[align=centre]Quit fleet session? (closes all agents)' -x C -y C 'Yes, quit' y \"run-shell '$self quit'\" 'Cancel' n ''" ;;
   esac
@@ -2211,6 +2426,7 @@ fleet — agent fleet manager (tmux + nvim + Claude Code)
   fleet send <a> "msg"   send message to an agent's claude
   fleet ready [a] [-m r]  flag a worktree done/ready for deletion (no arg = the one you're in) [--clear]
   fleet reap             remove all worktrees flagged ready (skips unmerged/dirty unless --force)
+  fleet inbox            read worker→orchestrator summaries (bare=pager; put|list|read|count|gc|clear)
   fleet browser [u] [a]  drive a real Chromium against the dev app (headless; --watch = visible tiled window) [url|port] [agent]
   fleet devport <port>   record the worktree's dev-server port (read by 'fleet browser')
   fleet fan <repo> <nm>  best-of-N: spawn N agents on one prompt [-n N] [-p prompt] [--base br] [--bare]
@@ -2255,6 +2471,7 @@ case "${1:-}" in
   watch-run) shift; cmd_watch_run "$@" ;;  # internal: detached watcher
   ready)   shift; cmd_ready "$@" ;;        # flag a worktree done/ready for reap
   reap)    shift; cmd_reap "$@" ;;         # remove flagged-ready worktrees
+  inbox)   shift; cmd_inbox "$@" ;;        # durable worker→orchestrator message queue
   browser) shift; cmd_browser "$@" ;;      # drive a real Chromium against the dev app
   devport) shift; cmd_devport "$@" ;;      # write/show the .fleet/devport marker
   mode)    shift; cmd_mode "$@" ;;
