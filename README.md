@@ -152,13 +152,35 @@ via the menu.
 
 ## Install
 
+**Arch Linux (pacman).** Install prebuilt from the self-hosted `[fleet]` repo —
+no AUR account, updates via `pacman -Syu`. Add to `/etc/pacman.conf` (below the
+official repos):
+
+```ini
+[fleet]
+SigLevel = Optional TrustAll
+Server = https://github.com/Redmern/fleet/releases/download/repo
+```
+
+```sh
+sudo pacman -Sy && sudo pacman -S fleet-git
+fleet setup         # per-user: fleetd unit + Claude Code hooks (pacman can't do this)
+fleet doctor        # verify
+```
+
+Full guide (update flow, security note, GPG hardening): [`docs/custom-repo.md`](docs/custom-repo.md).
+CI republishes the package on every push to `main`.
+
+**From source (dev box).** Use this on a machine where you develop fleet:
+
 ```sh
 ./install.sh        # symlinks bins, enables fleetd.service, wires claude hooks
 fleet doctor        # verify
 fleet up ~/path/to/project-root     # boot a project (any root folder of repos)
 ```
 
-`install.sh --uninstall` reverses everything.
+`install.sh --uninstall` reverses everything. (The `~/.local/bin` symlinks
+intentionally shadow a packaged `/usr/bin/fleet`, so a dev checkout always wins.)
 
 **No systemd?** `./install.sh --no-systemd` skips the user unit (auto-detected
 when `systemctl --user` isn't usable — containers, no user bus). The daemon then
