@@ -74,6 +74,11 @@ fleet ls | grep -F "<repo>/${branch//\//_}"      # already a live/known worker?
   printf '%s\t%s\n' "<repo>" "$branch" >> .fleet/dispatch/<id>/workers.tsv
   ```
 
+  In every worker's sub-task prompt, tell it how to report back:
+  *"When done, post your completion summary with `fleet inbox put -t '<title>' -m '<body>'`
+  (add `--sev warn` if it needs attention). NEVER `fleet send` into main and never
+  `send-keys` the orchestrator — write the inbox file, the human reads it on demand."*
+
 > Cross-instruction dedup is **best-effort**: it is only as good as two sub-orchs
 > producing the same canonical intent phrase. Divergent phrasings → two branches (the
 > visible, non-silent failure — both show in `fleet ls`, `reap` refuses unmerged). When
@@ -97,18 +102,39 @@ fleet ls | grep -F "<repo>/${branch//\//_}"      # already a live/known worker?
   worker you own is still live (`fleet ls`), and re-arm a dropped watch. This recovers a
   lost `send-keys` poke on the next tick.
 
-## 5. Route exceptional, main-pane-bound events OUT-OF-BAND
+## 5. Report to the human via the INBOX — never the main input line
 
-You almost never need to reach the main pane — your watches land here. The rare
-exception (a worker is BLOCKED and needs the human, or a dispatch hard-failed) goes
-through the one safe primitive, out-of-band only:
+The human's input line is **never** a delivery target. You reach the orchestrator
+two ways, both file-based, neither ever `send-keys` into main:
+
+**Routine summaries → `fleet inbox put` (the common case).** When your dispatch
+finishes, post **ONE rollup** for the whole dispatch (not N near-identical rows):
 
 ```
+fleet inbox put -d <id> -t "<id>: <one-line outcome>" -m "<full markdown rollup:
+per-worker results, diff stats, follow-ups, test status>"
+```
+
+Tag the dispatch with `-d <id>` so readers group by dispatch. Use `--sev warn` if it
+wants attention, `--sev blocked` for needs-the-human; plain `info` (default) stays
+pull-only (the human reads it from the inbox badge on their own schedule). The entry
+is a durable file — it survives restarts and is read on demand, so it can never
+block, clobber, or compete with the human prompting.
+
+**Exceptional, needs-the-human-NOW events → also `fleet notify … oob`.** A worker is
+BLOCKED on the human, or a dispatch hard-failed:
+
+```
+fleet inbox put -d <id> --sev blocked -t "<id> worker <x> BLOCKED — needs you" -m "<details>"
 fleet notify <main-pane> "<id> worker <x> BLOCKED — needs you" oob blocked
 ```
 
-Never `send-keys` into the main pane yourself. `fleet notify` does toast + bell +
-dashboard alert; the dashboard is the durable record the operator checks.
+`fleet notify` adds the immediate toast + bell + popup; the inbox entry is the
+durable record (and fleetd desktop-notifies sev>=warn inbox entries on its own).
+
+**NEVER** `fleet send` into main and **never** `send-keys` the orchestrator. If you
+do `fleet send main …` by mistake it is auto-redirected into the inbox (safe, not a
+clobber) — but address the inbox directly; that is the contract.
 
 ## 6. Lifetime — stay alive until ALL owned obligations discharge
 
