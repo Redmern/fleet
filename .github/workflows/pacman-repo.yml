@@ -133,3 +133,21 @@ jobs:
             repo/*.pkg.tar.zst \
             --clobber
           echo "Published to: https://github.com/${GH_REPO}/releases/download/${REPO_TAG}"
+
+      # 8. Prune stale package assets. Each build's package has a UNIQUE name
+      #    (fleet-git-r<N>.<hash>-1-any.pkg.tar.zst), so --clobber can't replace the
+      #    previous one — old packages would accumulate on the release forever.
+      #    The DB only references the package we just published, so every OTHER
+      #    *.pkg.tar.zst asset is dead weight: delete them, keeping only the current
+      #    one. Runs AFTER the upload so the DB-referenced package is never missing.
+      - name: Prune old package assets
+        run: |
+          current="$(basename "$(ls repo/*.pkg.tar.zst)")"
+          echo "keeping current package: $current"
+          gh release view "$REPO_TAG" --json assets -q '.assets[].name' \
+            | grep -E '\.pkg\.tar\.zst$' \
+            | grep -vxF "$current" \
+            | while read -r old; do
+                echo "pruning stale asset: $old"
+                gh release delete-asset "$REPO_TAG" "$old" -y || true
+              done
