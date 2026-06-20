@@ -700,6 +700,21 @@ cmd_new() {
 
 # ---- send ---------------------------------------------------------------------
 
+# Resolve a send target to the orchestrator pane, BYPASSING agents_tsv (which
+# filters main out so it can never be a send-keys target). Returns the pane id iff
+# the target names the orchestrator — by exact window name OR an is_main_pane role
+# match — so a literal `fleet send main` (or a drifted-name orchestrator) can be
+# captured into the inbox instead of lost. Fail-silent: no match -> rc 1, no echo.
+main_pane_for_target() { # <target> -> orchestrator pane_id, or rc 1
+  local target="$1" wname pane
+  [ -n "$target" ] || return 1
+  while IFS=$'\t' read -r wname pane; do
+    [ "$wname" = "$target" ] || continue          # exact window-name match (e.g. "main")
+    is_main_pane "$pane" && { printf '%s' "$pane"; return 0; }
+  done < <(tmux list-panes -a -F $'#{window_name}\t#{pane_id}' 2>/dev/null)
+  return 1
+}
+
 cmd_send() {
   local target="${1:-}" text="${2:-}"
   [ -n "$target" ] && [ -n "$text" ] || die "usage: fleet send <agent> \"message\""
@@ -718,7 +733,20 @@ cmd_send() {
   elif [ -n "$t2" ]; then pick="$t2"
   else pick="$t3"; fi
   n=$(printf '%s\n' "$pick" | grep -c .)
-  [ "$n" -eq 0 ] && die "no agent matching '$target' (try: fleet ls)"
+  if [ "$n" -eq 0 ]; then
+    # The orchestrator pane is DELIBERATELY filtered out of agents_tsv (so it can
+    # never be a send-keys target), which means a literal `fleet send main "msg"`
+    # resolves to nothing here. That message must still be CAPTURED, not lost
+    # (advisor §2 — the worker→main floor is a redirect, never a drop). If the
+    # target names the orchestrator pane, redirect it into the durable inbox.
+    local mpane; mpane=$(main_pane_for_target "$target")
+    if [ -n "$mpane" ]; then
+      echo "fleet send: '$target' is the orchestrator pane — redirecting to the inbox (the human input is never clobbered)" >&2
+      inbox_put --sev info -m "$text" >&2
+      exit 0
+    fi
+    die "no agent matching '$target' (try: fleet ls)"
+  fi
   if [ "$n" -gt 1 ]; then
     echo "ambiguous target '$target' matches $n agents:" >&2
     printf '%s\n' "$pick" | awk -F'\t' '{printf "  %-8s window=%-28s repo=%s [win %s]\n",$1,$5,$2,$4}' >&2
@@ -736,7 +764,7 @@ cmd_send() {
   # input line is never touched; the summary lands where it is read on demand.
   if is_main_pane "$pane"; then
     echo "fleet send: '$wname' is the orchestrator pane — redirecting to the inbox (the human input is never clobbered)" >&2
-    inbox_put --sev info -t "message for orchestrator (via fleet send)" -m "$text" >&2
+    inbox_put --sev info -m "$text" >&2
     exit 0
   fi
 
