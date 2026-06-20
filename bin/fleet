@@ -1231,7 +1231,11 @@ inbox_put() { # put [--from X] [-d dN] [--sev info|warn|blocked] [--key K] -t "t
   [ -n "$title" ] || title=$(printf '%s' "$body" | sed -n '1p' | cut -c1-80)
   [ -n "$title" ] || title="(no title)"
   if [ -z "$from" ]; then                       # default sender = caller's window
-    from=$(tmux display -p '#{window_name}' 2>/dev/null); [ -n "$from" ] || from="-"
+    # MUST target the calling pane (-t "$TMUX_PANE"): a bare `tmux display -p`
+    # resolves to the session's ACTIVE window (almost always "main"), which would
+    # mis-stamp every worker put / redirected send as from=main and lose the real
+    # sender. Fall back to "-" when not in a pane / lookup fails.
+    from=$(tmux display -p -t "${TMUX_PANE:-}" '#{window_name}' 2>/dev/null); [ -n "$from" ] || from="-"
   fi
   local dir; dir=$(inbox_dir) || { echo "inbox: no project root (run inside a fleet session)" >&2; return 1; }
   mkdir -p "$dir" 2>/dev/null || return 1
