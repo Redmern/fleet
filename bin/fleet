@@ -129,6 +129,22 @@ agent_label() { # last two path components
 
 # ---- ls -----------------------------------------------------------------------
 
+# True iff <pane> is the orchestrator (human) pane. The role registry
+# (.fleet/roles/<pane_id>, written by record_pane_role at boot) is authoritative;
+# the window name is kept only as a fast-path so the common case needs no file
+# read. Anchoring on the registry — the same signal the dispatch hook trusts —
+# makes the never-clobber guarantee survive a manual rename or a future spawn
+# path that omits `-n main`. Fail-silent: any trouble → return 1 (not main).
+is_main_pane() { # <pane_id>
+  local pane="${1:-}" wname root role
+  [ -n "$pane" ] || return 1
+  wname=$(tmux display -p -t "$pane" '#{window_name}' 2>/dev/null)
+  [ "$wname" = main ] && return 0                       # fast-path
+  root=$(fleet_root 2>/dev/null) || return 1
+  role=$(cat "$root/.fleet/roles/$pane" 2>/dev/null)    # authoritative
+  [ "$role" = main ]
+}
+
 agents_tsv() { # state<TAB>label<TAB>session<TAB>window_id<TAB>window_name<TAB>since<TAB>pane_id
   local json
   if json=$(rpc fleet.list); then
@@ -174,11 +190,16 @@ for a in agents:
                      f"{age//60}m{age%60:02d}s", a.get("pane_id",""), str(age), ready]))
 PY
   else
-    # daemon down: fall back to window options mirrored earlier (may be stale)
+    # daemon down: fall back to window options mirrored earlier (may be stale).
+    # Exclude the orchestrator's own window — fleetd's fleet.list already does
+    # (drops window_name=="main"); the raw path must too, or main becomes a
+    # resolvable send/mode target. Unpack every field so the per-row wname check
+    # is possible (field order is unchanged).
     tmux list-panes -a -F $'#{?@agent_state,#{@agent_state}\t#{pane_current_path}\t#{session_name}\t#{window_id}\t#{window_name}\t-\t#{pane_id},}' 2>/dev/null \
       | sed '/^$/d' \
-      | while IFS=$'\t' read -r st path rest; do
-          printf '%s\t%s\t%s\n' "$st" "$(agent_label "$path")" "$rest"
+      | while IFS=$'\t' read -r st path sess wid wname since pane; do
+          [ "$wname" = main ] && continue
+          printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$st" "$(agent_label "$path")" "$sess" "$wid" "$wname" "$since" "$pane"
         done
   fi
 }
@@ -708,6 +729,13 @@ cmd_send() {
   wname=$(printf '%s' "$line" | cut -f5)
   pane=$(printf '%s' "$line"  | cut -f7)
 
+  # Never send-keys into the orchestrator (human) pane. STOPGAP until step 2:
+  # once `fleet inbox put` exists this becomes a redirect (file the summary,
+  # warn, exit 0); for now refuse rather than clobber the human's input line.
+  if is_main_pane "$pane"; then
+    die "refusing to send into the orchestrator pane; will redirect to inbox in step 2"
+  fi
+
   # Re-tasking un-readies the target's worktree: it is going back to work, so a
   # leftover .fleet/ready must not survive. REAP-SAFETY — without this, `fleet
   # reap` could tear down a worktree we just sent work into. Best-effort.
@@ -1057,10 +1085,11 @@ cmd_notify() { # notify <pane> <msg> [policy] [class]
   local pane="${1:-}" msg="${2:-}" policy="${3:-inband-ok}" class="${4:-normal}" wname state tty
   [ -n "$pane" ] && [ -n "$msg" ] || die "usage: fleet notify <pane> \"msg\" [inband-ok|oob] [normal|blocked]"
 
-  # Hard pin: never send-keys into the main (human) pane. Detect it by window name
-  # and force oob, overriding any caller that passed inband-ok.
+  # Hard pin: never send-keys into the main (human) pane. Detect it via
+  # is_main_pane (role registry + window-name fast-path) and force oob,
+  # overriding any caller that passed inband-ok. Drift-proof vs a bare string.
   wname=$(tmux display -p -t "$pane" '#{window_name}' 2>/dev/null)
-  [ "$wname" = main ] && policy=oob
+  is_main_pane "$pane" && policy=oob
 
   if [ "$policy" = inband-ok ]; then
     state=$(orch_input_state "$pane")
@@ -1424,6 +1453,12 @@ cmd_mode() {
   local win pane nsock
   win=$(echo "$line" | cut -f4)
   pane=$(echo "$line" | cut -f7)
+  # Never BTab the orchestrator's own permission mode. No message to preserve, so
+  # the floor is a non-fatal warn+exit 0 (fail-silent), not a die.
+  if is_main_pane "$pane"; then
+    echo "fleet mode: refusing to cycle the orchestrator's own permission mode" >&2
+    exit 0
+  fi
   nsock=$(tmux show -w -t "$win" -v @fleet_nvim_sock 2>/dev/null)
   if [ -n "$nsock" ] && [ -S "$nsock" ]; then
     # (Re)source the current fleet.lua first, then call — so this works even for
@@ -1546,6 +1581,10 @@ cmd_main() {
     # would leak `main` into every spawned pane and re-arm the fork-bomb (§1).
     win=$(tmux new-window -P -F '#{window_id}' -t "$sess" -n main -c "$root" \
       -e FLEET_ROLE=main "$ORCH_BIN")
+    # Belt-and-suspenders: forbid automatic-rename drifting the window off "main"
+    # (the is_main_pane fast-path / status bar). The role registry handles the
+    # deliberate-rename vector; this forecloses the accidental one.
+    tmux set -w -t "$win" automatic-rename off 2>/dev/null || true
     tag_orch_window "$win"
     record_pane_role "$root" "$(tmux list-panes -t "$win" -F '#{pane_id}' 2>/dev/null | head -1)" main
     tmux set -t "$sess" @fleet_orch_harness "$harness"
@@ -1950,6 +1989,10 @@ cmd_up() {
       tmux new-session -d -s "$name" -c "$root" -n _boot sh
       local _mainwin; _mainwin=$(tmux new-window -P -F '#{window_id}' -t "$name" -n main -c "$root" \
         -e FLEET_ROLE=main "$ORCH_BIN")
+      # Belt-and-suspenders: forbid automatic-rename drifting the window off
+      # "main" (the is_main_pane fast-path / status bar); the role registry
+      # handles the deliberate-rename vector, this the accidental one.
+      tmux set -w -t "$_mainwin" automatic-rename off 2>/dev/null || true
       tmux kill-window -t "$name:_boot" 2>/dev/null || true
       tag_orch_window "$_mainwin"
       record_pane_role "$root" "$(tmux list-panes -t "$_mainwin" -F '#{pane_id}' 2>/dev/null | head -1)" main
