@@ -41,6 +41,36 @@ Edit with: `sudo ${EDITOR:-nano} /etc/pacman.conf`.
 
 ---
 
+## ⚠️ Already have fleet installed another way? Switch cleanly first
+
+pacman won't error if fleet is already present, but two installs **shadow** each
+other. If this device already has the **dev / worktree install** (the
+`~/.local/bin` symlinks from `install.sh`), remove it *before* installing the
+package — otherwise the checkout keeps winning and `pacman -Syu` upgrades have no
+effect:
+
+```bash
+cd ~/proj/pc-tune/fleet/main && ./install.sh --uninstall   # drops the ~/.local/bin symlinks + user unit + hooks
+```
+
+Then proceed with (b). Why it matters:
+
+- **No file conflict either way** — the dev install lives in `~/.local/bin` +
+  `~/.config/systemd/user`, the package in `/usr/bin` + `/usr/lib/systemd/user`.
+  So pacman installs fine even without cleanup — but `~/.local/bin` sits *before*
+  `/usr/bin` on `PATH`, and a `~/.config/systemd/user` unit shadows the packaged
+  one, so the package stays **masked and unused** until the dev install is gone.
+- Already installed via a **prior `makepkg` / this repo**? No cleanup — `pacman -S
+  fleet-git` just reinstalls/upgrades it (same package name).
+- Ran `fleet setup` from the dev install? It tags that install, so running it
+  again from the package refuses unless `--force`; uninstalling the dev one first
+  avoids the prompt.
+- **On the dev box** (where you edit fleet) do the *opposite*: keep the worktree,
+  **don't** add this repo or install the package — the shadowing is intentional so
+  your editable checkout wins.
+
+---
+
 ## (b) First-time setup
 
 Refresh the new repo's database, then install:
