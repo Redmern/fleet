@@ -9,6 +9,10 @@ set -u
 
 FLEET_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)"
 FLEET_LIB="$FLEET_DIR/lib"          # vendored node driver + node_modules (playwright-core)
+# Browser deps: prefer a user-writable vendor dir (populated by `fleet setup
+# --browser`) over the install tree, which is read-only when packaged under
+# /usr/lib/fleet. The dev/worktree path keeps working via the $FLEET_LIB fallback.
+FLEET_VENDOR="${XDG_DATA_HOME:-$HOME/.local/share}/fleet/lib"
 RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
 SOCK="$RUNTIME_DIR/fleet.sock"
 CONF_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/fleet"
@@ -1317,6 +1321,14 @@ EOF
 # The worker advertises its dev port in <worktree>/.fleet/devport (mirrors the
 # .fleet/ready marker); a bare port or full URL on the CLI overrides it.
 
+# Where playwright-core lives: the user-writable vendor dir when `fleet setup
+# --browser` populated it, else the install-tree lib (dev/worktree case). Node
+# resolves `require('playwright-core')` from "$(node_modules_dir)/node_modules".
+node_modules_dir() {
+  [ -d "$FLEET_VENDOR/node_modules/playwright-core" ] && { echo "$FLEET_VENDOR"; return; }
+  echo "$FLEET_LIB"
+}
+
 # Resolve the worktree root of the current dir (git toplevel, else $PWD).
 browser_root() {
   local dir="${1:-$PWD}" root
@@ -1375,9 +1387,13 @@ cmd_browser() { # browser [<url|port>] [--watch] [agent]
 
   [ -f "$FLEET_LIB/browser-test.js" ] || die "driver missing: $FLEET_LIB/browser-test.js"
   command -v node >/dev/null 2>&1 || die "node not found (needed to run the Playwright driver)"
-  if [ ! -d "$FLEET_LIB/node_modules/playwright-core" ]; then
-    die "playwright-core not vendored — run: (cd '$FLEET_LIB' && npm i)"
+  # playwright-core may sit in a user-writable vendor dir (packaged, RO install
+  # tree) or in $FLEET_LIB (dev/worktree); resolve it via NODE_PATH either way.
+  local nmdir; nmdir=$(node_modules_dir)
+  if [ ! -d "$nmdir/node_modules/playwright-core" ]; then
+    die "playwright-core not vendored — run: fleet setup --browser (or: cd '$FLEET_LIB' && npm i)"
   fi
+  export NODE_PATH="$nmdir/node_modules"
 
   local shotdir="$root/.fleet/shots"
   mkdir -p "$shotdir" 2>/dev/null || true
@@ -2151,6 +2167,229 @@ doctor_config_sync() {
   [ -n "$stale" ] || echo "ok   no stale sibling clones in ~/proj"
 }
 
+# ---- setup / unsetup ------------------------------------------------------------
+# The per-user half of install.sh, as a subcommand: pacman ships the immutable
+# system files (scripts under /usr/lib/fleet, /usr/bin symlinks + hook bins, the
+# user systemd unit); `fleet setup` does everything that touches per-user runtime
+# state (systemctl --user, ~/.claude settings.json, the browser vendor dir) which
+# root-at-build-time cannot. Hook bin paths derive from $FLEET_DIR, so wiring
+# always points at the same install this `fleet` came from (a packaged
+# /usr/bin/fleet symlink yields $FLEET_DIR=/usr/lib/fleet with real hook bins).
+# Everything here is idempotent and fail-soft. See _reports/pacman-package §2.
+
+# wire fleet-hook into a profile's settings.json (verbatim from install.sh, but
+# the hook path is passed in from $FLEET_DIR rather than $HOME/.local/bin).
+setup_wire_hooks() { # setup_wire_hooks <settings.json> <hook-bin>
+  python3 - "$1" "$2" <<'PY'
+import json, sys
+
+path, hook = sys.argv[1], sys.argv[2]
+try:
+    with open(path) as f:
+        settings = json.load(f)
+except FileNotFoundError:
+    settings = {}
+
+MAP = {
+    "UserPromptSubmit": "working",
+    "PreToolUse": "working",
+    "PermissionRequest": "blocked",
+    "Notification": "blocked",
+    "Stop": "idle",
+    "SessionStart": "idle",
+    "SessionEnd": "release",
+}
+
+hooks = settings.setdefault("hooks", {})
+for event, action in MAP.items():
+    entries = hooks.setdefault(event, [])
+    # drop any previous fleet-hook or herdr entries for this event
+    for entry in entries:
+        entry["hooks"] = [
+            h for h in entry.get("hooks", [])
+            if "fleet-hook" not in h.get("command", "")
+            and "herdr-agent-state" not in h.get("command", "")
+        ]
+    hooks[event] = [e for e in entries if e.get("hooks")]
+    hooks[event].append({
+        "matcher": "*",
+        "hooks": [{
+            "type": "command",
+            "command": f"bash '{hook}' {action}",
+            "timeout": 10,
+        }],
+    })
+
+with open(path, "w") as f:
+    json.dump(settings, f, indent=2)
+    f.write("\n")
+print(f"  wired hooks: {path}")
+PY
+}
+
+# wire the PreToolUse write-guard (verbatim from install.sh, guard path passed in).
+setup_wire_guard() { # setup_wire_guard <settings.json> <guard-bin>
+  python3 - "$1" "$2" <<'PY'
+import json, sys
+path, guard = sys.argv[1], sys.argv[2]
+try:
+    with open(path) as f: settings = json.load(f)
+except FileNotFoundError:
+    settings = {}
+hooks = settings.setdefault("hooks", {})
+entries = hooks.setdefault("PreToolUse", [])
+for e in entries:                                  # drop any previous guard entry
+    e["hooks"] = [h for h in e.get("hooks", []) if "fleet-guard" not in h.get("command", "")]
+entries[:] = [e for e in entries if e.get("hooks")]
+entries.append({
+    "matcher": "Edit|Write|MultiEdit|NotebookEdit",
+    "hooks": [{"type": "command", "command": f"sh '{guard}'", "timeout": 10}],
+})
+with open(path, "w") as f:
+    json.dump(settings, f, indent=2); f.write("\n")
+print(f"  wired write-guard: {path}")
+PY
+}
+
+# drop fleet-hook AND fleet-guard from a profile (verbatim from install.sh).
+setup_unwire_hooks() { # setup_unwire_hooks <settings.json>
+  python3 - "$1" <<'PY'
+import json, sys
+path = sys.argv[1]
+try:
+    with open(path) as f:
+        settings = json.load(f)
+except FileNotFoundError:
+    sys.exit(0)
+hooks = settings.get("hooks", {})
+for event in list(hooks):
+    entries = hooks[event]
+    for entry in entries:
+        entry["hooks"] = [h for h in entry.get("hooks", [])
+                          if "fleet-hook" not in h.get("command", "")
+                          and "fleet-guard" not in h.get("command", "")]
+    hooks[event] = [e for e in entries if e.get("hooks")]
+    if not hooks[event]:
+        del hooks[event]
+with open(path, "w") as f:
+    json.dump(settings, f, indent=2)
+    f.write("\n")
+print(f"  unwired hooks: {path}")
+PY
+}
+
+cmd_setup() {
+  local no_systemd=0 do_browser=0 FORCE=0
+  for a in "$@"; do
+    case "$a" in
+      --no-systemd) no_systemd=1 ;;
+      --browser)    do_browser=1 ;;
+      --force)      FORCE=1 ;;
+      *) die "fleet setup: unknown flag '$a' (--no-systemd | --browser | --force)" ;;
+    esac
+  done
+
+  # Hook bins resolve relative to THIS install (packaged: real files under
+  # /usr/lib/fleet/bin; dev: the worktree bin/). This replaces install.sh's
+  # hardcoded $HOME/.local/bin/fleet-hook.
+  local HOOK="$FLEET_DIR/bin/fleet-hook"
+  local GUARD="$FLEET_DIR/bin/fleet-guard"
+
+  # Dev-shadow guard (RESEARCH §6.2): if some OTHER fleet is first on PATH, wiring
+  # this one would fight it — last writer wins on the shared settings.json. Wire
+  # the install the `fleet` you ran belongs to; warn and no-op otherwise.
+  local onpath; onpath=$(command -v fleet 2>/dev/null)
+  if [ -n "$onpath" ] && \
+     [ "$(readlink -f "$onpath" 2>/dev/null)" != "$(readlink -f "$FLEET_DIR/bin/fleet" 2>/dev/null)" ]; then
+    echo "note: another fleet is first on PATH: $onpath -> $(readlink -f "$onpath" 2>/dev/null)"
+    echo "      run 'fleet setup' from THAT install, or pass --force to wire this one."
+    [ "$FORCE" = 1 ] || return 0
+  fi
+
+  # Auto-fall-back to --no-systemd when `systemctl --user` is unusable (no
+  # systemd, no user bus, containers) — same detection install.sh uses.
+  if [ "$no_systemd" = 0 ] && ! systemctl --user show-environment >/dev/null 2>&1; then
+    no_systemd=1
+    echo "note: 'systemctl --user' unavailable → setting up without systemd (--no-systemd)"
+  fi
+
+  # systemd: the packaged unit is on disk already (/usr/lib/systemd/user); a dev
+  # checkout has none, so drop a patched copy into the user unit dir first.
+  if [ "$no_systemd" = 1 ]; then
+    echo "  skipping systemd unit (--no-systemd); fleetd starts on demand via 'fleet up'"
+    if [ ! -S "$SOCK" ]; then
+      nohup "$FLEET_DIR/bin/fleetd" >/dev/null 2>&1 &
+      echo "  started fleetd (nohup, pid $!)"
+    fi
+  else
+    # Dev checkout (own unit, no packaged one) → install a copy with ExecStart
+    # pointing at this checkout's fleetd. Packaged installs already have the unit.
+    if [ -f "$FLEET_DIR/systemd/fleetd.service" ] && \
+       [ ! -f /usr/lib/systemd/user/fleetd.service ]; then
+      local unit_dir="$HOME/.config/systemd/user"
+      mkdir -p "$unit_dir"
+      sed "s#^ExecStart=.*#ExecStart=$FLEET_DIR/bin/fleetd#" \
+        "$FLEET_DIR/systemd/fleetd.service" > "$unit_dir/fleetd.service"
+      echo "  installed user unit: $unit_dir/fleetd.service (ExecStart=$FLEET_DIR/bin/fleetd)"
+    fi
+    systemctl --user daemon-reload 2>/dev/null || true
+    systemctl --user enable --now fleetd 2>/dev/null \
+      && echo "  fleetd.service enabled + started" \
+      || echo "  WARN: 'systemctl --user enable --now fleetd' failed (try --no-systemd)"
+  fi
+
+  # Wire hooks + guard into each EXISTING profile (don't conjure a profile dir).
+  local p
+  for p in "$HOME/.claude" "$HOME/.claude_personal"; do
+    [ -d "$p" ] || continue
+    [ -f "$p/settings.json" ] || echo '{}' > "$p/settings.json"
+    setup_wire_hooks "$p/settings.json" "$HOOK"
+    setup_wire_guard "$p/settings.json" "$GUARD"
+  done
+
+  # --browser: vendor playwright-core into a USER-WRITABLE dir (the install tree
+  # is read-only when packaged). playwright-core drives the SYSTEM Chromium, so
+  # NO ~150MB browser download. Idempotent; fail-soft when npm is missing.
+  if [ "$do_browser" = 1 ]; then
+    if [ -d "$FLEET_VENDOR/node_modules/playwright-core" ]; then
+      echo "  fleet-browser driver deps already vendored in $FLEET_VENDOR"
+    elif command -v npm >/dev/null 2>&1; then
+      mkdir -p "$FLEET_VENDOR"
+      local f
+      for f in browser-test.js package.json package-lock.json; do
+        [ -f "$FLEET_LIB/$f" ] && cp "$FLEET_LIB/$f" "$FLEET_VENDOR/$f"
+      done
+      echo "  vendoring fleet-browser driver deps (playwright-core, no browser download) → $FLEET_VENDOR"
+      ( cd "$FLEET_VENDOR" && PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1 npm i --no-audit --no-fund ) \
+        && echo "  fleet browser ready (system Chromium via playwright-core)" \
+        || echo "  WARN: 'npm i' in $FLEET_VENDOR failed — 'fleet browser' unavailable until you re-run it"
+    else
+      echo "  note: npm not found — install npm, then re-run 'fleet setup --browser' for 'fleet browser'"
+    fi
+  fi
+
+  echo
+  echo "fleet set up. Try: fleet doctor && fleet up <project-root>"
+}
+
+cmd_unsetup() {
+  # Mirror the per-user half of `install.sh --uninstall` ONLY: pacman owns the
+  # /usr/bin symlinks and the /usr/lib/fleet tree — never touch those here.
+  if systemctl --user show-environment >/dev/null 2>&1; then
+    systemctl --user disable --now fleetd 2>/dev/null || true
+    # Dev install: we dropped this unit ourselves, so it's ours to remove. A
+    # packaged install keeps its /usr/lib/systemd/user unit (pacman owns it).
+    rm -f "$HOME/.config/systemd/user/fleetd.service"
+    systemctl --user daemon-reload 2>/dev/null || true
+    echo "  disabled fleetd.service (user)"
+  fi
+  local p
+  for p in "$HOME/.claude" "$HOME/.claude_personal"; do
+    [ -f "$p/settings.json" ] && setup_unwire_hooks "$p/settings.json"
+  done
+  echo "fleet unset up (system files left for pacman to remove)"
+}
+
 # ---- dispatch -------------------------------------------------------------------
 
 print_usage() {
@@ -2186,6 +2425,8 @@ fleet — agent fleet manager (tmux + nvim + Claude Code)
   fleet keys             list feature keybinds
   fleet rebind           change a keybind interactively
   fleet status           live config report (what's deployed, per config repo)
+  fleet setup            per-user post-install: enable fleetd + wire Claude hooks [--no-systemd] [--browser] [--force]
+  fleet unsetup          reverse setup: disable the user unit + unwire hooks
   fleet doctor           dependency / wiring check
 EOF
 }
@@ -2232,6 +2473,8 @@ case "${1:-}" in
   rebind)     shift; cmd_rebind "$@" ;;
   rebind-set) shift; cmd_rebind_set "$@" ;;
   status)     shift; cmd_status "$@" ;;
+  setup)      shift; cmd_setup "$@" ;;     # per-user post-install: systemd + hook wiring (+ --browser)
+  unsetup)    shift; cmd_unsetup "$@" ;;   # reverse setup: disable unit + unwire hooks (per-user only)
   doctor)     shift; cmd_doctor "$@" ;;
   help|-h|--help) print_usage ;;       # explicit help: always the usage text
   "")
