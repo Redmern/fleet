@@ -1,0 +1,135 @@
+# Build the fleet-git package and publish a self-hosted pacman repo to a GitHub
+# Release. Other devices add the [fleet] repo (see docs/custom-repo.md) and get
+# updates via `pacman -Syu` — no AUR, no per-device build.
+#
+# Design + rationale: _reports/pacman-repo/RESEARCH.md.
+# The package recipe itself is packaging/PKGBUILD (do not duplicate it here).
+
+name: pacman-repo
+
+on:
+  # Rebuild whenever something that affects the package lands on main. The -git
+  # package's pkgver is r<commits>.<shorthash>, so every such push yields a new
+  # version and a refreshed repo DB.
+  push:
+    branches: [main]
+    paths:
+      - 'bin/**'
+      - 'lib/**'
+      - 'nvim/**'
+      - 'harness.d/**'
+      - 'systemd/**'
+      - 'packaging/**'
+      - 'FLEET.md'
+      - 'FLEET_SUBORCH.md'
+      - 'docs/**'
+      - '.github/workflows/pacman-repo.yml'
+  # Manual trigger — also used for the very first publish (creates the release).
+  workflow_dispatch:
+
+# Serialize runs so two pushes can't race on the same 'repo' release upload.
+concurrency:
+  group: pacman-repo
+  cancel-in-progress: false
+
+# The auto-provided GITHUB_TOKEN needs write access to create the release and
+# upload assets. No PAT / extra secret required.
+permissions:
+  contents: write
+
+jobs:
+  build-and-publish:
+    runs-on: ubuntu-latest
+    # Build inside Arch so makepkg/repo-add/pacman are native.
+    container: archlinux:latest
+
+    env:
+      # gh reads these instead of needing `gh auth login` in CI.
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      GH_REPO: ${{ github.repository }}
+      # Mutable release that holds the repo DB + packages (NOT a version tag).
+      REPO_TAG: repo
+
+    steps:
+      # 1. Toolchain. base-devel = makepkg+fakeroot+repo-add; git for the
+      #    git+https source clone; github-cli provides `gh`. --needed skips
+      #    already-present packages; -Syu refreshes the container's mirrors.
+      - name: Install toolchain
+        run: |
+          pacman -Syu --noconfirm --needed base-devel git github-cli
+
+      # 2. Non-root build user. makepkg refuses to run as root, and the Arch
+      #    container is root by default — create an unprivileged builder with
+      #    passwordless sudo (only used if a future build needs to install deps).
+      - name: Create build user
+        run: |
+          useradd -m builder
+          echo 'builder ALL=(ALL) NOPASSWD: ALL' > /etc/sudoers.d/builder
+          chmod 0440 /etc/sudoers.d/builder
+
+      # 3. Get the PKGBUILD. A plain git clone avoids actions/checkout, which is a
+      #    JS action and would need Node inside the container (Arch ships none).
+      #    makepkg re-clones the actual source itself via source=git+https, so we
+      #    only need the packaging/ files here. Clone the exact pushed SHA.
+      - name: Fetch packaging files
+        run: |
+          git clone "https://github.com/${GH_REPO}.git" src
+          git -C src checkout "${GITHUB_SHA}"
+          # The build dir must be writable by the builder user.
+          chown -R builder:builder src
+
+      # 4. Build the package as the builder user.
+      #    --nodeps: depends=(tmux neovim fzf ...) are RUNTIME deps; package()
+      #      only copies files, so they need not be installed to build. This
+      #      avoids pulling the whole desktop stack into the container.
+      #    --noconfirm -f: non-interactive, overwrite a stale tarball.
+      #    Output: packaging/fleet-git-r<N>.<hash>-1-any.pkg.tar.zst
+      - name: Build fleet-git
+        run: |
+          runuser -u builder -- bash -c '
+            cd src/packaging
+            makepkg --nodeps --noconfirm -f
+          '
+
+      # 5. Assemble the pacman repo database. Collect the built package into a
+      #    clean repo/ dir and run repo-add, which writes fleet.db.tar.gz +
+      #    fleet.files.tar.gz and the fleet.db / fleet.files symlinks pacman uses.
+      - name: Build repo database
+        run: |
+          mkdir -p repo
+          cp src/packaging/*.pkg.tar.zst repo/
+          cd repo
+          repo-add fleet.db.tar.gz *.pkg.tar.zst
+          echo "--- repo/ contents ---"
+          ls -l
+
+      # 6. Ensure the 'repo' release exists (idempotent first-run handling).
+      #    gh release view exits non-zero if absent → create it, targeting the
+      #    pushed commit, marked prerelease so it never shows as "Latest".
+      - name: Ensure release exists
+        run: |
+          if ! gh release view "$REPO_TAG" >/dev/null 2>&1; then
+            gh release create "$REPO_TAG" \
+              --target "${GITHUB_SHA}" \
+              --title "fleet pacman repo" \
+              --notes "Self-hosted pacman repo for fleet-git. Add the [fleet] repo per docs/custom-repo.md. Auto-published by CI; do not treat as a software release." \
+              --prerelease
+          fi
+
+      # 7. Publish. --clobber replaces existing assets in place so re-runs are
+      #    idempotent and leave no binary churn in git history. Upload the four DB
+      #    artifacts (resolving the .db/.files symlinks to real bytes) plus the
+      #    package. -L makes cp dereference the symlinks repo-add created.
+      - name: Publish to release
+        run: |
+          cd repo
+          cp -L fleet.db.tar.gz   ../fleet.db.tar.gz
+          cp -L fleet.db          ../fleet.db
+          cp -L fleet.files.tar.gz ../fleet.files.tar.gz
+          cp -L fleet.files       ../fleet.files
+          cd ..
+          gh release upload "$REPO_TAG" \
+            fleet.db fleet.db.tar.gz fleet.files fleet.files.tar.gz \
+            repo/*.pkg.tar.zst \
+            --clobber
+          echo "Published to: https://github.com/${GH_REPO}/releases/download/${REPO_TAG}"

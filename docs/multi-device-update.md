@@ -13,6 +13,43 @@ if the laptop keeps the container somewhere else.
 
 ---
 
+## Two update models — git-worktree vs pacman repo
+
+There are now **two** ways a device gets fleet updates, and they coexist:
+
+- **Git-worktree model (dev box).** The machine where you *develop* fleet keeps
+  the `$PC/fleet/main` worktree + `~/.local/bin` symlinks (`install.sh`). Those
+  symlinks intentionally shadow `/usr/bin/fleet` on PATH, so the dev checkout
+  always wins. Updates come from the rest of this runbook (`git pull --ff-only`
+  + `install.sh`). Use this on any device where you edit fleet.
+
+- **Pacman-repo model (other devices).** A device that only *consumes* fleet can
+  skip the worktree entirely: add the self-hosted `[fleet]` pacman repo once and
+  update with plain `sudo pacman -Syu`. See `docs/custom-repo.md` for the
+  one-time `pacman.conf` stanza and `pacman -S fleet-git`. CI republishes the
+  package on every push to `main`, so the laptop catches up with a normal system
+  upgrade — no worktree pull, no `install.sh`.
+
+  ```bash
+  # one-time, per device (see docs/custom-repo.md for the pacman.conf stanza):
+  sudo pacman -Sy && sudo pacman -S fleet-git
+  fleet setup                 # per-user: fleetd unit + Claude hooks (pacman can't do this)
+  # thereafter:
+  sudo pacman -Syu            # fleet updates arrive like any package
+  ```
+
+  `fleet setup` is still required once per device (pacman installs only system
+  files). The other config repos (`nvim`, `tmux`, `tmuxinator`, `dotfiles`) are
+  **not** packaged — if the device uses them, keep following the worktree/chezmoi
+  steps below for those even while fleet itself comes from pacman.
+
+**Pick one for fleet per device.** Don't run both the `~/.local/bin` symlinks and
+the `fleet-git` package as your primary on the same box — the symlinks would
+shadow the packaged binary, masking pacman upgrades. The rest of this runbook is
+the **git-worktree** path.
+
+---
+
 ## Layout reminder (why the commands look the way they do)
 
 Per `bootstrap.sh`, each config repo is a **worktree container** under
