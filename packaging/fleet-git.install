@@ -1,0 +1,33 @@
+post_install() {
+  cat <<'EOF'
+==> fleet installed (system files only). Per-user setup is NOT automatic.
+    Run as your normal user (NOT root):
+
+        fleet setup            # enable fleetd (user) + wire Claude Code hooks
+        fleet setup --browser  # also vendor playwright-core for `fleet browser`
+
+    Then verify:  fleet doctor
+
+    fleetd is a *user* unit; `fleet setup` runs
+        systemctl --user enable --now fleetd
+    (no system-wide unit is installed; fleetd needs no privileges).
+
+    If you also run a fleet dev checkout via ~/.local/bin symlinks, that copy
+    shadows /usr/bin/fleet on PATH — `fleet setup` detects it and no-ops unless
+    you pass --force.
+
+    The opt-in dispatch hook is NOT wired by this package. Enable it per-project
+    with `fleet dispatch enable` (needs jq).
+EOF
+}
+
+post_upgrade() {
+  echo "==> fleet upgraded. Re-run 'fleet setup' if hook paths changed;"
+  echo "    'systemctl --user daemon-reload' if the unit changed."
+}
+
+pre_remove() {
+  echo "==> Before removing: run 'fleet unsetup' as your user to disable the"
+  echo "    fleetd user unit and unwire Claude Code hooks (pacman cannot touch"
+  echo "    per-user state)."
+}

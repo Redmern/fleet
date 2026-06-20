@@ -1,0 +1,114 @@
+# Maintainer: Redmer Nauta <redmern@gmail.com>
+
+# fleet-git — AUR VCS package tracking rolling `main` (see packaging/README.md
+# and _reports/pacman-package/RESEARCH.md §5). pacman installs ONLY immutable
+# system files; all per-user wiring (systemd --user, Claude hooks, optional
+# browser vendor) is done post-install by `fleet setup`. No network in build()
+# beyond the source clone.
+
+pkgname=fleet-git
+pkgver=r0.0000000          # real value computed by pkgver() at build time
+pkgrel=1
+pkgdesc="Tmux/git-worktree command-center for orchestrating coding agents (Claude Code, omp, ...)"
+arch=('any')
+url="https://github.com/Redmern/fleet"
+license=('MIT')
+install="$pkgname.install"
+
+# Hard deps — mirror `fleet doctor`'s required checks (tmux/nvim/git/python3/fzf).
+depends=(
+  'tmux'
+  'neovim'
+  'git'
+  'python'
+  'fzf'
+  'bash'
+)
+
+# Optional features. Names match doctor's optional checks + browser/dispatch extras.
+optdepends=(
+  'jq: opt-in per-project dispatch hook (fleet dispatch enable)'
+  'nodejs: fleet browser driver (playwright-core, vendored by `fleet setup --browser`)'
+  'npm: vendor the browser driver (`fleet setup --browser`)'
+  'chromium: the browser `fleet browser` drives (system Chromium, no bundled download)'
+  'libnotify: desktop notifications (notify-send)'
+  'tmuxinator: alternative session builder (fleet builds sessions itself otherwise)'
+  # claude-code is not in the official repos; install separately for the default harness.
+)
+
+# No makedepends beyond git: the browser path (RESEARCH §3, option b) vendors
+# playwright-core per-user via `fleet setup --browser`, so build() does NO npm i
+# and hits NO network beyond the source clone.
+makedepends=('git')
+
+# Standard -git convention: supersede a future tagged `fleet` package. These act
+# against a pacman-tracked `fleet`, NOT the dev ~/.local/bin symlinks (untracked
+# by pacman; they keep winning on PATH — RESEARCH §6).
+provides=('fleet')
+conflicts=('fleet')
+
+source=("git+https://github.com/Redmern/fleet.git")
+sha256sums=('SKIP')
+
+pkgver() {
+  cd "$srcdir/fleet"
+  # Repo has NO tags yet → r<commits>.<shorthash> (RESEARCH §5.1).
+  # Once releases are tagged, switch to:
+  #   git describe --long --tags | sed 's/\([^-]*-g\)/r\1/;s/-/./g'
+  printf "r%s.%s" "$(git rev-list --count HEAD)" "$(git rev-parse --short HEAD)"
+}
+
+package() {
+  cd "$srcdir/fleet"
+
+  local libdir="$pkgdir/usr/lib/fleet"
+
+  # ---- 1. The whole exec tree under /usr/lib/fleet --------------------------
+  # bin/fleet computes FLEET_DIR = readlink-f(self)/.. , so /usr/bin/fleet (a
+  # symlink → /usr/lib/fleet/bin/fleet) resolves to FLEET_DIR=/usr/lib/fleet and
+  # all siblings (harness.d, nvim, lib, *.md) are found with NO code change.
+  install -d "$libdir/bin" "$libdir/lib" "$libdir/harness.d" "$libdir/nvim"
+
+  # executables
+  install -m755 bin/fleet bin/fleetd bin/fleet-hook bin/fleet-guard \
+                bin/fleet-dash bin/fleet-status "$libdir/bin/"
+  # opt-in dispatch hook source (copied + chmod +x into a project by
+  # `fleet dispatch enable`; run via `sh` — 644 here is fine, matches repo)
+  install -m644 bin/fleet-dispatch.sh "$libdir/bin/fleet-dispatch.sh"
+
+  # node driver source + manifest — NOT node_modules (per-user cache, §3/§7.3),
+  # and NOT package-lock.json (the repo ships none).
+  install -m644 lib/browser-test.js lib/package.json "$libdir/lib/"
+
+  # harness adapters, nvim plugin, orchestrator guides
+  install -m644 harness.d/*.conf "$libdir/harness.d/"
+  install -m644 nvim/fleet.lua "$libdir/nvim/fleet.lua"
+  install -m644 FLEET.md FLEET_SUBORCH.md "$libdir/"
+
+  # ---- 2. /usr/bin entrypoints — SYMLINKS so FLEET_DIR resolution works -----
+  # Only the four install.sh symlinked. fleet-dash/fleet-status/fleet-dispatch
+  # are invoked via $FLEET_DIR/bin/... and need not be on PATH.
+  install -d "$pkgdir/usr/bin"
+  local b
+  for b in fleet fleetd fleet-hook fleet-guard; do
+    ln -s "/usr/lib/fleet/bin/$b" "$pkgdir/usr/bin/$b"
+  done
+
+  # ---- 3. systemd USER unit, ExecStart patched to the system binary ---------
+  # Shipped unit uses %h/.local/bin/fleetd (dev path); rewrite to /usr/bin/fleetd.
+  # pacman drops the file; `fleet setup` does the per-user `systemctl --user enable`.
+  install -d "$pkgdir/usr/lib/systemd/user"
+  sed 's|^ExecStart=.*|ExecStart=/usr/bin/fleetd|' systemd/fleetd.service \
+      > "$pkgdir/usr/lib/systemd/user/fleetd.service"
+  chmod 644 "$pkgdir/usr/lib/systemd/user/fleetd.service"
+
+  # ---- 4. license -----------------------------------------------------------
+  install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+
+  # ---- 5. docs --------------------------------------------------------------
+  install -d "$pkgdir/usr/share/doc/$pkgname"
+  install -m644 README.md "$pkgdir/usr/share/doc/$pkgname/README.md"
+  if [ -d docs ]; then
+    install -m644 docs/*.md "$pkgdir/usr/share/doc/$pkgname/"
+  fi
+}

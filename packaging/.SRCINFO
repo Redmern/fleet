@@ -1,0 +1,27 @@
+pkgbase = fleet-git
+	pkgdesc = Tmux/git-worktree command-center for orchestrating coding agents (Claude Code, omp, ...)
+	pkgver = r0.0000000
+	pkgrel = 1
+	url = https://github.com/Redmern/fleet
+	install = fleet-git.install
+	arch = any
+	license = MIT
+	makedepends = git
+	depends = tmux
+	depends = neovim
+	depends = git
+	depends = python
+	depends = fzf
+	depends = bash
+	optdepends = jq: opt-in per-project dispatch hook (fleet dispatch enable)
+	optdepends = nodejs: fleet browser driver (playwright-core, vendored by `fleet setup --browser`)
+	optdepends = npm: vendor the browser driver (`fleet setup --browser`)
+	optdepends = chromium: the browser `fleet browser` drives (system Chromium, no bundled download)
+	optdepends = libnotify: desktop notifications (notify-send)
+	optdepends = tmuxinator: alternative session builder (fleet builds sessions itself otherwise)
+	provides = fleet
+	conflicts = fleet
+	source = git+https://github.com/Redmern/fleet.git
+	sha256sums = SKIP
+
+pkgname = fleet-git
