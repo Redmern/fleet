@@ -171,6 +171,19 @@ this project with the `fleet` CLI.
   its window, delete the worktree and its merged branch). Refuses any worktree
   with uncommitted changes or a branch not merged into its base unless `--force`.
 
+## Leader menu (which-key)
+
+The command center has a which-key-style **leader menu**: a grouped popup of
+one-key actions. Open it with **prefix+Space** (works from any pane, including
+this orchestrator pane), with **prefix+F** as a secondary alias, or by pressing
+**bare Space while the dashboard pane is focused**. Press the shown key to run an
+action; **Esc/q/Space** closes. Actions are grouped **+Agents** (pick `a`, new
+`n`, ready `y`, reap `x`, orchestrator `m`, rebuild `M`), **+Inbox** (view `i`),
+**+Session** (save `s`, sessions `o`, reload `R`, quit `Q`), and **+Info** (ls
+`l`, keys `?`, rebind `c`). `fleet keys` lists every binding; `fleet rebind`
+(or the menu's `c`) changes one. Per-agent verbs (send, mode, diff, close) stay
+on the dashboard's selected row, not in the leader.
+
 ## Delegate first
 
 Your default move for any non-trivial request is to **delegate**, not to do the

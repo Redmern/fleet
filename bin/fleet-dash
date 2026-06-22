@@ -607,7 +607,7 @@ render() {
   # bottom border with key hints (or a transient status)
   local hint
   if [ -n "$status" ]; then hint="$status"
-  else hint="j/k · Ent jump · h hide · v diff · m mode · s send · n new · d close · r/R refresh/reload"; fi
+  else hint="Spc leader · j/k · Ent jump · h hide · v diff · m mode · s send · n new · d close · r/R refresh/reload"; fi
   tput cup $(( rows - 1 )) 0 2>/dev/null
   printf '\033[2m%s\033[0m\033[K' "$(hrule '╰' '╯' "$inner" "$hint")"
 }
@@ -1169,6 +1169,12 @@ while :; do
     j) nav_down; drain_nav ;;
     g) nav_top; drain_nav ;;
     G) nav_bot; drain_nav ;;
+    ' ')           # leader: open the which-key popup (dash-local trigger).
+      # Bare Space is free inside this TUI loop (it never types text), so this
+      # needs NO tmux root binding — nvim/claude/shell Space stays untouched.
+      # The same popup as prefix+Space; it schedules its own action on close.
+      tmux display-popup -E -b rounded -w 64% -h 80% "$FLEET_BIN menu" 2>/dev/null
+      clear; status="" ;;
     i)             # toggle inbox/agents view (also the key prefix+i sends in)
       if [ "$MODE" = inbox ]; then MODE=agents; load_rows
       else MODE=inbox; load_inbox; fi
