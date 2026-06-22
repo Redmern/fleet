@@ -136,7 +136,7 @@ this project with the `fleet` CLI.
 > them from `CLAUDE.md`, omp and others from `AGENTS.md`), so they are written
 > agent-neutral. Capabilities only some harnesses support are noted inline.
 
-- `fleet ls` — list all agents: state (working/blocked/idle), repo/branch, window.
+- `fleet ls` — list THIS project's agents: state (working/blocked/idle), repo/branch, window. `--all`/`-a` lists every project on the server.
 - `fleet new <repo> <branch> [-p "task"] [--bare] [--base <branch>] [--harness|-h <name>]`
   — spawn an agent: creates a git worktree for `<branch>` if needed, opens a tmux
   window (editor + agent split by default, `--bare` for a plain agent pane), and
