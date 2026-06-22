@@ -119,7 +119,10 @@ for e in entries:                                  # drop any previous guard ent
     e["hooks"] = [h for h in e.get("hooks", []) if "fleet-guard" not in h.get("command", "")]
 entries[:] = [e for e in entries if e.get("hooks")]
 entries.append({
-    "matcher": "Edit|Write|MultiEdit|NotebookEdit",
+    # "*" — fleet-guard self-filters by tool (Bash → worker merge/push block;
+    # Edit/Write/MultiEdit/NotebookEdit → test/CI/lockfile protection; else exit 0).
+    # A narrower matcher hides Bash from the hook, so the merge/push guard never fires.
+    "matcher": "*",
     "hooks": [{"type": "command", "command": f"sh '{guard}'", "timeout": 10}],
 })
 with open(path, "w") as f:
