@@ -19,6 +19,12 @@ this project with the `fleet` CLI.
   **repo-less** agent: no repo, branch, or worktree, just a plain agent pane at
   the project root. `[label]` names the window (default `scratch`). Use for
   throwaway/helper agents not tied to a checkout.
+- **`$FLEET_DOCS`** — every spawned worker gets this env var: an absolute,
+  per-branch scratch-docs dir (`<worktree>/.fleet/notes`, git-ignored so it never
+  dirties or clutters the repo; archived to `<root>/.fleet/notes/archive/…` on
+  `fleet reap`). When you dispatch, **instruct the worker in its `-p` prompt** to
+  write research/plans/architecture/scratch markdown to `$FLEET_DOCS` instead of
+  the repo root — keeps returned diffs clean.
 - `fleet send <agent> "message"` — send a follow-up message into a running
   agent's input. `<agent>` matches window name or repo/branch.
 - `fleet mode <agent>` — cycle that agent's permission mode one step. Only for

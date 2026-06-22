@@ -541,7 +541,7 @@ cmd_new() {
 
   local root; root=$(fleet_root) || die "not inside tmux"
   local sess; sess=$(session_name) || die "not inside tmux"
-  local dir wname repo_base=""
+  local dir wname repo_base="" docs=""
 
   if [ "$scratch" = 1 ]; then
     # repo-less scratch agent: no repo, no branch, no worktree. Always a plain
@@ -550,6 +550,10 @@ cmd_new() {
     bare=1
     dir="$root"
     wname=$(scratch_wname "$sess" "${repo:-scratch}")
+    # Repo-less, so no worktree/info-exclude — give it a sane scratch-docs dir
+    # under the shared root anyway, so $FLEET_DOCS is always a real dir.
+    docs="$root/.fleet/notes/scratch/${repo:-scratch}"
+    mkdir -p "$docs" 2>/dev/null || true
   else
     [ -n "$repo" ] && [ -n "$branch" ] || die "usage: fleet new <repo> <branch> [-p prompt] [--bare] [--switch|-s] [--base branch] [--harness|-h name] [--mode default|acceptEdits|plan|auto|bypassPermissions]  (or: fleet new --scratch [label] for a repo-less agent)"
     repo_base=$(resolve_repo "$root" "$repo") || die "repo '$repo' not found under $root"
@@ -600,6 +604,21 @@ cmd_new() {
       fi
     fi
     wname="$(basename "$repo_base")/$branchdir"
+    # Per-branch scratch-docs dir, present before the agent starts. mkdir is
+    # idempotent across reuse of an existing worktree.
+    docs="$dir/.fleet/notes"
+    mkdir -p "$docs" 2>/dev/null || true
+    # Git-invisibility WITHOUT a tracked .gitignore or any commit: append an
+    # anchored '/.fleet/' to the repo's COMMON exclude (shared by every worktree,
+    # never committed). Also hides the existing ready/devport/roles markers. The
+    # common-dir is relative to $dir under -C, so absolutise it before use.
+    local _common; _common=$(git -C "$dir" rev-parse --git-common-dir 2>/dev/null)
+    if [ -n "$_common" ]; then
+      case "$_common" in /*) ;; *) _common="$dir/$_common" ;; esac
+      mkdir -p "$_common/info" 2>/dev/null || true
+      local _excl="$_common/info/exclude"
+      grep -qxF '/.fleet/' "$_excl" 2>/dev/null || printf '/.fleet/\n' >>"$_excl" 2>/dev/null || true
+    fi
   fi
 
   local hbin
@@ -647,14 +666,14 @@ cmd_new() {
       #              new-window. Exact-match (=$hidden) so fnmatch can't mis-target.
       if tmux has-session -t "=$hidden" 2>/dev/null; then
         win_id=$(tmux new-window -d -P -F '#{window_id}' -t "=$hidden" -n "$wname" -c "$dir" \
-          -e FLEET_ROLE=worker "${argv[@]}" 2>/dev/null)
+          -e FLEET_ROLE=worker -e FLEET_DOCS="$docs" "${argv[@]}" 2>/dev/null)
         [ -n "$win_id" ] || win_id=$(tmux new-session -d -P -F '#{window_id}' -s "$hidden" -n "$wname" -c "$dir" \
-          -e FLEET_ROLE=worker "${argv[@]}" 2>/dev/null)
+          -e FLEET_ROLE=worker -e FLEET_DOCS="$docs" "${argv[@]}" 2>/dev/null)
       else
         win_id=$(tmux new-session -d -P -F '#{window_id}' -s "$hidden" -n "$wname" -c "$dir" \
-          -e FLEET_ROLE=worker "${argv[@]}" 2>/dev/null)
+          -e FLEET_ROLE=worker -e FLEET_DOCS="$docs" "${argv[@]}" 2>/dev/null)
         [ -n "$win_id" ] || win_id=$(tmux new-window -d -P -F '#{window_id}' -t "=$hidden" -n "$wname" -c "$dir" \
-          -e FLEET_ROLE=worker "${argv[@]}" 2>/dev/null)
+          -e FLEET_ROLE=worker -e FLEET_DOCS="$docs" "${argv[@]}" 2>/dev/null)
       fi
       # Mirror @fleet_root onto the hidden session (idempotent) so `fleet`
       # sub-commands run from INSIDE a scratch agent resolve the project root.
@@ -665,7 +684,7 @@ cmd_new() {
       tmux set -t "$hidden" @fleet_root "$root" 2>/dev/null || true
     else
       win_id=$(tmux new-window -d -P -F '#{window_id}' -t "$sess" -n "$wname" -c "$dir" \
-        -e FLEET_ROLE=worker "${argv[@]}")
+        -e FLEET_ROLE=worker -e FLEET_DOCS="$docs" "${argv[@]}")
     fi
   else
     # nvim pane: claude autostarts via claudecode.nvim; other harnesses open in a
@@ -673,7 +692,7 @@ cmd_new() {
     local nsock="$RUNTIME_DIR/fleet/nvim-$(date +%s%N).sock"
     mkdir -p "$RUNTIME_DIR/fleet"
     win_id=$(tmux new-window -d -P -F '#{window_id}' -t "$sess" -n "$wname" -c "$dir" \
-      -e FLEET_ROLE=worker \
+      -e FLEET_ROLE=worker -e FLEET_DOCS="$docs" \
       -e FLEET_AUTOCLAUDE="$([ "$H_NVIM_PLUGIN" = 1 ] && echo 1 || echo 0)" \
       -e FLEET_HARNESS="$H_NAME" -e FLEET_HARNESS_BIN="$hbin${H_ARGS:+ $H_ARGS}" \
       -e FLEET_TERM_MATCH="$H_TERM_MATCH" -e FLEET_PROMPT="$prompt" \
@@ -1521,6 +1540,7 @@ cmd_reap() { # reap [<target>] [--force] — remove worktrees flagged ready
     esac
   done
   local sess; sess=$(session_name) || die "not inside a fleet session"
+  local root; root=$(fleet_root 2>/dev/null)   # archive target for scratch-docs (fail-silent if empty)
   local f; f=$(agents_file "$sess")
   [ -f "$f" ] || { echo "no saved agents for this session"; return 0; }
   local lines; lines=$(cat "$f" 2>/dev/null)   # snapshot: cmd_forget mutates $f
@@ -1563,7 +1583,18 @@ cmd_reap() { # reap [<target>] [--force] — remove worktrees flagged ready
                       | awk -F'\t' -v d="$dir" '$1==d{print $2; exit}')
     [ -n "$win" ] && tmux kill-window -t "$win" 2>/dev/null
     cmd_forget "$dir"
-    rm -f "$dir/.fleet/ready" 2>/dev/null; rmdir "$dir/.fleet" 2>/dev/null || true  # else it blocks remove
+    # Archive a non-empty scratch-docs dir out to <root>/.fleet/notes/archive/ so
+    # the worker's research/plan markdown survives the reap. Fully fail-silent —
+    # must NEVER block removal; on any failure we just fall through and remove.
+    # The move also empties .fleet/notes so the rmdir .fleet path below still works.
+    if [ -n "$root" ] && [ -d "$dir/.fleet/notes" ] && [ -n "$(ls -A "$dir/.fleet/notes" 2>/dev/null)" ]; then
+      local ts; ts=$(date +%s 2>/dev/null)
+      local arch="$root/.fleet/notes/archive/${repo:-repo}__${branch//\//_}__${ts}"
+      mkdir -p "$root/.fleet/notes/archive" 2>/dev/null \
+        && mv "$dir/.fleet/notes" "$arch" 2>/dev/null \
+        && echo "archived $lbl notes -> $arch" || true
+    fi
+    rm -f "$dir/.fleet/ready" 2>/dev/null; rmdir "$dir/.fleet/notes" "$dir/.fleet" 2>/dev/null || true  # else it blocks remove
     local main; main=$(git -C "$dir" worktree list --porcelain 2>/dev/null | awk '/^worktree /{print $2; exit}')
     local rmflag=""; [ "$force" = 1 ] && rmflag="--force"
     if git -C "${main:-$dir}" worktree remove $rmflag "$dir" 2>/dev/null; then
