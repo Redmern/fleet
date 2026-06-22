@@ -209,8 +209,25 @@ PY
 }
 
 cmd_ls() {
+  # By default, scope the listing to the CURRENT project: keep rows whose
+  # session (field 3) is this session or its parked-scratch sibling
+  # "<sess>_hidden". `--all`/`-a` restores the full server-wide listing.
+  # Scoping lives HERE (display only) — agents_tsv stays global so send/pick/
+  # watch/dashboard callers keep the full list.
+  local all=0
+  case "${1:-}" in --all|-a) all=1 ;; esac
+
   local out; out=$(agents_tsv)
   [ -n "$out" ] || { echo "no agents registered"; return 0; }
+
+  # Scope unless --all. session_name failing/empty (not inside tmux) → can't
+  # scope, so fall through to the global listing.
+  local sess
+  if [ "$all" -eq 0 ] && sess=$(session_name 2>/dev/null) && [ -n "$sess" ]; then
+    out=$(echo "$out" | awk -F'\t' -v s="$sess" '$3==s || $3==s"_hidden"')
+    [ -n "$out" ] || { echo "no agents in this project"; return 0; }
+  fi
+
   printf 'STATE\tAGENT\tWINDOW\tIN-STATE\n'
   # $9 is the "ready for deletion" flag (reason text, or empty). When set, show
   # the state as "done" — but only when the agent is not actively live: a stale or
@@ -2692,7 +2709,7 @@ fleet — agent fleet manager (tmux + nvim + Claude Code)
   fleet restore          respawn saved agents from a previous session
   fleet new <repo> <br>  spawn agent (worktree + window + claude) [-p prompt] [--bare] [--switch|-s] [--base br] [-h harness]
   fleet new --scratch    spawn a repo-less agent (no repo/branch/worktree) [label] [-p prompt] [-h harness]
-  fleet ls               list agents and states
+  fleet ls               list THIS project's agents and states (--all|-a = every project on the server)
   fleet pick             fzf jump-to-agent
   fleet send <a> "msg"   send message to an agent's claude
   fleet ready [a] [-m r]  flag a worktree done/ready for deletion (no arg = the one you're in) [--clear]
