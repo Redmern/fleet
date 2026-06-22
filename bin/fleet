@@ -349,10 +349,11 @@ scratch_wname() { # <sess> <label> -> a window name not already open in the sess
   printf '%s' "$name"
 }
 
-persist_agent() { # session dir repo branch bare base harness
+persist_agent() { # session dir repo branch bare base harness [self_merge]
   local sess="$1" f; f=$(agents_file "$sess"); mkdir -p "$(dirname "$f")" 2>/dev/null
   [ -f "$f" ] && { awk -F'\t' -v d="$2" '$1!=d' "$f" >"$f.tmp" 2>/dev/null && mv "$f.tmp" "$f"; }
-  printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$2" "$3" "$4" "$5" "$6" "${7:-claude}" >>"$f"
+  # Trailing self_merge field is optional: legacy 6-field lines read back as "0".
+  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$2" "$3" "$4" "$5" "$6" "${7:-claude}" "${8:-0}" >>"$f"
 }
 
 cmd_forget() { # forget <dir> — drop a saved agent (called by the dashboard on teardown)
@@ -505,13 +506,14 @@ cmd_restore() { # respawn saved agents whose windows are gone
   # unlike pane cwd which the dashboard/other panes can share.
   local openwins; openwins=$(tmux list-windows -t "$sess" -F '#{window_name}' 2>/dev/null)
   local dir repo branch bare base harness n=0
-  while IFS=$'\t' read -r dir repo branch bare base harness; do
+  while IFS=$'\t' read -r dir repo branch bare base harness self_merge; do
     [ -n "$dir" ] && [ -n "$repo" ] && [ -n "$branch" ] || continue
     printf '%s\n' "$openwins" | grep -qxF "$repo/${branch//\//_}" && continue   # already running
     local args=("$repo" "$branch")
     [ "$bare" = 1 ] && args+=(--bare)
     [ -n "$base" ] && args+=(--base "$base")
     [ -n "$harness" ] && args+=(--harness "$harness")
+    [ "$self_merge" = 1 ] && args+=(--self-merge)   # preserve the merge/push grant across restore
     echo "restoring $repo/$branch..."
     cmd_new "${args[@]}" >/dev/null 2>&1 && n=$((n+1))
   done < "$f"
@@ -521,7 +523,7 @@ cmd_restore() { # respawn saved agents whose windows are gone
 # ---- new ----------------------------------------------------------------------
 
 cmd_new() {
-  local repo="" branch="" prompt="" bare=0 base="" harness="" scratch=0 switch=0 mode=""
+  local repo="" branch="" prompt="" bare=0 base="" harness="" scratch=0 switch=0 mode="" self_merge=0
   while [ $# -gt 0 ]; do
     case "$1" in
       -p) prompt="$2"; shift 2 ;;
@@ -530,6 +532,7 @@ cmd_new() {
       --switch|-s) switch=1; shift ;;
       --base) base="$2"; shift 2 ;;
       --harness|-h) harness="$2"; shift 2 ;;
+      --self-merge) self_merge=1; shift ;;   # grant this worker merge/push rights (fleet-guard allows it via FLEET_SELF_MERGE=1)
       --mode) mode="$2"; shift 2 ;;   # override start --permission-mode (e.g. bypassPermissions) — not reachable via Shift+Tab
       -*) die "unknown flag $1" ;;
       *) if [ -z "$repo" ]; then repo="$1"; elif [ -z "$branch" ]; then branch="$1"; else die "extra arg $1"; fi; shift ;;
@@ -555,7 +558,7 @@ cmd_new() {
     docs="$root/.fleet/notes/scratch/${repo:-scratch}"
     mkdir -p "$docs" 2>/dev/null || true
   else
-    [ -n "$repo" ] && [ -n "$branch" ] || die "usage: fleet new <repo> <branch> [-p prompt] [--bare] [--switch|-s] [--base branch] [--harness|-h name] [--mode default|acceptEdits|plan|auto|bypassPermissions]  (or: fleet new --scratch [label] for a repo-less agent)"
+    [ -n "$repo" ] && [ -n "$branch" ] || die "usage: fleet new <repo> <branch> [-p prompt] [--bare] [--switch|-s] [--base branch] [--harness|-h name] [--self-merge] [--mode default|acceptEdits|plan|auto|bypassPermissions]  (or: fleet new --scratch [label] for a repo-less agent)"
     repo_base=$(resolve_repo "$root" "$repo") || die "repo '$repo' not found under $root"
     local branchdir="${branch//\//_}" anchor=""
     local is_bare_repo; is_bare_repo=$(git -C "$repo_base" rev-parse --is-bare-repository 2>/dev/null)
@@ -666,14 +669,14 @@ cmd_new() {
       #              new-window. Exact-match (=$hidden) so fnmatch can't mis-target.
       if tmux has-session -t "=$hidden" 2>/dev/null; then
         win_id=$(tmux new-window -d -P -F '#{window_id}' -t "=$hidden" -n "$wname" -c "$dir" \
-          -e FLEET_ROLE=worker -e FLEET_DOCS="$docs" "${argv[@]}" 2>/dev/null)
+          -e FLEET_ROLE=worker -e FLEET_DOCS="$docs" -e FLEET_SELF_MERGE="$self_merge" "${argv[@]}" 2>/dev/null)
         [ -n "$win_id" ] || win_id=$(tmux new-session -d -P -F '#{window_id}' -s "$hidden" -n "$wname" -c "$dir" \
-          -e FLEET_ROLE=worker -e FLEET_DOCS="$docs" "${argv[@]}" 2>/dev/null)
+          -e FLEET_ROLE=worker -e FLEET_DOCS="$docs" -e FLEET_SELF_MERGE="$self_merge" "${argv[@]}" 2>/dev/null)
       else
         win_id=$(tmux new-session -d -P -F '#{window_id}' -s "$hidden" -n "$wname" -c "$dir" \
-          -e FLEET_ROLE=worker -e FLEET_DOCS="$docs" "${argv[@]}" 2>/dev/null)
+          -e FLEET_ROLE=worker -e FLEET_DOCS="$docs" -e FLEET_SELF_MERGE="$self_merge" "${argv[@]}" 2>/dev/null)
         [ -n "$win_id" ] || win_id=$(tmux new-window -d -P -F '#{window_id}' -t "=$hidden" -n "$wname" -c "$dir" \
-          -e FLEET_ROLE=worker -e FLEET_DOCS="$docs" "${argv[@]}" 2>/dev/null)
+          -e FLEET_ROLE=worker -e FLEET_DOCS="$docs" -e FLEET_SELF_MERGE="$self_merge" "${argv[@]}" 2>/dev/null)
       fi
       # Mirror @fleet_root onto the hidden session (idempotent) so `fleet`
       # sub-commands run from INSIDE a scratch agent resolve the project root.
@@ -684,7 +687,7 @@ cmd_new() {
       tmux set -t "$hidden" @fleet_root "$root" 2>/dev/null || true
     else
       win_id=$(tmux new-window -d -P -F '#{window_id}' -t "$sess" -n "$wname" -c "$dir" \
-        -e FLEET_ROLE=worker -e FLEET_DOCS="$docs" "${argv[@]}")
+        -e FLEET_ROLE=worker -e FLEET_DOCS="$docs" -e FLEET_SELF_MERGE="$self_merge" "${argv[@]}")
     fi
   else
     # nvim pane: claude autostarts via claudecode.nvim; other harnesses open in a
@@ -692,7 +695,7 @@ cmd_new() {
     local nsock="$RUNTIME_DIR/fleet/nvim-$(date +%s%N).sock"
     mkdir -p "$RUNTIME_DIR/fleet"
     win_id=$(tmux new-window -d -P -F '#{window_id}' -t "$sess" -n "$wname" -c "$dir" \
-      -e FLEET_ROLE=worker -e FLEET_DOCS="$docs" \
+      -e FLEET_ROLE=worker -e FLEET_DOCS="$docs" -e FLEET_SELF_MERGE="$self_merge" \
       -e FLEET_AUTOCLAUDE="$([ "$H_NVIM_PLUGIN" = 1 ] && echo 1 || echo 0)" \
       -e FLEET_HARNESS="$H_NAME" -e FLEET_HARNESS_BIN="$hbin${H_ARGS:+ $H_ARGS}" \
       -e FLEET_TERM_MATCH="$H_TERM_MATCH" -e FLEET_PROMPT="$prompt" \
@@ -734,7 +737,7 @@ cmd_new() {
     tmux select-window -t "$win_id" 2>/dev/null || true
   fi
   # scratch agents are repo-less + ephemeral — nothing to restore, so don't persist.
-  [ "$scratch" = 1 ] || persist_agent "$sess" "$dir" "$(basename "$repo_base")" "$branch" "$bare" "$base" "$H_NAME"
+  [ "$scratch" = 1 ] || persist_agent "$sess" "$dir" "$(basename "$repo_base")" "$branch" "$bare" "$base" "$H_NAME" "$self_merge"
   sync_main_tiles "$sess" 2>/dev/null || true
 }
 
@@ -2849,7 +2852,7 @@ fleet — agent fleet manager (tmux + nvim + Claude Code)
   fleet up [name|path]   boot project session + daemon + command center (auto-restores saved agents; --no-restore for main only, --tmuxinator to load a same-named tmuxinator layout)
   fleet save [name]      save the current session as a reusable project alias (fleet up <name>)
   fleet restore          respawn saved agents from a previous session
-  fleet new <repo> <br>  spawn agent (worktree + window + claude) [-p prompt] [--bare] [--switch|-s] [--base br] [-h harness]
+  fleet new <repo> <br>  spawn agent (worktree + window + claude) [-p prompt] [--bare] [--switch|-s] [--base br] [-h harness] [--self-merge]
   fleet new --scratch    spawn a repo-less agent (no repo/branch/worktree) [label] [-p prompt] [-h harness]
   fleet ls               list THIS project's agents and states (--all|-a = every project on the server)
   fleet pick             fzf jump-to-agent

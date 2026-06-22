@@ -44,7 +44,10 @@ def deny(reason):
 # Scan every git invocation in the command (split on shell separators) and find
 # its subcommand, skipping global options like `-C <path>` / `-c k=v`. If a worker
 # tries `git merge` or `git push`, hard-deny. Fail-open on anything ambiguous.
-if tool == "Bash" and role == "worker":
+# Opt-out: a worker spawned with `fleet new --self-merge` carries
+# FLEET_SELF_MERGE=1 and is exempt — the orchestrator explicitly granted it
+# merge/push rights for that branch.
+if tool == "Bash" and role == "worker" and os.environ.get("FLEET_SELF_MERGE") != "1":
     cmd = str((h.get("tool_input") or {}).get("command") or "")
     for seg in re.split(r"&&|\|\||;|\n|\|", cmd):
         toks = seg.split()

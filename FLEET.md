@@ -9,12 +9,14 @@ this project with the `fleet` CLI.
 > agent-neutral. Capabilities only some harnesses support are noted inline.
 
 - `fleet ls` — list THIS project's agents: state (working/blocked/idle), repo/branch, window. `--all`/`-a` lists every project on the server.
-- `fleet new <repo> <branch> [-p "task"] [--bare] [--base <branch>] [--harness|-h <name>]`
+- `fleet new <repo> <branch> [-p "task"] [--bare] [--base <branch>] [--harness|-h <name>] [--self-merge]`
   — spawn an agent: creates a git worktree for `<branch>` if needed, opens a tmux
   window (editor + agent split by default, `--bare` for a plain agent pane), and
   seeds it with the `-p` prompt. `<repo>` is a repo name/alias in this project
   root. `--harness` (alias `-h`) picks the agent CLI (`claude` default, or `omp`,
-  …; see `fleet harnesses`).
+  …; see `fleet harnesses`). By default a worker may **not** `git merge`/`git push`
+  (fleet-guard blocks it — you review the diff and integrate); pass `--self-merge`
+  to grant *that* worker merge/push rights for its branch.
 - `fleet new --scratch [label] [-p "task"] [--harness|-h <name>]` — spawn a
   **repo-less** agent: no repo, branch, or worktree, just a plain agent pane at
   the project root. `[label]` names the window (default `scratch`). Use for
