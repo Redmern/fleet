@@ -2026,26 +2026,24 @@ cmd_dash_inbox() {
 # window in one shot. Session-relative — run via a prefix keybind/menu, so
 # session_name() resolves to the client that triggered it. Does NOT stop fleetd
 # (it's the shared daemon) and does NOT delete the saved-agents file (kept so
-# `fleet up --restore` can rebuild this session later). If a client is attached
-# to the session we're about to kill, move it to another tmux session first (or
-# detach) so tmux doesn't drop the client abruptly. Fail-silent throughout.
+# `fleet up --restore` can rebuild this session later).
+#
+# Quit means LEAVE: we DETACH the attached client(s) before the kill rather than
+# switch-client into another tmux session. The user routinely runs several fleet
+# sessions at once (pc/techweb2/webshop); silently hopping the client into a
+# different fleet session on quit reads as "fleet didn't quit — it just moved me
+# somewhere else". Detaching drops the client back to the shell, an unambiguous
+# "this session is gone". Detaching first (before the kill) also keeps the old
+# safety: tmux never drops the client abruptly out from under a killed session.
+# Kill both $sess and ${sess}_hidden so the parked scratch session never lingers.
+# Fail-silent throughout.
 cmd_quit() {
   local sess; sess=$(session_name 2>/dev/null) || exit 0
   [ -n "$sess" ] || exit 0
-  # hop the attached client elsewhere before the kill (switch if another session
-  # exists, else detach); ignore failures — the kill is what matters.
-  # Exclude *_hidden from the hop target: switching the client into the bare hidden
-  # session (no main/dash) then killing only $sess would orphan it + its scratch
-  # agents. So skip _hidden sessions when picking `other`, AND kill ${sess}_hidden
-  # alongside $sess so teardown never leaves the parked session behind.
-  local other
-  other=$(tmux list-sessions -F '#{session_name}' 2>/dev/null \
-            | grep -vxF "$sess" | grep -v '_hidden$' | head -1)
-  if [ -n "$other" ]; then
-    tmux switch-client -t "$other" 2>/dev/null || true
-  else
-    tmux detach-client -s "$sess" 2>/dev/null || true
-  fi
+  # Detach any client attached to this session (and its _hidden sibling) BEFORE
+  # the kill, so the client lands at the shell instead of being orphaned.
+  tmux detach-client -s "$sess" 2>/dev/null || true
+  tmux detach-client -s "${sess}_hidden" 2>/dev/null || true
   tmux kill-session -t "=${sess}_hidden" 2>/dev/null || true
   tmux kill-session -t "$sess" 2>/dev/null || true
   exit 0
@@ -2125,6 +2123,17 @@ inject_status_format() { # append agent glyph to window-status formats.
   case "$fmt" in
     *@fleet_inbox*) ;;
     *) [ -n "$fmt" ] && tmux set -g status-right "#{?@fleet_inbox,#{@fleet_inbox} ,}$fmt" ;;
+  esac
+  # Fleet session marker: prepend a fleet glyph (󰭹, same as the menu title) to
+  # the far LEFT of the GLOBAL status-left, gated on the per-session @fleet_root
+  # option. status-left is a global option, but the #{?@fleet_root,...} test
+  # evaluates per-session, so the icon shows ONLY on fleet sessions (which carry
+  # @fleet_root, set by `fleet up`) and NOT on plain tmux sessions. The session
+  # pill stays after it. Substring-guarded so repeated injects don't stack it.
+  fmt=$(tmux show -g -v status-left 2>/dev/null)
+  case "$fmt" in
+    *@fleet_root*) ;;
+    *) tmux set -g status-left "#{?@fleet_root,󰭹 ,}$fmt" ;;
   esac
 }
 
