@@ -2184,7 +2184,7 @@ keybind_for() { # keybind_for <action> → key (config override or default)
 action_tmux_command() { # tmux command string run when an action's key is pressed
   local action="$1" self="$FLEET_DIR/bin/fleet"
   case "$action" in
-    menu) echo "display-popup -E -b rounded -w 64% -h 80% '$self menu'" ;;
+    menu) echo "run-shell -b '$self menu-popup'" ;;   # measures then opens a fit-to-content popup
     pick) echo "display-popup -E -b rounded -w 80% -h 60% '$self pick'" ;;
     new)  echo "command-prompt -p 'fleet new (repo branch):' \"run-shell '$self new %%'\"" ;;
     save) echo "command-prompt -p 'fleet save (name, blank=session):' \"run-shell '$self save %%'\"" ;;
@@ -2259,6 +2259,32 @@ action_for_key() { # action_for_key <key> — selectable (non-hidden) action bou
     [ "$(keybind_for "$action")" = "$k" ] && { printf '%s' "$action"; return 0; }
   done < <(fleet_actions)
   return 1
+}
+
+cmd_menu_popup() { # measure leader_grid, then open `fleet menu` as a popup sized
+  # to hug the grid (width = longest visible line, height = line count) instead
+  # of the fixed 64%x80%. Fail-silent: any measurement hiccup falls back to the
+  # old proportional size so the binding never breaks.
+  local self="$FLEET_DIR/bin/fleet" grid line w cols=0 rows=0 cw ch
+  grid=$(leader_grid 2>/dev/null) || grid=""
+  if [ -n "$grid" ]; then
+    # strip SGR/CSI escapes so width counts visible glyphs only; ${#line} is
+    # char-aware in this UTF-8 locale (nerd-font group glyphs count as width 1).
+    while IFS= read -r line || [ -n "$line" ]; do
+      rows=$(( rows + 1 )); w=${#line}; (( w > cols )) && cols=$w
+    done < <(printf '%s' "$grid" | sed -E 's/\x1b\[[0-9;]*m//g' 2>/dev/null)
+  fi
+  if (( cols == 0 || rows == 0 )); then    # measurement failed → old fixed frame
+    tmux display-popup -E -b rounded -w 64% -h 80% "$self menu" 2>/dev/null
+    return 0
+  fi
+  cols=$(( cols + 4 )); rows=$(( rows + 2 ))   # rounded border + breathing room
+  # clamp to the client so a tiny window never gets an oversized popup
+  cw=$(tmux display -p '#{client_width}' 2>/dev/null)
+  ch=$(tmux display -p '#{client_height}' 2>/dev/null)
+  [[ "$cw" =~ ^[0-9]+$ ]] && (( cols > cw - 2 )) && cols=$(( cw - 2 ))
+  [[ "$ch" =~ ^[0-9]+$ ]] && (( rows > ch - 2 )) && rows=$(( ch - 2 ))
+  tmux display-popup -E -b rounded -w "$cols" -h "$rows" "$self menu" 2>/dev/null
 }
 
 cmd_menu() {
@@ -2925,6 +2951,7 @@ case "${1:-}" in
   sessions|switch) shift; cmd_sessions "$@" ;;        # fzf switcher over open fleet sessions
   quit)       shift; cmd_quit "$@" ;;                 # tear down THIS fleet session
   menu)       shift; cmd_menu "$@" ;;
+  menu-popup) shift; cmd_menu_popup "$@" ;;           # internal: fit-to-content frame for the leader menu
   keys)       shift; cmd_keys "$@" ;;
   rebind)     shift; cmd_rebind "$@" ;;
   rebind-set) shift; cmd_rebind_set "$@" ;;

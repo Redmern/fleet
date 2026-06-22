@@ -1173,7 +1173,7 @@ while :; do
       # Bare Space is free inside this TUI loop (it never types text), so this
       # needs NO tmux root binding — nvim/claude/shell Space stays untouched.
       # The same popup as prefix+Space; it schedules its own action on close.
-      tmux display-popup -E -b rounded -w 64% -h 80% "$FLEET_BIN menu" 2>/dev/null
+      "$FLEET_BIN" menu-popup 2>/dev/null   # fit-to-content frame; blocks until the popup closes
       clear; status="" ;;
     i)             # toggle inbox/agents view (also the key prefix+i sends in)
       if [ "$MODE" = inbox ]; then MODE=agents; load_rows
