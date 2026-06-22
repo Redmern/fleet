@@ -345,13 +345,19 @@ class Fleet:
             tmux("set", "-g", "status-right", "#{?@fleet_inbox,#{@fleet_inbox} ,}" + fmt)
         # Mirror the status-left fleet icon (inject_status_format in `bin/fleet`).
         # Theme switches wipe status-left too; re-inject the @fleet_root-gated
-        # glyph (󰭹) so the marker survives a theme switch until the next
-        # `fleet up`. Same idempotent substring guard so the glyph never stacks.
+        # ship ( nf-fa-ship U+F21A) INSIDE the session-name pill, right before
+        # #S, so the marker survives a theme switch until the next `fleet up`.
+        # Idempotent: skip if the ship is already present; strip any legacy
+        # outside-the-pill 󰭹 prepend; fail-silent if #S is absent.
+        ship = ""  # nf-fa-ship U+F21A
         left = tmux("show", "-g", "-v", "status-left")
         if left is not None:
             left = left.rstrip("\n")
-            if "@fleet_root" not in left:
-                tmux("set", "-g", "status-left", "#{?@fleet_root,\U000f0b79 ,}" + left)
+            new = left.replace("#{?@fleet_root,\U000f0b79 ,}", "")  # drop legacy prepend
+            if ship not in new and "#S" in new:
+                new = new.replace("#S", "#{?@fleet_root," + ship + " ,}#S", 1)
+            if new != left:
+                tmux("set", "-g", "status-left", new)
 
     # ---- queries -----------------------------------------------------------
 

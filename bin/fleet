@@ -2127,17 +2127,27 @@ inject_status_format() { # append agent glyph to window-status formats.
     *@fleet_inbox*) ;;
     *) [ -n "$fmt" ] && tmux set -g status-right "#{?@fleet_inbox,#{@fleet_inbox} ,}$fmt" ;;
   esac
-  # Fleet session marker: prepend a fleet glyph (󰭹, same as the menu title) to
-  # the far LEFT of the GLOBAL status-left, gated on the per-session @fleet_root
-  # option. status-left is a global option, but the #{?@fleet_root,...} test
-  # evaluates per-session, so the icon shows ONLY on fleet sessions (which carry
-  # @fleet_root, set by `fleet up`) and NOT on plain tmux sessions. The session
-  # pill stays after it. Substring-guarded so repeated injects don't stack it.
+  # Fleet session marker: inject a ship glyph ( nf-fa-ship U+F21A — "a fleet of
+  # ships") INSIDE the session-name pill, immediately before the #S token, gated
+  # per-session on @fleet_root. status-left is a global option, but the
+  # #{?@fleet_root,...} test evaluates per-session, so the ship shows ONLY on
+  # fleet sessions (which carry @fleet_root, set by `fleet up`) and NOT on plain
+  # tmux sessions — rendering as ' <name>' within the pill's colored background.
+  # Idempotent: skips if the ship is already present. Strips any legacy
+  # outside-the-pill 󰭹 prepend first so no stray glyph lingers left of the pill.
+  # If #S isn't found, leaves status-left untouched (fail-silent).
+  local ship; ship=$(printf '\U0000f21a')   # nf-fa-ship U+F21A
   fmt=$(tmux show -g -v status-left 2>/dev/null)
-  case "$fmt" in
-    *@fleet_root*) ;;
-    *) tmux set -g status-left "#{?@fleet_root,󰭹 ,}$fmt" ;;
-  esac
+  if [ -n "$fmt" ]; then
+    local newfmt="$fmt"
+    newfmt=${newfmt/#\#\{?@fleet_root,󰭹 ,\}/}
+    case "$newfmt" in
+      *"$ship"*) ;;                                  # ship already inside pill
+      *'#S'*) local inj="#{?@fleet_root,$ship ,}#S"; newfmt=${newfmt/'#S'/$inj} ;;
+      *) ;;                                          # no #S token — fail-silent
+    esac
+    [ "$newfmt" != "$fmt" ] && tmux set -g status-left "$newfmt"
+  fi
 }
 
 # ---- keybinds -----------------------------------------------------------------
