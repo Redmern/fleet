@@ -1,19 +1,28 @@
 #!/bin/sh
-# fleet-guard — Claude Code PreToolUse hook. Asks (or denies) before edits to
-# protected paths (tests, CI configs, lockfiles) so agents can't quietly delete
-# tests or rewrite CI to make things pass. Opt-in: no-op unless `fleet guard on`
-# created the enable marker. Fail-silent and fast — on any doubt, allow.
+# fleet-guard — Claude Code PreToolUse hook. Two protections:
+#  (1) ALWAYS-ON: a worker agent (FLEET_ROLE=worker) may not `git merge` or
+#      `git push`. Integration is the ORCHESTRATOR's job — it reviews returned
+#      diffs and merges/pushes. A worker that self-merges into main bypasses
+#      review (and worktree isolation only stops it from *checking out* main, not
+#      from `git push . HEAD:main` or merging via another worktree). This block is
+#      independent of the opt-in marker below.
+#  (2) OPT-IN (`fleet guard on`): ask/deny before edits to protected paths
+#      (tests, CI configs, lockfiles) so agents can't quietly delete tests or
+#      rewrite CI to make things pass.
+# Fail-silent and fast — on any doubt, allow.
 set -eu
 
 CFG="${XDG_CONFIG_HOME:-$HOME/.config}/fleet"
-[ -f "$CFG/guard-on" ] || exit 0           # disabled → allow everything
 command -v python3 >/dev/null 2>&1 || exit 0
 
 in="$(cat 2>/dev/null || true)"
 [ -n "$in" ] || exit 0
 
-FLEET_GUARD_INPUT="$in" FLEET_GUARD_CFG="$CFG" python3 - <<'PY' || exit 0
-import json, os, fnmatch, sys
+# The guard-on marker gates protection (2) only; protection (1) is always active.
+GUARD_ON=0; [ -f "$CFG/guard-on" ] && GUARD_ON=1
+
+FLEET_GUARD_INPUT="$in" FLEET_GUARD_CFG="$CFG" FLEET_GUARD_ON="$GUARD_ON" python3 - <<'PY' || exit 0
+import json, os, fnmatch, sys, re
 
 try:
     h = json.loads(os.environ["FLEET_GUARD_INPUT"])
@@ -21,6 +30,42 @@ except Exception:
     sys.exit(0)
 
 tool = str(h.get("tool_name") or "")
+role = os.environ.get("FLEET_ROLE", "")
+
+def deny(reason):
+    print(json.dumps({"hookSpecificOutput": {
+        "hookEventName": "PreToolUse",
+        "permissionDecision": "deny",
+        "permissionDecisionReason": reason,
+    }}))
+    sys.exit(0)
+
+# --- (1) ALWAYS-ON: workers must not merge or push -------------------------------
+# Scan every git invocation in the command (split on shell separators) and find
+# its subcommand, skipping global options like `-C <path>` / `-c k=v`. If a worker
+# tries `git merge` or `git push`, hard-deny. Fail-open on anything ambiguous.
+if tool == "Bash" and role == "worker":
+    cmd = str((h.get("tool_input") or {}).get("command") or "")
+    for seg in re.split(r"&&|\|\||;|\n|\|", cmd):
+        toks = seg.split()
+        if "git" not in toks:
+            continue
+        i = toks.index("git")
+        j = i + 1
+        while j < len(toks) and toks[j].startswith("-"):   # skip git global opts
+            if toks[j] in ("-C", "-c") and j + 1 < len(toks):
+                j += 2
+            else:
+                j += 1
+        sub = toks[j] if j < len(toks) else ""
+        if sub in ("merge", "push"):
+            deny("fleet-guard: workers must not run 'git %s'. Integration is the "
+                 "orchestrator's job — it reviews your diff and merges/pushes. "
+                 "Commit on your own branch and run 'fleet ready' to signal done." % sub)
+
+# --- (2) OPT-IN: protected-path edits (tests / CI / lockfiles) -------------------
+if os.environ.get("FLEET_GUARD_ON") != "1":
+    sys.exit(0)
 if tool not in ("Edit", "Write", "MultiEdit", "NotebookEdit"):
     sys.exit(0)
 path = str((h.get("tool_input") or {}).get("file_path") or "")
@@ -64,7 +109,7 @@ def matches(pat, path, base):
     return fnmatch.fnmatch(path, pat) or fnmatch.fnmatch(base, pat) \
         or fnmatch.fnmatch(path, "*/" + pat)
 
-deny = False
+deny_flag = False
 hit = None
 # Evaluate ALL patterns, not just the first match: a user's bang-prefixed hard
 # deny must win over a built-in soft-ask regardless of list order. A hard deny is
@@ -75,7 +120,7 @@ for pat in patterns:
     p = pat[1:] if hard else pat
     if matches(p, path, base):
         if hard:
-            deny = True
+            deny_flag = True
             hit = p
             break
         if hit is None:
@@ -84,11 +129,11 @@ for pat in patterns:
 if hit is None:
     sys.exit(0)
 
-decision = "deny" if deny else "ask"
+decision = "deny" if deny_flag else "ask"
 reason = ("fleet-guard: %s is protected (%s). %s"
           % (base, hit,
              "Edit blocked — remove it from .fleet/protected to allow."
-             if deny else "Confirm this change is intended."))
+             if deny_flag else "Confirm this change is intended."))
 print(json.dumps({"hookSpecificOutput": {
     "hookEventName": "PreToolUse",
     "permissionDecision": decision,
