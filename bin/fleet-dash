@@ -34,8 +34,14 @@ CFG_PILL_MAX=8                              # cap pills/row (bound pathological 
 CFG_RAW=""; CFG_NP=0; CFG_TS=""             # cached pill string / count / timestamp
 CFG_LABEL="live"                            # row label ("live" for pc-tune, else "repos")
 
-sel=0                                     # selected row index
+sel=0                                     # selected row index (agents view)
 status=""                                 # transient status line
+MODE=agents                               # view: 'agents' (default) or 'inbox'
+isel=0                                    # selected row index (inbox view)
+IN=0                                      # inbox row count
+IROWS=()                                  # inbox rows: one .msg path each, newest-first
+ICUR=""                                   # cached .cursor value (unread = id > ICUR)
+IUNREAD=0                                 # unread count (for the inbox title)
 
 # --- terminal setup ----------------------------------------------------------
 # The loop runs load_rows+render between key reads; in cooked mode the tty echoes
@@ -342,6 +348,120 @@ load_rows() {
 
 field() { printf '%s' "${ROWS[$1]}" | cut -f"$2"; }  # field <rowidx> <col>
 
+# --- inbox data --------------------------------------------------------------
+# Live orchestrator inbox: <root>/.fleet/inbox/*.msg, newest-first (sort -r on the
+# filename = id). Header accessors mirror `fleet`'s exactly (scan only the
+# key=value region above the `--` separator) so a `--` inside the body can never
+# be mistaken for the header end.
+inbox_root() { printf '%s/.fleet/inbox' "$(dash_root)"; }
+ibx_field()  { sed -n "/^--$/q; s/^$2=//p" "$1" 2>/dev/null | head -1; }   # ibx_field <file> <key>
+ibx_body()   { sed -n '/^--$/,$p' "$1" 2>/dev/null | sed '1d'; }
+
+# Advance the durable read cursor MONOTONICALLY (max id wins), atomic tmp+mv —
+# same semantics as fleet's inbox_advance_cursor.
+ibx_advance_cursor() { # <dir> <id>
+  local dir="$1" id="$2" cur
+  [ -n "$id" ] || return 0
+  cur=$(cat "$dir/.cursor" 2>/dev/null)
+  if [ -z "$cur" ] || [ "$id" \> "$cur" ]; then
+    printf '%s\n' "$id" > "$dir/.cursor.tmp.$$" 2>/dev/null \
+      && mv -f "$dir/.cursor.tmp.$$" "$dir/.cursor" 2>/dev/null
+  fi
+}
+
+sev_color() { case "$1" in blocked) printf '\033[31m' ;; warn) printf '\033[33m' ;; *) printf '\033[2m' ;; esac; }
+
+fmt_age() { # seconds -> compact 5s/3m/2h/4d
+  local s="${1:-0}"; (( s < 0 )) && s=0
+  if   (( s < 60 ));    then printf '%ds' "$s"
+  elif (( s < 3600 ));  then printf '%dm' "$(( s / 60 ))"
+  elif (( s < 86400 )); then printf '%dh' "$(( s / 3600 ))"
+  else printf '%dd' "$(( s / 86400 ))"; fi
+}
+
+# IROWS[] entries: the .msg file path. Fields are read lazily per-row (like fleet).
+load_inbox() {
+  IROWS=(); IUNREAD=0
+  local dir f id; dir=$(inbox_root)
+  ICUR=$(cat "$dir/.cursor" 2>/dev/null)
+  if [ -d "$dir" ]; then
+    while IFS= read -r f; do
+      [ -e "$f" ] || continue
+      IROWS+=("$f"); id=$(basename "$f" .msg)
+      { [ -z "$ICUR" ] || [ "$id" \> "$ICUR" ]; } && (( IUNREAD++ ))
+    done < <(ls -1 "$dir"/*.msg 2>/dev/null | sort -r)
+  fi
+  IN=${#IROWS[@]}
+  (( IN == 0 )) && isel=0
+  (( isel >= IN )) && isel=$((IN - 1))
+  (( isel < 0 )) && isel=0
+}
+
+# Mode-aware navigation: act on the active view's index/count so the same j/k/g/G
+# (and the arrow keys, and drain_nav's coalescing) drive whichever view is up.
+nav_up()   { if [ "$MODE" = inbox ]; then (( isel > 0 )) && ((isel--)); else (( sel > 0 )) && ((sel--)); fi; }
+nav_down() { if [ "$MODE" = inbox ]; then (( isel < IN-1 )) && ((isel++)); else (( sel < N-1 )) && ((sel++)); fi; }
+nav_top()  { if [ "$MODE" = inbox ]; then isel=0; else sel=0; fi; }
+nav_bot()  { if [ "$MODE" = inbox ]; then (( IN > 0 )) && isel=$((IN - 1)); else (( N > 0 )) && sel=$((N - 1)); fi; }
+
+# Enter in inbox = POP the selected message to the orchestrator. Paste a source
+# header line + the body into the orchestrator's input WITHOUT submitting (no
+# Enter/C-m — the human reviews and sends). On success: mark read + archive (move
+# the .msg into archive/, advance .cursor to its id), which drops the unread badge
+# and removes it from the live list. The orchestrator pane is resolved via fleet's
+# is_main_pane helper (it is deliberately filtered out of agents_tsv). If it can't
+# be resolved, error and do nothing — never lose the message.
+inbox_pop() {
+  (( IN == 0 )) && { status="inbox empty"; return; }
+  local f="${IROWS[$isel]}" dir; dir=$(inbox_root)
+  local id from title disp body text orch
+  id=$(basename "$f" .msg)
+  from=$(ibx_field "$f" from); title=$(ibx_field "$f" title); disp=$(ibx_field "$f" dispatch)
+  text="From $from: $title"
+  [ -n "$disp" ] && [ "$disp" != "-" ] && text+="  ($disp)"
+  body=$(ibx_body "$f")
+  text+=$'\n'"$body"
+  orch=$("$FLEET_BIN" main-pane "$SESS" 2>/dev/null)
+  if [ -z "$orch" ]; then status="couldn't resolve orchestrator pane — nothing popped"; return; fi
+  tmux send-keys -t "$orch" -l -- "$text" 2>/dev/null \
+    || { status="paste failed — nothing changed"; return; }
+  mkdir -p "$dir/archive" 2>/dev/null
+  mv -f "$f" "$dir/archive/" 2>/dev/null
+  ibx_advance_cursor "$dir" "$id"
+  status="popped → orchestrator"
+}
+
+# J in inbox = JUMP to the message's source agent. 'from' is a window name at send
+# time; resolve it to a LIVE window in this project (visible session or its parked
+# <sess>_hidden) and select it, surfacing a hidden window first (same as the agents
+# view's Enter=jump). No live match (agent reaped, or from='-') -> open the stored
+# .msg in a popup pager. Jumping never archives or marks read.
+inbox_jump() {
+  (( IN == 0 )) && { status="inbox empty"; return; }
+  local f="${IROWS[$isel]}" from win wsess
+  from=$(ibx_field "$f" from)
+  if [ -n "$from" ] && [ "$from" != "-" ]; then
+    win=$(tmux list-windows -a -F $'#{session_name}\t#{window_name}\t#{window_id}' 2>/dev/null \
+      | awk -F'\t' -v n="$from" -v s="$SESS" -v h="${SESS}_hidden" \
+          '($1==s||$1==h)&&$2==n{print $3; exit}')
+  fi
+  if [ -n "$win" ]; then
+    wsess=$(tmux display -p -t "$win" '#{session_name}' 2>/dev/null)
+    if [ -n "$wsess" ] && [ "$wsess" != "$SESS" ]; then
+      tmux move-window -s "$win" -t "$SESS:" 2>/dev/null
+      tmux set -w -t "$win" @fleet_hidden 0 2>/dev/null
+    fi
+    tmux select-window -t "$win" 2>/dev/null
+    status="jumped → $from"
+  else
+    local q; q=$(printf '%q' "$f") pager="less -R"
+    command -v less >/dev/null 2>&1 || pager=cat
+    tmux display-popup -E -b rounded -w 80% -h 70% -T " msg · ${from:-?} " \
+      "cat $q | $pager" 2>/dev/null
+    status="$from not live — showed stored message"
+  fi
+}
+
 # --- render ------------------------------------------------------------------
 # Rounded box drawn inside the pane (tmux pane borders can't be rounded). Redraw
 # in place (cursor-home, clear-to-EOL per line) so the pane never flashes.
@@ -367,6 +487,7 @@ PAD_X=2          # blank columns inset on each side, inside the rails
 PAD_Y=1          # blank rows of inset below the top border / above the bottom
 
 render() {
+  [ "$MODE" = inbox ] && { render_inbox; return; }
   local cols rows; cols=$(tput cols); rows=$(tput lines)
   # leave the pane's last column empty: writing a full-width last line scrolls
   # on auto-wrap terminals. cols-3 keeps the right rail one column in.
@@ -487,6 +608,84 @@ render() {
   local hint
   if [ -n "$status" ]; then hint="$status"
   else hint="j/k · Ent jump · h hide · v diff · m mode · s send · n new · d close · r/R refresh/reload"; fi
+  tput cup $(( rows - 1 )) 0 2>/dev/null
+  printf '\033[2m%s\033[0m\033[K' "$(hrule '╰' '╯' "$inner" "$hint")"
+}
+
+# inbox view: one row per live .msg (newest-first), with the same box, padding and
+# focus-coloured selection bar as the agents view. Field-access machinery is the
+# per-file ibx_field/ibx_body accessors (same as fleet).
+render_inbox() {
+  local cols rows; cols=$(tput cols); rows=$(tput lines)
+  local inner=$(( cols - 3 ))
+  local slots=$(( rows - 2 ))
+  local cw=$(( inner - 2 * PAD_X )); (( cw < 0 )) && cw=0
+  local ins; ins=$(printf '%*s' "$PAD_X" '')
+  local ins1; ins1=$(printf '%*s' $(( PAD_X - 1 )) '')
+  local blank; blank=$(printf '%*s' "$inner" '')
+  local pa; pa=$(tmux display -p -t "$SELF_PANE" '#{pane_active}#{window_active}' 2>/dev/null)
+  local markc='\033[38;5;240m'; [ "$pa" = "11" ] && markc='\033[1;32m'
+  local now; now=$(date +%s 2>/dev/null); [ -n "$now" ] || now=0
+  tput cup 0 0 2>/dev/null
+
+  printf '\033[2m%s\033[0m\033[K\n' \
+    "$(hrule '╭' '╮' "$inner" "INBOX · $SESS · $IUNREAD unread / $IN")"
+
+  local drawn=0 i
+  for (( i=0; i<PAD_Y && drawn<slots; i++ )); do
+    printf '\033[2m│%s│\033[0m\033[K\n' "$blank"; (( drawn++ ))
+  done
+
+  if (( IN == 0 )); then
+    local msg="inbox empty" mpad
+    while (( drawn < slots )); do
+      if (( drawn == slots / 2 )); then
+        mpad=$(( (cw - ${#msg}) / 2 )); (( mpad < 0 )) && mpad=0
+        printf '\033[2m│\033[0m%s%*s%-*s%s\033[2m│\033[0m\033[K\n' \
+          "$ins" "$mpad" '' "$(( cw - mpad ))" "$msg" "$ins"
+      else
+        printf '\033[2m│%s│\033[0m\033[K\n' "$blank"
+      fi
+      (( drawn++ ))
+    done
+  else
+    local SEVW=9 FROMW=14 AGEW=5
+    local f id unread sev from title epoch age sevf
+    local sevtxt fromtxt titletxt agetxt content LW ageshow lblsgr
+    for (( i=0; i<IN && drawn<slots; i++ )); do
+      f="${IROWS[$i]}"; id=$(basename "$f" .msg)
+      unread=' '; { [ -z "$ICUR" ] || [ "$id" \> "$ICUR" ]; } && unread='*'
+      sev=$(ibx_field "$f" sev); from=$(ibx_field "$f" from); title=$(ibx_field "$f" title)
+      epoch="${id%%.*}"; case "$epoch" in *[!0-9]*|'') epoch=$now ;; esac
+      age=$(fmt_age $(( now - epoch )))
+      ageshow=1; LW=$(( cw - 33 ))                 # 1+1+SEVW+1+FROMW+1+1+AGEW = 33
+      (( LW < 1 )) && { ageshow=0; LW=$(( cw - 27 )); }   # drop age (6 cols)
+      (( LW < 1 )) && LW=0
+      sevf=$(printf '[%s]' "$sev")
+      sevtxt=$(printf '%s%-*.*s\033[0m' "$(sev_color "$sev")" "$SEVW" "$SEVW" "$sevf")
+      fromtxt=$(printf '%-*.*s' "$FROMW" "$FROMW" "$from")
+      titletxt=$(fit_left "$title" "$LW")
+      agetxt=""; (( ageshow )) && agetxt=$(printf ' %*s' "$AGEW" "$age")
+      (( i == isel )) && lblsgr='\033[1m' || lblsgr='\033[2m'
+      content=$(printf '%s %s %s %b%s\033[22m%s' \
+        "$unread" "$sevtxt" "$fromtxt" "$lblsgr" "$titletxt" "$agetxt")
+      if (( i == isel )); then
+        printf '\033[2m│\033[0m%b▌\033[0m%s%s%s\033[2m│\033[0m\033[K\n' \
+          "$markc" "$ins1" "$content" "$ins"
+      else
+        printf '\033[2m│\033[0m%s%s%s\033[2m│\033[0m\033[K\n' "$ins" "$content" "$ins"
+      fi
+      (( drawn++ ))
+    done
+  fi
+
+  while (( drawn < slots )); do
+    printf '\033[2m│%s│\033[0m\033[K\n' "$blank"; (( drawn++ ))
+  done
+
+  local hint
+  if [ -n "$status" ]; then hint="$status"
+  else hint="j/k · Ent pop → orch · J jump to source · i agents · r/R refresh/reload"; fi
   tput cup $(( rows - 1 )) 0 2>/dev/null
   printf '\033[2m%s\033[0m\033[K' "$(hrule '╰' '╯' "$inner" "$hint")"
 }
@@ -924,14 +1123,14 @@ drain_nav() {
   local k2 r2
   while IFS= read -rsN1 -t 0.003 k2; do
     case "$k2" in
-      k) (( sel > 0 )) && ((sel--)) ;;
-      j) (( sel < N-1 )) && ((sel++)) ;;
-      g) sel=0 ;;
-      G) (( N > 0 )) && sel=$((N - 1)) ;;
+      k) nav_up ;;
+      j) nav_down ;;
+      g) nav_top ;;
+      G) nav_bot ;;
       $'\e') IFS= read -rsN2 -t 0.01 r2 || r2=''
         case "$r2" in
-          '[A') (( sel > 0 )) && ((sel--)) ;;
-          '[B') (( sel < N-1 )) && ((sel++)) ;;
+          '[A') nav_up ;;
+          '[B') nav_down ;;
           *) : ;;                       # focus/other ESC seq: ignore, keep draining
         esac ;;
       *) PENDING="$k2"; return ;;        # non-nav: stash, stop draining
@@ -950,7 +1149,10 @@ while :; do
   # (load_rows would starve); this forces a reload when data is older than
   # REFRESH while keeping the ~34ms `fleet agents` RPC off every keypress
   # (≤1 RPC/sec even under a mash). Nav itself never reloads — it only moves sel.
-  if (( SECONDS - last_load >= REFRESH )); then load_rows; last_load=$SECONDS; fi
+  if (( SECONDS - last_load >= REFRESH )); then
+    if [ "$MODE" = inbox ]; then load_inbox; else load_rows; fi
+    last_load=$SECONDS
+  fi
   render
 
   if [ -n "$PENDING" ]; then key="$PENDING"; PENDING=""        # handle stashed key first
@@ -959,17 +1161,22 @@ while :; do
     $'\e')  # arrow keys: ESC [ A/B  (also swallows focus \033[I/O harmlessly)
       IFS= read -rsN2 -t 0.01 rest || rest=''
       case "$rest" in
-        '[A') (( sel > 0 )) && ((sel--)) ;;
-        '[B') (( sel < N-1 )) && ((sel++)) ;;
+        '[A') nav_up ;;
+        '[B') nav_down ;;
       esac
       drain_nav ;;
-    k) (( sel > 0 )) && ((sel--)); drain_nav ;;
-    j) (( sel < N-1 )) && ((sel++)); drain_nav ;;
-    g) sel=0; drain_nav ;;
-    G) (( N > 0 )) && sel=$((N - 1)); drain_nav ;;
-    r) status=""; load_rows; last_load=$SECONDS ;;   # manual refresh
+    k) nav_up; drain_nav ;;
+    j) nav_down; drain_nav ;;
+    g) nav_top; drain_nav ;;
+    G) nav_bot; drain_nav ;;
+    i)             # toggle inbox/agents view (also the key prefix+i sends in)
+      if [ "$MODE" = inbox ]; then MODE=agents; load_rows
+      else MODE=inbox; load_inbox; fi
+      status=""; last_load=$SECONDS ;;
+    r) status=""; if [ "$MODE" = inbox ]; then load_inbox; else load_rows; fi; last_load=$SECONDS ;;   # manual refresh
     R) cleanup; exec "$SELF" "$SESS" ;;   # reload the dashboard with fresh code
-    $'\n'|$'\r')   # jump to selected agent; surface a parked scratch window first
+    $'\n'|$'\r')   # inbox: pop to orchestrator. agents: jump to selected window
+      if [ "$MODE" = inbox ]; then inbox_pop; load_inbox; last_load=$SECONDS; continue; fi
       (( N == 0 )) && continue
       win=$(field "$sel" 3)
       # A window parked in <sess>_hidden is not a member of $SESS, so a bare
@@ -983,7 +1190,11 @@ while :; do
       fi
       tmux select-window -t "$win" 2>/dev/null
       load_rows; last_load=$SECONDS ;;
+    J)             # inbox: jump to the message's source agent (no-op in agents view)
+      [ "$MODE" = inbox ] || continue
+      inbox_jump; load_inbox; last_load=$SECONDS ;;
     h)             # hide the selected scratch agent back off the bar (into <sess>_hidden)
+      [ "$MODE" = inbox ] && continue
       (( N == 0 )) && continue
       win=$(field "$sel" 3); wname=$(field "$sel" 4)
       # Gate on the @fleet_hidden marker so ONLY scratch agents are hideable —
@@ -1011,6 +1222,7 @@ while :; do
       [ -n "$ph" ] && tmux kill-window -t "$ph" 2>/dev/null
       status="hid $wname"; load_rows; last_load=$SECONDS ;;
     m)             # permission-mode pick-list for the selected agent (sets status)
+      [ "$MODE" = inbox ] && continue
       (( N == 0 )) && continue
       label=$(field "$sel" 2); pane=$(field "$sel" 6)
       case "$(field "$sel" 1)" in
@@ -1020,6 +1232,7 @@ while :; do
       esac
       load_rows; last_load=$SECONDS ;;
     s)             # send a message to selected agent
+      [ "$MODE" = inbox ] && continue
       (( N == 0 )) && continue
       label=$(field "$sel" 2)
       msg=$(ask "send to $label> "); clear   # repaint: read -e may have scrolled
@@ -1027,13 +1240,16 @@ while :; do
         && status="sent → $label" || status="send failed → $label"; }
       load_rows; last_load=$SECONDS ;;
     n)             # spawn a new agent via the in-box form (sets status)
+      [ "$MODE" = inbox ] && continue
       new_agent_form; clear; load_rows; last_load=$SECONDS ;;
     d)             # close/teardown the selected agent (confirm popup)
+      [ "$MODE" = inbox ] && continue
       (( N == 0 )) && continue
       label=$(field "$sel" 2); win=$(field "$sel" 3); pane=$(field "$sel" 6)
       dir=$(tmux display -p -t "$pane" '#{pane_current_path}' 2>/dev/null)
       confirm_teardown "$label" "$win" "$pane" "$dir"; clear; load_rows; last_load=$SECONDS ;;
     v)             # view the selected agent's git diff in a popup pager
+      [ "$MODE" = inbox ] && continue
       (( N == 0 )) && continue
       label=$(field "$sel" 2); pane=$(field "$sel" 6)
       dir=$(tmux display -p -t "$pane" '#{pane_current_path}' 2>/dev/null)
