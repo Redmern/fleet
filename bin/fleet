@@ -518,7 +518,10 @@ cmd_restore() { # respawn saved agents whose windows are gone
   # unlike pane cwd which the dashboard/other panes can share.
   local openwins; openwins=$(tmux list-windows -t "$sess" -F '#{window_name}' 2>/dev/null)
   local dir repo branch bare base harness n=0
-  while IFS=$'\t' read -r dir repo branch bare base harness self_merge; do
+  # Translate field-separating TABs to US (\037) so `read` with a NON-whitespace
+  # IFS preserves EMPTY columns (e.g. an empty base, col 5). `IFS=$'\t' read`
+  # collapses tab runs and drops empties, shifting every later field one left.
+  while IFS=$'\037' read -r dir repo branch bare base harness self_merge; do
     [ -n "$dir" ] && [ -n "$repo" ] && [ -n "$branch" ] || continue
     printf '%s\n' "$openwins" | grep -qxF "$repo/${branch//\//_}" && continue   # already running
     local args=("$repo" "$branch")
@@ -530,7 +533,7 @@ cmd_restore() { # respawn saved agents whose windows are gone
     if [ "$self_merge" = 1 ]; then args+=(--self-merge); else args+=(--no-self-merge); fi
     echo "restoring $repo/$branch..."
     cmd_new "${args[@]}" >/dev/null 2>&1 && n=$((n+1))
-  done < "$f"
+  done < <(tr '\t' '\037' <"$f")
   echo "restored $n agent(s)"
 }
 
@@ -1568,9 +1571,14 @@ cmd_reap() { # reap [<target>] [--force] — remove worktrees flagged ready
   local root; root=$(fleet_root 2>/dev/null)   # archive target for scratch-docs (fail-silent if empty)
   local f; f=$(agents_file "$sess")
   [ -f "$f" ] || { echo "no saved agents for this session"; return 0; }
-  local lines; lines=$(cat "$f" 2>/dev/null)   # snapshot: cmd_forget mutates $f
+  # Snapshot before iterating (cmd_forget mutates $f). Translate the field-
+  # separating TABs to US (\037) so `read` with a NON-whitespace IFS preserves
+  # EMPTY columns: an empty base (col 5 — the common no-`--base` case) must stay
+  # empty, not let the harness shift into it. `IFS=$'\t' read` collapses runs of
+  # tab (an IFS *whitespace* char) and drops empty fields, mis-parsing the rest.
+  local lines; lines=$(tr '\t' '\037' <"$f" 2>/dev/null)   # snapshot: cmd_forget mutates $f
   local any=0 reaped=0 dir repo branch base
-  while IFS=$'\t' read -r dir repo branch _bare base _rest; do
+  while IFS=$'\037' read -r dir repo branch _bare base _rest; do
     [ -n "$dir" ] || continue
     [ -e "$dir/.fleet/ready" ] || continue       # only flagged worktrees
     local lbl="${repo:-?}/${branch:-?}"
