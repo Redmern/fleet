@@ -137,14 +137,21 @@ this project with the `fleet` CLI.
 > agent-neutral. Capabilities only some harnesses support are noted inline.
 
 - `fleet ls` — list THIS project's agents: state (working/blocked/idle), repo/branch, window. `--all`/`-a` lists every project on the server.
-- `fleet new <repo> <branch> [-p "task"] [--bare] [--base <branch>] [--harness|-h <name>] [--self-merge]`
+- `fleet new <repo> <branch> [-p "task"] [--bare] [--base <branch>] [--harness|-h <name>] [--self-merge|--no-self-merge]`
   — spawn an agent: creates a git worktree for `<branch>` if needed, opens a tmux
   window (editor + agent split by default, `--bare` for a plain agent pane), and
   seeds it with the `-p` prompt. `<repo>` is a repo name/alias in this project
   root. `--harness` (alias `-h`) picks the agent CLI (`claude` default, or `omp`,
-  …; see `fleet harnesses`). By default a worker may **not** `git merge`/`git push`
-  (fleet-guard blocks it — you review the diff and integrate); pass `--self-merge`
-  to grant *that* worker merge/push rights for its branch.
+  …; see `fleet harnesses`). By **default** a worker **may** `git merge`/`git push`
+  its branch (fleet-guard allows it). Flip the whole project to *blocked* with
+  `fleet selfmerge off`; override a single spawn either way with `--self-merge`
+  (force allow) or `--no-self-merge` (force block).
+- `fleet selfmerge on|off|status` — project-wide worker self-merge toggle. `off`
+  drops a `<root>/.fleet/no-self-merge` marker so newly-spawned workers in this
+  project (all repos) are blocked from merge/push; `on` removes it (the default,
+  workers may merge/push); bare/`status` reports the current state. **Spawn-time:**
+  affects workers spawned from now on — existing panes keep their grant. Per-agent
+  `--self-merge`/`--no-self-merge` on `fleet new` override the project default.
 - `fleet new --scratch [label] [-p "task"] [--harness|-h <name>]` — spawn a
   **repo-less** agent: no repo, branch, or worktree, just a plain agent pane at
   the project root. `[label]` names the window (default `scratch`). Use for

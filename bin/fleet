@@ -498,6 +498,18 @@ cmd_guard() { # on | off | status — toggle the test/CI write-guard PreToolUse 
   esac
 }
 
+cmd_selfmerge() { # on | off | status — project-wide worker self-merge toggle (spawn-time)
+  local sub="${1:-status}" root; root=$(fleet_root 2>/dev/null) || { echo "self-merge: (not inside a fleet session)"; return 0; }
+  local marker="$root/.fleet/no-self-merge"
+  case "$sub" in
+    on)  rm -f "$marker" 2>/dev/null || true; echo "self-merge: ON for this project (newly-spawned workers may merge/push)" ;;
+    off) mkdir -p "$root/.fleet" 2>/dev/null; : >"$marker" 2>/dev/null || true; echo "self-merge: OFF for this project (newly-spawned workers blocked from merge/push)" ;;
+    *)   if [ -e "$marker" ]; then echo "self-merge: OFF for this project (newly-spawned workers blocked from merge/push)";
+         else echo "self-merge: ON (default — newly-spawned workers may merge/push)"; fi
+         echo "note: spawn-time only — affects workers spawned from now on; existing panes keep their grant. Override per-agent with: fleet new --self-merge | --no-self-merge" ;;
+  esac
+}
+
 cmd_restore() { # respawn saved agents whose windows are gone
   local sess; sess=$(session_name) || die "not inside tmux"
   local f; f=$(agents_file "$sess")
@@ -513,7 +525,9 @@ cmd_restore() { # respawn saved agents whose windows are gone
     [ "$bare" = 1 ] && args+=(--bare)
     [ -n "$base" ] && args+=(--base "$base")
     [ -n "$harness" ] && args+=(--harness "$harness")
-    [ "$self_merge" = 1 ] && args+=(--self-merge)   # preserve the merge/push grant across restore
+    # Re-apply the EXACT persisted grant explicitly (default is now 1, and a
+    # project marker could flip it) so a restored agent keeps what it had.
+    if [ "$self_merge" = 1 ]; then args+=(--self-merge); else args+=(--no-self-merge); fi
     echo "restoring $repo/$branch..."
     cmd_new "${args[@]}" >/dev/null 2>&1 && n=$((n+1))
   done < "$f"
@@ -523,7 +537,7 @@ cmd_restore() { # respawn saved agents whose windows are gone
 # ---- new ----------------------------------------------------------------------
 
 cmd_new() {
-  local repo="" branch="" prompt="" bare=0 base="" harness="" scratch=0 switch=0 mode="" self_merge=0
+  local repo="" branch="" prompt="" bare=0 base="" harness="" scratch=0 switch=0 mode="" self_merge=1 sm_flag=""
   while [ $# -gt 0 ]; do
     case "$1" in
       -p) prompt="$2"; shift 2 ;;
@@ -532,7 +546,8 @@ cmd_new() {
       --switch|-s) switch=1; shift ;;
       --base) base="$2"; shift 2 ;;
       --harness|-h) harness="$2"; shift 2 ;;
-      --self-merge) self_merge=1; shift ;;   # grant this worker merge/push rights (fleet-guard allows it via FLEET_SELF_MERGE=1)
+      --self-merge) sm_flag=1; shift ;;      # force merge/push ON for this worker (overrides the project default)
+      --no-self-merge) sm_flag=0; shift ;;   # force merge/push OFF for this worker (overrides the project default)
       --mode) mode="$2"; shift 2 ;;   # override start --permission-mode (e.g. bypassPermissions) — not reachable via Shift+Tab
       -*) die "unknown flag $1" ;;
       *) if [ -z "$repo" ]; then repo="$1"; elif [ -z "$branch" ]; then branch="$1"; else die "extra arg $1"; fi; shift ;;
@@ -546,6 +561,13 @@ cmd_new() {
   local sess; sess=$(session_name) || die "not inside tmux"
   local dir wname repo_base="" docs=""
 
+  # Self-merge default is ON (workers may merge/push). A project can flip the
+  # whole tree to OFF with `fleet selfmerge off` (drops <root>/.fleet/no-self-merge);
+  # an explicit --self-merge / --no-self-merge on this spawn overrides either way.
+  self_merge=1
+  [ -e "$root/.fleet/no-self-merge" ] && self_merge=0
+  [ -n "$sm_flag" ] && self_merge="$sm_flag"
+
   if [ "$scratch" = 1 ]; then
     # repo-less scratch agent: no repo, no branch, no worktree. Always a plain
     # agent pane (nothing to edit in nvim), launched at the project root. The
@@ -558,7 +580,7 @@ cmd_new() {
     docs="$root/.fleet/notes/scratch/${repo:-scratch}"
     mkdir -p "$docs" 2>/dev/null || true
   else
-    [ -n "$repo" ] && [ -n "$branch" ] || die "usage: fleet new <repo> <branch> [-p prompt] [--bare] [--switch|-s] [--base branch] [--harness|-h name] [--self-merge] [--mode default|acceptEdits|plan|auto|bypassPermissions]  (or: fleet new --scratch [label] for a repo-less agent)"
+    [ -n "$repo" ] && [ -n "$branch" ] || die "usage: fleet new <repo> <branch> [-p prompt] [--bare] [--switch|-s] [--base branch] [--harness|-h name] [--self-merge|--no-self-merge] [--mode default|acceptEdits|plan|auto|bypassPermissions]  (or: fleet new --scratch [label] for a repo-less agent)"
     repo_base=$(resolve_repo "$root" "$repo") || die "repo '$repo' not found under $root"
     local branchdir="${branch//\//_}" anchor=""
     local is_bare_repo; is_bare_repo=$(git -C "$repo_base" rev-parse --is-bare-repository 2>/dev/null)
@@ -2852,7 +2874,7 @@ fleet — agent fleet manager (tmux + nvim + Claude Code)
   fleet up [name|path]   boot project session + daemon + command center (auto-restores saved agents; --no-restore for main only, --tmuxinator to load a same-named tmuxinator layout)
   fleet save [name]      save the current session as a reusable project alias (fleet up <name>)
   fleet restore          respawn saved agents from a previous session
-  fleet new <repo> <br>  spawn agent (worktree + window + claude) [-p prompt] [--bare] [--switch|-s] [--base br] [-h harness] [--self-merge]
+  fleet new <repo> <br>  spawn agent (worktree + window + claude) [-p prompt] [--bare] [--switch|-s] [--base br] [-h harness] [--self-merge|--no-self-merge]  (workers may merge/push by default)
   fleet new --scratch    spawn a repo-less agent (no repo/branch/worktree) [label] [-p prompt] [-h harness]
   fleet ls               list THIS project's agents and states (--all|-a = every project on the server)
   fleet pick             fzf jump-to-agent
@@ -2865,6 +2887,7 @@ fleet — agent fleet manager (tmux + nvim + Claude Code)
   fleet fan <repo> <nm>  best-of-N: spawn N agents on one prompt [-n N] [-p prompt] [--base br] [--bare]
   fleet cost <a>         show an agent's token spend
   fleet guard on|off     test/CI write-guard (asks before editing tests/CI/lockfiles)
+  fleet selfmerge on|off project-wide worker self-merge toggle (on=default; off blocks new workers' merge/push)
   fleet mode <a>         cycle an agent's Claude permission mode (Shift+Tab)
   fleet dispatch <id>    spawn the ephemeral sub-orchestrator for a ledger id (zero LLM)
   fleet dispatch enable  OPT-IN: wire the UserPromptSubmit dispatch hook (enable|disable|status)
@@ -2897,6 +2920,7 @@ case "${1:-}" in
   restore)  shift; cmd_restore "$@" ;;   # respawn saved agents
   forget)   shift; cmd_forget "$@" ;;    # drop a saved agent (dashboard teardown)
   guard)    shift; cmd_guard "$@" ;;     # toggle the test/CI write-guard
+  selfmerge) shift; cmd_selfmerge "$@" ;;  # project-wide worker self-merge toggle
   fan)      shift; cmd_fan "$@" ;;        # best-of-N fan-out
   cost)     shift; cmd_cost "$@" ;;       # per-agent token/cost
   cost-pane) shift; cost_for_pane "$@" ;; # raw cost for a pane (dashboard)
