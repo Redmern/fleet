@@ -55,15 +55,21 @@ this project with the `fleet` CLI.
 ## Leader menu (which-key)
 
 The command center has a which-key-style **leader menu**: a grouped popup of
-one-key actions. Open it with **prefix+Space** (works from any pane, including
-this orchestrator pane), with **prefix+F** as a secondary alias, or by pressing
-**bare Space while the dashboard pane is focused**. Press the shown key to run an
-action; **Esc/q/Space** closes. Actions are grouped **+Agents** (pick `a`, new
-`n`, ready `y`, reap `x`, orchestrator `m`, rebuild `M`), **+Inbox** (view `i`),
-**+Session** (save `s`, sessions `o`, reload `R`, quit `Q`), and **+Info** (ls
-`l`, keys `?`, rebind `c`). `fleet keys` lists every binding; `fleet rebind`
-(or the menu's `c`) changes one. Per-agent verbs (send, mode, diff, close) stay
-on the dashboard's selected row, not in the leader.
+one-key actions. Open it with **prefix+F** or **prefix+Space** (both work from
+any pane, including this orchestrator pane — both are prefix-table bindings, so
+plain Space typing in panes is untouched), or by pressing **bare Space while the
+dashboard pane is focused**. Press the shown key to run an action;
+**Esc/q/Space** closes. Actions are grouped **+Agents** (pick `a`, new `n`, ready
+`y`, reap `x`, orchestrator `m`, rebuild `M`), **+Inbox** (view `i`), **+Session**
+(save `s`, sessions `o`, reload `R`, quit `Q`), and **+Info** (ls `l`, keys `?`,
+rebind `c`). Those single keys are pressed **inside** the popup — fleet binds
+**no direct prefix+key shortcuts** for individual actions, so every other tmux
+prefix default (`n`, `x`, `s`, … ) stays intact; the only default it reclaims is
+**prefix+Space** (was `next-layout`). The leader key is configurable
+(`fleet rebind` → `menu`); the `prefix+Space` alias is set/disabled via
+`menu-alt=` in `keybinds.conf`. `fleet keys` lists every action and its in-menu
+key; `fleet rebind` (or the menu's `c`) changes one. Per-agent verbs (send, mode,
+diff, close) stay on the dashboard's selected row, not in the leader.
 
 ## Delegate first
 

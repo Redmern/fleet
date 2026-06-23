@@ -2207,12 +2207,15 @@ inject_status_format() { # append agent glyph to window-status formats.
 KEYBINDS_CONF="$CONF_DIR/keybinds.conf"
 
 # action|default-key|group|menu label|description
+# Leader-only model: the ONLY prefix binding is `menu` (the which-key leader, on
+# prefix+F by default). Every other action's key is its IN-POPUP mnemonic — the
+# single key you press while the leader menu is open — never a prefix binding.
 # group buckets the action into a which-key section ('+Agents' …). The special
-# group '-' hides an action from the leader grid (still bound under the prefix).
+# group '-' hides an action from the leader grid (the leader itself).
 # Unknown groups still render — they get their own section after the known ones.
 fleet_actions() {
   cat <<'EOF'
-menu|Space|-|Leader menu|Open the which-key leader menu
+menu|F|-|Leader menu|Open the which-key leader menu (the only prefix binding: prefix+F)
 pick|a|Agents|Pick / jump to agent|fzf popup of all agents, Enter jumps
 new|n|Agents|New agent|Prompt for "repo branch", spawn agent
 ready|y|Agents|Flag ready|Flag a worktree done/ready for reap (blank = this cwd)
@@ -2260,20 +2263,36 @@ action_tmux_command() { # tmux command string run when an action's key is presse
   esac
 }
 
+# secondary prefix alias for the leader menu. Configurable via keybinds.conf
+# `menu-alt=<key>`; default Space. Set it empty to disable (then the only trigger
+# is prefix+<menu-key>). This lives in the PREFIX key-table too, so it only
+# reclaims tmux's prefix+Space=next-layout default — plain Space typing in
+# nvim/claude/shell panes is untouched.
+MENU_ALT_DEFAULT="Space"
+menu_alt_key() {
+  local key=""
+  if [ -f "$KEYBINDS_CONF" ] && grep -q '^menu-alt=' "$KEYBINDS_CONF" 2>/dev/null; then
+    # an explicit `menu-alt=` line wins (empty value disables the alias)
+    awk -F= '$1=="menu-alt"{print $2; exit}' "$KEYBINDS_CONF"; return
+  fi
+  printf '%s' "$MENU_ALT_DEFAULT"
+}
+
 apply_keybinds() {
-  local action key cmd
-  while IFS='|' read -r action _ _ _ _; do
-    key=$(keybind_for "$action")
-    cmd=$(action_tmux_command "$action")
-    [ -n "$key" ] && [ -n "$cmd" ] || continue
-    eval "tmux bind-key '$key' $cmd"
-  done < <(fleet_actions)
-  # secondary alias: prefix+F always opens the leader menu too (the primary
-  # trigger is prefix+Space, bound above from the 'menu' action's key). All
-  # bindings live in the PREFIX key-table — never the root table — so plain
-  # Space typing in nvim/claude/shell panes is untouched.
-  local mcmd; mcmd=$(action_tmux_command menu)
-  [ -n "$mcmd" ] && eval "tmux bind-key 'F' $mcmd" 2>/dev/null
+  # Leader-only model: the leader menu is the ONLY fleet binding. NO other action
+  # gets a binding — every action is reached THROUGH the menu (single keys pressed
+  # INSIDE the popup), so tmux's other prefix defaults (n/x/s/… ) keep working.
+  # Two PREFIX-table triggers open the same menu (both prefix-table, so plain
+  # typing in nvim/claude/shell panes is untouched):
+  #   • prefix+<menu-key> (default prefix+F) — configurable via the `menu` action.
+  #   • prefix+<menu-alt> (default prefix+Space) — secondary alias, reclaims
+  #     tmux's prefix+Space=next-layout; configurable / disable via `menu-alt=`.
+  local mkey mcmd akey
+  mkey=$(keybind_for menu)
+  mcmd=$(action_tmux_command menu)
+  [ -n "$mkey" ] && [ -n "$mcmd" ] && eval "tmux bind-key '$mkey' $mcmd" 2>/dev/null
+  akey=$(menu_alt_key)
+  [ -n "$akey" ] && [ -n "$mcmd" ] && eval "tmux bind-key '$akey' $mcmd" 2>/dev/null
 }
 
 # which-key leader menu. Two faces share one entry point:
@@ -2300,7 +2319,8 @@ leader_section() { # leader_section <group> — print header + lines if non-empt
 }
 
 leader_grid() { # the full which-key grid (stdout)
-  printf '\n  \033[1;36m󰭹 Fleet leader\033[0m   \033[2mprefix+Space · q/Esc closes\033[0m\n\n'
+  printf '\n  \033[1;36m󰭹 Fleet leader\033[0m   \033[2mprefix+%s%s · q/Esc closes\033[0m\n\n' \
+    "$(keybind_for menu)" "$(a=$(menu_alt_key); [ -n "$a" ] && printf ' / prefix+%s' "$a")"
   local printed=" " grp
   for grp in $LEADER_GROUPS; do leader_section "$grp"; printed+="$grp "; done
   # sweep any remaining groups (unknown / future), skip the hidden marker '-'
@@ -2377,15 +2397,11 @@ cmd_rebind_set() { # rebind-set <action> <key>
   [ -n "$action" ] && [ -n "$key" ] || return 0
   mkdir -p "$CONF_DIR"
   touch "$KEYBINDS_CONF"
-  # release the action's previous key unless another action still uses it
-  local oldkey; oldkey=$(keybind_for "$action")
-  if [ -n "$oldkey" ] && [ "$oldkey" != "$key" ]; then
-    local still=""
-    while IFS='|' read -r a _ _ _; do
-      [ "$a" = "$action" ] && continue
-      [ "$(keybind_for "$a")" = "$oldkey" ] && still=1
-    done < <(fleet_actions)
-    [ -z "$still" ] && tmux unbind-key "$oldkey" 2>/dev/null
+  # release the leader's previous PREFIX key (only `menu` is prefix-bound; other
+  # actions are in-popup keys with no tmux binding to release).
+  if [ "$action" = menu ]; then
+    local oldkey; oldkey=$(keybind_for "$action")
+    [ -n "$oldkey" ] && [ "$oldkey" != "$key" ] && tmux unbind-key "$oldkey" 2>/dev/null
   fi
   # warn (don't block) if the key already drives another fleet action
   local clash; clash=$(
@@ -2399,25 +2415,35 @@ cmd_rebind_set() { # rebind-set <action> <key>
   echo "$action=$key" >> "$tmp"
   mv "$tmp" "$KEYBINDS_CONF"
   apply_keybinds
+  # 'menu' is the leader (a real prefix binding); everything else is an in-popup key.
+  local where="menu"; [ "$action" = menu ] && where="prefix"
   if [ -n "$clash" ]; then
-    tmux display-message "fleet: $action → prefix $key (also bound: $clash)"
+    tmux display-message "fleet: $action → $where $key (also bound: $clash)"
   else
-    tmux display-message "fleet: $action → prefix $key"
+    tmux display-message "fleet: $action → $where $key"
   fi
 }
 
 cmd_keys() { # plain text listing; --hold keeps a popup open until a key is pressed
   local hold=0
   case "${1:-}" in --hold) hold=1 ;; esac
+  local mkey; mkey=$(keybind_for menu)
   printf 'ACTION\tKEY\tGROUP\tDESCRIPTION\n'
   local action key grp label desc
   while IFS='|' read -r action key_default grp label desc; do
     key=$(keybind_for "$action")
-    printf '%s\tprefix %s\t%s\t%s\n' "$action" "$key" "$grp" "$desc"
+    if [ "$action" = menu ]; then
+      printf '%s\tprefix %s\t%s\t%s\n' "$action" "$key" "$grp" "$desc"
+    else
+      printf '%s\tmenu %s\t%s\t%s\n' "$action" "$key" "$grp" "$desc"
+    fi
   done < <(fleet_actions)
   echo
-  echo "leader: prefix+Space (or prefix+F), or bare Space in the dashboard pane"
-  echo "config: $KEYBINDS_CONF  (edit or use the leader menu / 'fleet rebind')"
+  local akey; akey=$(menu_alt_key)
+  echo "leader: prefix+$mkey${akey:+ / prefix+$akey} (the only fleet prefix bindings), or bare Space in the dashboard pane"
+  echo "all other actions: open the leader, then press their 'menu <key>' inside the popup"
+  echo "fleet binds no other prefix keys — tmux defaults (n, x, s, … ) are untouched"
+  echo "config: $KEYBINDS_CONF  (edit or use the leader menu / 'fleet rebind'; menu-alt= sets/disables the prefix+Space alias)"
   if [ "$hold" -eq 1 ]; then hold_wait; fi
 }
 
@@ -2960,9 +2986,9 @@ fleet — agent fleet manager (tmux + nvim + Claude Code)
   fleet notify <p> "m"   safe-deliver a message to a pane (in-band iff proven safe, else out-of-band)
   fleet restamp          re-propagate the edited FLEET.md guide into bootstrapped CLAUDE.md/AGENTS.md
   fleet main [--reload]  (re)build command center window (--reload restarts just the dashboard)
-  fleet sessions         fzf switch between open fleet sessions (prefix+$(keybind_for sessions))
-  fleet quit             tear down THIS fleet session — kills all its windows (prefix+$(keybind_for quit))
-  fleet menu             feature menu (bound to prefix+$menu_key by fleet up)
+  fleet sessions         fzf switch between open fleet sessions (leader menu → $(keybind_for sessions))
+  fleet quit             tear down THIS fleet session — kills all its windows (leader menu → $(keybind_for quit))
+  fleet menu             which-key leader menu — the ONLY prefix binding (prefix+$menu_key); all actions reached through it
   fleet keys             list feature keybinds
   fleet rebind           change a keybind interactively
   fleet status           live config report (what's deployed, per config repo)
