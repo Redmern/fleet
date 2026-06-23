@@ -2263,12 +2263,13 @@ action_tmux_command() { # tmux command string run when an action's key is presse
   esac
 }
 
-# secondary prefix alias for the leader menu. Configurable via keybinds.conf
-# `menu-alt=<key>`; default Space. Set it empty to disable (then the only trigger
-# is prefix+<menu-key>). This lives in the PREFIX key-table too, so it only
-# reclaims tmux's prefix+Space=next-layout default — plain Space typing in
-# nvim/claude/shell panes is untouched.
-MENU_ALT_DEFAULT="Space"
+# Optional secondary prefix alias for the leader menu. Configurable via
+# keybinds.conf `menu-alt=<key>`. Default is EMPTY (disabled) so fleet's ONLY
+# prefix binding is prefix+<menu-key> (prefix+F) and tmux's prefix+Space=next-layout
+# stays untouched — fleet clashes with NO tmux default out of the box. Opt back in
+# to a Space leader with `menu-alt=Space`. (The dashboard's bare-Space leader is a
+# separate, pane-local key and is unaffected either way.)
+MENU_ALT_DEFAULT=""
 menu_alt_key() {
   local key=""
   if [ -f "$KEYBINDS_CONF" ] && grep -q '^menu-alt=' "$KEYBINDS_CONF" 2>/dev/null; then
