@@ -71,7 +71,7 @@ dashboard pane is focused**. Press the shown key to run an action;
 **Esc/q/Space** closes. Actions are grouped **+Agents** (pick `a`, new `n`, ready
 `y`, reap `x`, orchestrator `m`, pop oldest message `p`, triage messages `t`,
 rebuild `M`), **+Session**
-(save `s`, sessions `o`, reload `R`, quit `Q`), and **+Info** (ls `l`, keys `?`,
+(save `s`, sessions `o`, reload `R`, dispatch mode `d`, quit `Q`), and **+Info** (ls `l`, keys `?`,
 rebind `c`). Those single keys are pressed **inside** the popup — fleet binds
 **no direct prefix+key shortcuts** for individual actions, so every other tmux
 prefix default (`n`, `x`, `s`, … ) stays intact; the only default it reclaims is
@@ -161,7 +161,9 @@ are already handled.
 - `off` — the layer is dormant; everything falls through in-pane.
 
 Set/inspect it with `fleet dispatch mode [sigil|all|off]` (bare prints the current
-mode; `fleet dispatch status` also reports it).
+mode; `fleet dispatch status` also reports it). Or flip it from the **leader menu**:
+**+Session → `d`** opens a picker showing the current mode and whether the hook is
+wired, then off/sigil/all in one keystroke (sigil/all wire the hook first).
 
 What reaches you in-pane is only the fall-through (a bare prompt under `sigil`, or an
 escaped `\…` prompt under `all`):

@@ -199,7 +199,7 @@ dashboard pane is focused**. Press the shown key to run an action;
 **Esc/q/Space** closes. Actions are grouped **+Agents** (pick `a`, new `n`, ready
 `y`, reap `x`, orchestrator `m`, pop oldest message `p`, triage messages `t`,
 rebuild `M`), **+Session**
-(save `s`, sessions `o`, reload `R`, quit `Q`), and **+Info** (ls `l`, keys `?`,
+(save `s`, sessions `o`, reload `R`, dispatch mode `d`, quit `Q`), and **+Info** (ls `l`, keys `?`,
 rebind `c`). Those single keys are pressed **inside** the popup — fleet binds
 **no direct prefix+key shortcuts** for individual actions, so every other tmux
 prefix default (`n`, `x`, `s`, … ) stays intact; the only default it reclaims is

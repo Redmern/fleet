@@ -2662,6 +2662,7 @@ main|M|Agents|Rebuild command center|Re-tile the main window
 save|s|Session|Save project|Save this session as a reusable project alias (fleet up <name>)
 sessions|o|Session|Fleet sessions|Switch between open fleet sessions
 reload|R|Session|Reload dashboard|Restart the dashboard pane in place (picks up new code)
+dispatch|d|Session|Dispatch mode|Toggle the every-prompt-dispatch front door (off/sigil/all)
 quit|Q|Session|Quit fleet|Kill this fleet session (closes all agents)
 ls|l|Info|List agents|Show agent states in a popup
 keys|?|Info|Keys / help|List every fleet keybinding in a popup
@@ -2692,6 +2693,17 @@ action_tmux_command() { # tmux command string run when an action's key is presse
     popmsg) echo "run-shell '$self inbox pop'" ;;   # plain run-shell, composes with the close-then-dispatch flow
     triage) echo "run-shell '$self dash-triage'" ;; # focus the dash + inject its triage key (NOT a popup) — same shape as 'new'
     reload) echo "display-menu -b rounded -T '#[align=centre]Reload dashboard?' -x C -y C 'Yes, reload' y \"run-shell '$self main --reload'\" 'Cancel' n ''" ;;
+    dispatch)
+      # Read live state at press time (this runs when the leader dispatches the
+      # action), fail-silent: bad/missing root just yields 'sigil' + 'hook off'.
+      local dmode dwired droot dset
+      dmode=$(dispatch_mode_get 2>/dev/null); dmode="${dmode:-sigil}"
+      dwired=off
+      droot=$(fleet_root 2>/dev/null) && dset="$droot/.claude/settings.json" \
+        && [ -f "$dset" ] && grep -q fleet-dispatch "$dset" 2>/dev/null && dwired=on
+      # sigil/all need the hook wired (mode is moot otherwise), so enable first;
+      # off just flips the mode marker (cleanest single toggle, no settings churn).
+      echo "display-menu -b rounded -T '#[align=centre]Dispatch mode  (now: $dmode · hook $dwired)' -x C -y C 'off (disabled)' o \"run-shell '$self dispatch mode off'\" 'sigil (,-prefix dispatches)' s \"run-shell '$self dispatch enable && $self dispatch mode sigil'\" 'all (every prompt dispatches; \\ escapes)' a \"run-shell '$self dispatch enable && $self dispatch mode all'\" 'Cancel' c ''" ;;
     ls)     echo "run-shell -b '$self popup-fit ls'" ;;    # measures then opens a fit-to-content popup
     keys)   echo "run-shell -b '$self popup-fit keys'" ;;  # measures then opens a fit-to-content popup
     sessions) echo "display-popup -E -b rounded -w 70% -h 60% '$self sessions'" ;;
