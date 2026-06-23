@@ -28,6 +28,7 @@ post_upgrade() {
 
 pre_remove() {
   echo "==> Before removing: run 'fleet unsetup' as your user to disable the"
-  echo "    fleetd user unit and unwire Claude Code hooks (pacman cannot touch"
-  echo "    per-user state)."
+  echo "    fleetd user unit, unwire Claude Code hooks, and drop any ~/.local/bin"
+  echo "    fleet shims (pacman cannot touch per-user state). pacman then removes"
+  echo "    the system files (/usr/bin, /usr/lib/fleet)."
 }

@@ -2896,9 +2896,16 @@ cmd_setup() {
   local onpath; onpath=$(command -v fleet 2>/dev/null)
   if [ -n "$onpath" ] && \
      [ "$(readlink -f "$onpath" 2>/dev/null)" != "$(readlink -f "$FLEET_DIR/bin/fleet" 2>/dev/null)" ]; then
-    echo "note: another fleet is first on PATH: $onpath -> $(readlink -f "$onpath" 2>/dev/null)"
-    echo "      run 'fleet setup' from THAT install, or pass --force to wire this one."
-    [ "$FORCE" = 1 ] || return 0
+    echo "ERROR: fleet setup aborted — another fleet shadows this one on PATH:" >&2
+    echo "         on PATH:  $onpath -> $(readlink -f "$onpath" 2>/dev/null)" >&2
+    echo "         this one: $FLEET_DIR/bin/fleet" >&2
+    echo "       Wiring this install would fight the one you actually run (last writer" >&2
+    echo "       wins on the shared settings.json), leaving Claude Code hooks pointed at" >&2
+    echo "       the wrong tree. NOTHING was changed." >&2
+    echo "       Fix: run 'fleet setup' from the install that's first on PATH, or run" >&2
+    echo "       'fleet doctor' to see which fleet is active. Pass --force to wire THIS" >&2
+    echo "       one anyway." >&2
+    [ "$FORCE" = 1 ] || exit 3
   fi
 
   # Auto-fall-back to --no-systemd when `systemctl --user` is unusable (no
@@ -2986,7 +2993,23 @@ cmd_unsetup() {
     [ -n "$p" ] || continue
     [ -f "$p/settings.json" ] && setup_unwire_hooks "$p/settings.json"
   done < <(claude_profiles)
-  echo "fleet unset up (system files left for pacman to remove)"
+
+  # Remove the ~/.local/bin shims THIS install owns — the untracked half no
+  # package manager tracks (curl + dev installs put them here). Only unlink ones
+  # that actually resolve into this tree, so a coexisting dev/other install on a
+  # different tree is left untouched. Package-managed bins (/usr/bin for pacman,
+  # brew's bin) live elsewhere and are removed by the package manager itself.
+  local bindir="$HOME/.local/bin" b target
+  for b in fleet fleetd fleet-hook fleet-guard; do
+    [ -L "$bindir/$b" ] || continue
+    target=$(readlink -f "$bindir/$b" 2>/dev/null)
+    case "$target" in
+      "$FLEET_DIR"/*) rm -f "$bindir/$b" && echo "  removed $bindir/$b" ;;
+    esac
+  done
+
+  echo "fleet unset up (per-user wiring removed; any package-managed system files"
+  echo "  left for the package manager — 'pacman -R fleet-git' / 'brew uninstall fleet')."
 }
 
 # ---- dispatch -------------------------------------------------------------------
