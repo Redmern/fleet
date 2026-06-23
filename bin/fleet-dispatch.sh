@@ -1,9 +1,10 @@
 #!/bin/sh
 # fleet-dispatch.sh — UserPromptSubmit hook for the orchestration ("dispatch")
 # layer. Runs ONLY in the main command-center pane (FLEET_ROLE=main). It intercepts
-# sigil-prefixed prompts with ZERO model turn: writes the instruction to the durable
-# ledger and spawns an ephemeral sub-orchestrator. A bare (no-sigil) prompt passes
-# through untouched to the main pane's own model.
+# prompts with ZERO model turn: writes the instruction to the durable ledger and
+# spawns an ephemeral sub-orchestrator. WHICH prompts are intercepted is set by
+# `fleet dispatch mode` (sigil=opt-in ',' | all=opt-out front door, escape '\' | off);
+# an inline-classified prompt passes through untouched to the main pane's own model.
 #
 # DELIBERATELY opt-in: install.sh does NOT wire this. The operator enables it with
 # `fleet dispatch enable`. It must NEVER be active in a live command center unless
@@ -38,15 +39,22 @@ _input="$(cat 2>/dev/null)"
 PROMPT="$(printf '%s' "$_input" | jq -r '.prompt // empty' 2>/dev/null)"
 [ -n "$PROMPT" ] || exit 0
 
-# 3. CLASSIFY — FLIPPED default (§3.1): a leading sigil dispatches; bare passes
-#    through. The sigil is a single leading comma.
-case "$PROMPT" in
-  ,*) ;;            # dispatch
-  *)  exit 0 ;;     # bare → pass-through to the main pane's model
+# 3. CLASSIFY via the stored dispatch mode (sigil|all|off). The decision oracle is
+#    `fleet dispatch-classify` — ONE classifier shared by this hook and the test suite
+#    so they can never drift. The prompt is piped on STDIN so the body never crosses a
+#    command line. Verdicts: dispatch-sigil (strip a leading ','), dispatch-bare (whole
+#    prompt is the instruction), inline (pass through to the main pane's own model).
+#      mode sigil → ',' dispatches, bare is inline (opt-in, today's default)
+#      mode all   → bare dispatches, a leading '\' (escape) is inline (opt-out)
+#      mode off   → everything inline (layer dormant)
+VERDICT="$(printf '%s' "$PROMPT" | "$FLEET_BIN" dispatch-classify 2>/dev/null)"
+case "$VERDICT" in
+  dispatch-sigil) BODY="${PROMPT#,}" ;;   # strip exactly one leading sigil
+  dispatch-bare)  BODY="$PROMPT" ;;       # the whole prompt is the instruction
+  *)              exit 0 ;;               # inline → pass-through to the main pane's model
 esac
-BODY="${PROMPT#,}"    # strip exactly one leading sigil
-BODY="${BODY# }"      # strip one optional following space
-[ -n "$BODY" ] || exit 0   # a lone "," is not an instruction
+BODY="${BODY# }"           # strip one optional following space
+[ -n "$BODY" ] || exit 0   # a lone sigil is not an instruction
 
 # Opportunistic recovery (§4): re-animate any stranded dispatch before our own.
 # One-shot, cheap, best-effort — never blocks dispatch.

@@ -133,18 +133,55 @@ all the finished worktrees in one step (it refuses unmerged or dirty ones).
 > only ever runs in the main pane, so no other pane can act as a router regardless.)
 
 When the **dispatch layer** is enabled (`fleet dispatch enable`), a `UserPromptSubmit`
-hook runs in this pane. Prompts with a **leading `,`** are intercepted with **zero
-model turn**: the hook allocates a ledger id, writes the instruction, and spawns an
-ephemeral sub-orchestrator (`so-<id>`) that decomposes and runs the work on its own
-panes. You never see those prompts — they are already handled.
+hook runs in this pane and intercepts prompts with **zero model turn**: it allocates a
+ledger id, writes the instruction, and spawns an ephemeral sub-orchestrator (`so-<id>`)
+that decomposes and runs the work on its own panes. You never see those prompts — they
+are already handled.
 
-What reaches you is only the **bare** (no-sigil) fall-through:
+**Which prompts get dispatched is set by `fleet dispatch mode`:**
+
+- `sigil` (default) — **opt-in**: a prompt with a **leading `,`** dispatches; a bare
+  prompt falls through to you in-pane.
+- `all` — **the dispatch-everything front door (opt-out)**: **every** bare prompt is
+  dispatched (your pane returns to ready the instant you press Enter — never tied up
+  running a pipeline); a prompt with a **leading `\` (escape sigil)** is the exception,
+  answered **inline** in your pane for a quick question/status check.
+- `off` — the layer is dormant; everything falls through in-pane.
+
+Set/inspect it with `fleet dispatch mode [sigil|all|off]` (bare prints the current
+mode; `fleet dispatch status` also reports it).
+
+What reaches you in-pane is only the fall-through (a bare prompt under `sigil`, or an
+escaped `\…` prompt under `all`):
 
 - A trivial question ("what's the build command?", "which branch is X on?") →
   **answer it in-pane**.
-- A bare prompt that is actually a unit of work the user forgot to prefix → treat it
-  as a dispatch: delegate it yourself (`fleet new …` as above), or tell the user to
-  resend it with a leading `,` to fan it out through the layer.
+- A bare prompt that is actually a unit of work the user forgot to prefix (under
+  `sigil`) → treat it as a dispatch: delegate it yourself (`fleet new …`), or tell the
+  user to resend it with a leading `,` to fan it out through the layer.
+
+### Gated pipelines (the two human gates)
+
+A dispatched feature run through the `fleet-implementation-pipeline` skill **stops
+twice and waits for you**, surfacing each decision as a **✉ pill** in the dashboard
+inbox (posted at `sev warn`, so a desktop notify fires):
+
+- **🚧 GATE 1 — approve the plan.** The sub-orch posts a plain-English plan + proof
+  design, then **parks** (ends its turn). **Pop** the message (`e`→Enter on its row, or
+  the leader `p` FIFO drain) to approve → the approval routes **back to that sub-orch**
+  and auto-submits, and test-first implementation begins. Type a course-correction
+  instead → a fresh prompt; nothing is built.
+- **🚧 GATE 2 — approve the merge.** After the tests are green the sub-orch posts *how
+  the tests prove it* + manual-test steps, with the **merge target baked in**
+  (`fleet integration-branch`; absent ⇒ `main`), then parks. **Pop** = "merge + push to
+  that branch"; the sub-orch reviews the diff, merges, and `fleet ready`s. Type a defect
+  → it loops and builds further on what's there.
+
+A pipeline **never advances past a gate on its own** — only your pop moves it. A sub-orch
+parked at a gate carries a ledger `state=gate{1,2}-wait`, and **`fleet reap` skips it**
+(alongside the existing unread-needs-human guard) so a parked pipeline is never
+torn down before you pop. Gate mechanics for the sub-orch side live in
+`FLEET_SUBORCH.md §7`.
 
 Exceptional events (a dispatch hard-failed, a worker is BLOCKED on the human) arrive
 **out-of-band only** — a tmux toast, a terminal bell, and a row in the dashboard alerts

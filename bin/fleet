@@ -809,6 +809,21 @@ main_pane_for_target() { # <target> -> this session's orchestrator pane_id, or r
   return 1
 }
 
+# Resolve a window NAME → its live pane id within THIS session (or its parked
+# <sess>_hidden sibling, where scratch sub-orchs live). Session-scoped like
+# main_pane_for_target so a same-named window in another project is never matched.
+# Used by the gate pop router to find the owning sub-orch's pane. rc 1 if no live match.
+window_pane_for() { # <wname> -> pane_id, or rc 1
+  local wname="${1:-}" sess s w pane
+  [ -n "$wname" ] || return 1
+  sess=$(session_name 2>/dev/null) || return 1; [ -n "$sess" ] || return 1
+  while IFS=$'\t' read -r s w pane; do
+    { [ "$s" = "$sess" ] || [ "$s" = "${sess}_hidden" ]; } || continue
+    [ "$w" = "$wname" ] && { printf '%s' "$pane"; return 0; }
+  done < <(tmux list-panes -a -F $'#{session_name}\t#{window_name}\t#{pane_id}' 2>/dev/null)
+  return 1
+}
+
 cmd_send() {
   # Optional leading flags. --needs-human marks an orchestrator-bound message as a
   # hard block (sev=blocked -> critical desktop notify) instead of a routine summary
@@ -1113,13 +1128,60 @@ DISPATCH ID: $id"
   release_lock "$led/.spawnlock-$wname"
 }
 
+# ---- dispatch MODE (the dispatch-everything front door classifier) ------------
+# `fleet dispatch mode sigil|all|off` flips the UserPromptSubmit classifier between
+# opt-in dispatch (sigil), opt-out dispatch (all), and disabled (off). Stored as a
+# one-word marker file in the ledger — mirrors dispatch_enable's wiring marker but is
+# orthogonal: `mode` decides WHICH prompts dispatch, `enable/disable` decides whether
+# the hook is wired at all. Absent marker ⇒ `sigil` (today's behaviour, zero surprise).
+dispatch_mode_file() { local r; r=$(fleet_root 2>/dev/null) || return 1; printf '%s/.fleet/dispatch-mode' "$r"; }
+dispatch_mode_get() { # echo the active mode word (default sigil)
+  local f m; f=$(dispatch_mode_file 2>/dev/null) && m=$(cat "$f" 2>/dev/null)
+  case "$m" in all|off|sigil) printf '%s' "$m" ;; *) printf 'sigil' ;; esac
+}
+dispatch_mode_set() {
+  local m="${1:-}"
+  case "$m" in sigil|all|off) ;; *) echo "usage: fleet dispatch mode sigil|all|off" >&2; return 1 ;; esac
+  local f; f=$(dispatch_mode_file 2>/dev/null) || { echo "dispatch mode: no project root" >&2; return 1; }
+  mkdir -p "$(dirname "$f")" 2>/dev/null
+  printf '%s\n' "$m" > "$f" 2>/dev/null || { echo "dispatch mode: could not write $f" >&2; return 1; }
+  echo "dispatch mode: $m"
+}
+
+# `fleet dispatch-classify` — the single dispatch decision oracle, shared by the hook
+# (bin/fleet-dispatch.sh) and the test suite so they can never drift. Reads the prompt
+# from STDIN (so the body never crosses a command line) and the mode from the marker;
+# prints exactly one verdict the caller acts on:
+#   dispatch-sigil  → dispatch; strip ONE leading ',' to get the instruction body
+#   dispatch-bare   → dispatch; the whole prompt is the instruction body
+#   inline          → pass through to the main pane's own model (no dispatch)
+# Mode matrix: sigil → `,`=dispatch / bare=inline (today). all → bare=dispatch /
+# leading `\`(escape)=inline. off → everything inline.
+cmd_dispatch_classify() {
+  local mode prompt; mode=$(dispatch_mode_get); prompt=$(cat 2>/dev/null)
+  case "$mode" in
+    off) echo inline ;;
+    all)
+      case "$prompt" in
+        \\*) echo inline ;;                                   # escape sigil → inline
+        *)   [ -n "$prompt" ] && echo dispatch-bare || echo inline ;;
+      esac ;;
+    *)   # sigil (default)
+      case "$prompt" in
+        ,*) echo dispatch-sigil ;;
+        *)  echo inline ;;
+      esac ;;
+  esac
+}
+
 # `fleet dispatch <id>` — deterministic spawn, no LLM. Also fans out to the
-# enable/disable/status verbs (the opt-in hook installer).
-cmd_dispatch() { # dispatch <id> | enable | disable | status
+# enable/disable/status/mode verbs (the opt-in hook installer + front-door mode).
+cmd_dispatch() { # dispatch <id> | enable | disable | status | mode [sigil|all|off]
   case "${1:-}" in
     enable)  shift; dispatch_enable  "$@"; return $? ;;
     disable) shift; dispatch_disable "$@"; return $? ;;
     status)  shift; dispatch_status  "$@"; return $? ;;
+    mode)    shift; if [ $# -eq 0 ]; then dispatch_mode_get; echo; return 0; else dispatch_mode_set "$1"; return $?; fi ;;
   esac
   local id="${1:-}"
   [ -n "$id" ] || die "usage: fleet dispatch <id> | enable | disable | status"
@@ -1149,6 +1211,122 @@ cmd_dispatch_alloc() {
   meta_set "$d" state queued
   meta_set "$d" created "$(date -Is 2>/dev/null || date)"
   printf '%s\n' "$d"
+}
+
+# ---- gated pipeline: integration branch + gate messages ------------------------
+# `fleet integration-branch` — the per-project merge target a GATE 2 pop ships to.
+# Resolved from a plain marker (<root>/.fleet/integration-branch, contents = branch
+# name); absent ⇒ `main` (current reality for every repo). Baked into the GATE 2
+# sentinel so a pop merges to the right branch without re-asking.
+cmd_integration_branch() {
+  local r f b; r=$(fleet_root 2>/dev/null) || { echo main; return 0; }
+  f="$r/.fleet/integration-branch"
+  b=$(sed -n '1p' "$f" 2>/dev/null | tr -d '[:space:]')
+  printf '%s\n' "${b:-main}"
+}
+
+# `fleet gate parse|post|park|waiting` — the gate-message machinery for the gated
+# pipeline. A gate message carries a machine-readable sentinel as its FIRST body line;
+# the sub-orch advances past a gate ONLY when a popped prompt carries one.
+#   [FLEET-GATE:1 slug=S action=implement]          GATE 1 approval → build (TDD)
+#   [FLEET-GATE:2 slug=S action=merge target=T]     GATE 2 approval → merge S→T, push
+cmd_gate() {
+  local sub="${1:-}"; [ $# -gt 0 ] && shift
+  case "$sub" in
+    parse)   gate_parse   "$@" ;;   # detect+structure a sentinel (pop-detection oracle)
+    post)    gate_post    "$@" ;;   # compose + enqueue a gate message (sev warn)
+    park)    gate_park    "$@" ;;   # mark a sub-orch ledger gate{1,2}-wait (reap-guard)
+    waiting) gate_waiting "$@" ;;   # list sub-orchs parked at a gate (reap consults this)
+    *) die "usage: fleet gate parse|post <1|2>|park <id> <1|2>|waiting" ;;
+  esac
+}
+
+# Detect the gate sentinel on the FIRST line of a body (file arg or stdin). Prints
+# `gate=N <k>=<v> …` and returns 0 when present; returns 1 for any non-sentinel input
+# (a typed course-correction is normal input, NEVER a gate crossing). Honoured ONLY on
+# the first line so a sentinel quoted lower in a body can't forge an approval.
+gate_parse() { # parse [file]
+  local first
+  if [ -n "${1:-}" ] && [ -f "$1" ]; then first=$(sed -n '1p' "$1" 2>/dev/null)
+  else first=$(sed -n '1p' 2>/dev/null); fi
+  case "$first" in
+    \[FLEET-GATE:*\]*) ;;            # must START with the sentinel
+    *) return 1 ;;
+  esac
+  local inner="${first#\[FLEET-GATE:}"; inner="${inner%%\]*}"   # "1 slug=x action=implement"
+  local n="${inner%% *}" rest="${inner#* }" kv
+  printf 'gate=%s' "$n"
+  for kv in $rest; do case "$kv" in *=*) printf ' %s' "$kv" ;; esac; done
+  printf '\n'
+}
+
+# Compose + enqueue a gate message. Posted at sev=warn so the desktop notify fires
+# (info would be silent). Body is SHORT (sentinel + pointer + digest) because the body
+# is what gets pasted into the sub-orch on pop. The GATE 2 target defaults to the
+# project integration-branch and is frozen into the sentinel.
+gate_post() { # post <1|2> --slug S [--target T] [--summary "…"] [--plan FILE] [-d <id>]
+  local gate="${1:-}"; [ $# -gt 0 ] && shift
+  case "$gate" in 1|2) ;; *) die "usage: fleet gate post <1|2> --slug S [--target T] [--summary …]" ;; esac
+  local slug="" target="" summary="" plan="" disp="-"
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --slug)        slug="$2"; shift 2 ;;
+      --target)      target="$2"; shift 2 ;;
+      --summary)     summary="$2"; shift 2 ;;
+      --plan)        plan="$2"; shift 2 ;;
+      -d|--dispatch) disp="$2"; shift 2 ;;
+      *) die "fleet gate post: unknown arg $1" ;;
+    esac
+  done
+  [ -n "$slug" ] || die "fleet gate post: --slug required"
+  local sentinel title body
+  if [ "$gate" = 1 ]; then
+    sentinel="[FLEET-GATE:1 slug=$slug action=implement]"
+    [ -n "$plan" ] || plan="_reports/$slug/PLAN-PLAIN.md"
+    title="GATE 1 — plan ready: ${summary:-$slug}"
+    body="$sentinel
+Plain plan: $plan
+In one paragraph: ${summary:-<see plan>}.
+▸ POP this message to APPROVE and start test-first implementation.
+▸ Or reply with changes to revise the plan (nothing is built yet)."
+  else
+    [ -n "$target" ] || target=$(cmd_integration_branch)
+    sentinel="[FLEET-GATE:2 slug=$slug action=merge target=$target]"
+    [ -n "$plan" ] || plan="_reports/$slug/DONE-PLAIN.md"
+    title="GATE 2 — $slug done, tests green: ready to merge → $target"
+    body="$sentinel
+Details: $plan
+HOW THE TESTS PROVE IT: ${summary:-<see details>}.
+▸ POP this message = \"merge + push to $target\".
+▸ Or run the manual steps, then pop to ship, or reply with what's broken to loop."
+  fi
+  inbox_put -d "$disp" --sev warn -t "$title" -m "$body"
+}
+
+# Mark a sub-orch's ledger as parked at a gate so `fleet reap` won't tear its
+# pipeline down before the human pops (the gate message would orphan). The sub-orch
+# calls this right after posting + verifying its gate message, then ends its turn.
+gate_park() { # park <dispatch-id> <1|2>
+  local id="${1:-}" gate="${2:-}"
+  case "$gate" in 1|2) ;; *) die "usage: fleet gate park <dispatch-id> <1|2>" ;; esac
+  [ -n "$id" ] || die "usage: fleet gate park <dispatch-id> <1|2>"
+  local r; r=$(fleet_root 2>/dev/null) || die "no project root"
+  local d="$r/.fleet/dispatch/$id"
+  [ -d "$d" ] || die "no such dispatch $id"
+  meta_set "$d" state "gate${gate}-wait"
+  echo "parked $id at gate${gate}-wait"
+}
+
+# List the sub-orch window names (so-<id>) currently parked at a gate. `fleet reap`
+# consults this set and skips any matching worktree/window (unless --force).
+gate_waiting() {
+  local r led d id st; r=$(fleet_root 2>/dev/null) || return 0
+  led="$r/.fleet/dispatch"; [ -d "$led" ] || return 0
+  for d in "$led"/d*/; do
+    [ -d "$d" ] || continue
+    id=$(basename "$d"); st=$(meta_get "$d" state)
+    case "$st" in gate1-wait|gate2-wait) printf 'so-%s\n' "$id" ;; esac
+  done
 }
 
 # `fleet reconcile` — one-shot sweep: re-animate stranded dispatches (unfinished
@@ -1507,6 +1685,24 @@ inbox_gc() { # cap newest-N -> MOVE overflow to archive/; cap archive too. Never
 # archive-as-truth) only after a VERIFIED paste + mv; any failure leaves the message
 # live so it is never lost. Session-scoped throughout (inbox_dir + cmd_main_pane).
 # Feedback via tmux display-message (echo is invisible to a popup-dispatched action).
+# Decide WHERE a popped message routes. With the front door, a gate message authored
+# by a sub-orch (from=so-d<N>) must route BACK to that sub-orch's pane and AUTO-SUBMIT
+# (a machine pane has no human draft to clobber, and auto-submit makes one keypress both
+# paste and advance). Everything else (human/system/orphan, or a reaped sub-orch whose
+# window is gone) routes to the MAIN pane with NO auto-submit — protect a half-typed
+# draft. Prints "dest=<main|suborch> submit=<0|1> pane=<id>". Pure resolution, no paste.
+inbox_route() { # route <from>
+  local from="${1:-}" sp
+  case "$from" in
+    so-*)
+      sp=$(window_pane_for "$from" 2>/dev/null)
+      [ -n "$sp" ] && { printf 'dest=suborch submit=1 pane=%s\n' "$sp"; return 0; }
+      ;;                                   # sub-orch gone → fall through to main fallback
+  esac
+  local mp; mp=$(cmd_main_pane 2>/dev/null)
+  printf 'dest=main submit=0 pane=%s\n' "${mp:-}"
+}
+
 inbox_pop() { # pop [file] — no file = global-oldest FIFO
   local arg="${1:-}" f dir
   dir=$(inbox_dir) || { tmux display-message "inbox: no project root" 2>/dev/null; return 0; }
@@ -1522,8 +1718,14 @@ inbox_pop() { # pop [file] — no file = global-oldest FIFO
     f=$(ls -1 "$dir"/*.msg 2>/dev/null | sort | head -1)
     [ -n "$f" ] && [ -e "$f" ] || { tmux display-message "inbox empty" 2>/dev/null; return 0; }
   fi
-  local orch; orch=$(cmd_main_pane 2>/dev/null)
-  [ -n "$orch" ] || { tmux display-message "no orchestrator pane — nothing popped" 2>/dev/null; return 0; }
+  # ROUTE by sender (§7 front door): a gate message from a live sub-orch routes BACK to
+  # it and auto-submits; everything else goes to the main pane, no auto-submit. Resolve
+  # the destination from the message's `from=` — no new field needed.
+  local route orch submit=0
+  route=$(inbox_route "$(inbox_field "$f" from)")
+  orch=$(printf '%s' "$route" | sed -n 's/.*pane=//p')
+  case "$route" in *submit=1*) submit=1 ;; esac
+  [ -n "$orch" ] || { tmux display-message "no destination pane — nothing popped" 2>/dev/null; return 0; }
   # BUSY-GATE — FIFO (no-arg) only. A blind leader-menu pop must not inject into an
   # orchestrator that is mid-generation or sitting at a permission prompt: that is
   # the very mid-prompt interruption the queue exists to prevent. A SPECIFIC file
@@ -1557,6 +1759,10 @@ $body"
   tmux set-buffer -b fleet-inbox-pop -- "$text" 2>/dev/null \
     && tmux paste-buffer -t "$orch" -b fleet-inbox-pop -p -d 2>/dev/null \
     || { tmux display-message "paste failed — nothing changed" 2>/dev/null; return 0; }
+  # AUTO-SUBMIT only for a machine sub-orch destination (submit=1): there is no human
+  # draft to clobber, so one keypress both pastes the gate approval and advances the
+  # parked pipeline. The human/main pane keeps the never-submit rule (no C-m).
+  [ "$submit" = 1 ] && tmux send-keys -t "$orch" C-m 2>/dev/null || true
   # archive-as-truth = mark read. VERIFY the mv: if it fails after a successful paste
   # the file stays live and the next FIFO pop would re-select + re-paste the SAME
   # message forever (starving newer ones) — warn instead of silently re-popping.
@@ -1574,6 +1780,8 @@ cmd_inbox() { # inbox [put|list|read|count|gc|clear|pop] — bare = pager that C
   case "$sub" in
     put)   inbox_put   "$@" ;;
     pop)   inbox_pop   "$@" ;;   # pop [file]: file = that msg, none = global-oldest FIFO
+    route) inbox_route "$@" ;;   # internal: where a from= routes (dest/submit/pane)
+    needs-human) inbox_has_needs_human_from "$@" ;; # internal: reap-guard predicate (rc 0 = block)
     list)  inbox_list  "$@" ;;   # non-destructive peek
     read)  inbox_read  "$@" ;;   # non-destructive display
     count) inbox_count "$@" ;;
@@ -1662,6 +1870,7 @@ dispatch_status() { # report whether the hook is wired + the ledger rollup
   settings="$root/.claude/settings.json"
   [ -f "$settings" ] && grep -q "fleet-dispatch" "$settings" 2>/dev/null && on=yes
   echo "dispatch hook wired: $on  ($settings)"
+  echo "dispatch mode:       $(dispatch_mode_get)  (sigil=opt-in ',' | all=opt-out, escape '\\' | off=disabled)"
   local led="$root/.fleet/dispatch" d id st
   [ -d "$led" ] || { echo "no dispatches yet"; return 0; }
   printf 'ID\tSTATE\tWINDOW\n'
@@ -1749,6 +1958,7 @@ cmd_reap() { # reap [<target>] [--force] — remove worktrees flagged ready
   # empty, not let the harness shift into it. `IFS=$'\t' read` collapses runs of
   # tab (an IFS *whitespace* char) and drops empty fields, mis-parsing the rest.
   local lines; lines=$(tr '\t' '\037' <"$f" 2>/dev/null)   # snapshot: cmd_forget mutates $f
+  local gatewait; gatewait=$(gate_waiting 2>/dev/null)     # sub-orchs parked at a gate (skip)
   local any=0 reaped=0 dir repo branch base
   while IFS=$'\037' read -r dir repo branch _bare base _rest; do
     [ -n "$dir" ] || continue
@@ -1794,6 +2004,13 @@ cmd_reap() { # reap [<target>] [--force] — remove worktrees flagged ready
                 | awk -F'\t' -v d="$dir" '$1==d{print $2; exit}')
       if inbox_has_needs_human_from "$wrecon" ${wlive:+"$wlive"}; then
         echo "skip   $lbl: unread needs-human message in inbox — pop/handle it first (use --force)"; continue
+      fi
+      # GATE-WAIT GUARD: never reap a sub-orch parked at a gate (ledger gate{1,2}-wait)
+      # — its gate message stays live until the human pops it, so removing the worktree
+      # would orphan the very approval the pipeline is waiting on. Match by live window
+      # name against the parked set. Like the other guards, --force overrides.
+      if [ -n "$wlive" ] && printf '%s\n' "$gatewait" | grep -qxF "$wlive"; then
+        echo "skip   $lbl: sub-orch parked at a gate — pop its message first (use --force)"; continue
       fi
     fi
     local win; win=$(tmux list-panes -a -F '#{pane_current_path}'$'\t''#{window_id}' 2>/dev/null \
@@ -3271,8 +3488,11 @@ case "${1:-}" in
   browser) shift; cmd_browser "$@" ;;      # drive a real Chromium against the dev app
   devport) shift; cmd_devport "$@" ;;      # write/show the .fleet/devport marker
   mode)    shift; cmd_mode "$@" ;;
-  dispatch)      shift; cmd_dispatch "$@" ;;        # <id> spawn, or enable|disable|status
+  dispatch)      shift; cmd_dispatch "$@" ;;        # <id> spawn, or enable|disable|status|mode
   dispatch-alloc) shift; cmd_dispatch_alloc "$@" ;; # internal: alloc id + ledger dir (hook)
+  dispatch-classify) shift; cmd_dispatch_classify "$@" ;; # internal: front-door classifier (hook)
+  gate)          shift; cmd_gate "$@" ;;            # gated pipeline: parse|post|park|waiting
+  integration-branch) shift; cmd_integration_branch "$@" ;; # per-project GATE 2 merge target
   reconcile)     shift; cmd_reconcile "$@" ;;       # sweep stranded dispatches
   notify)        shift; cmd_notify "$@" ;;          # safe-delivery primitive
   slug)          shift; cmd_slug "$@" ;;            # deterministic kebab slug (worker keys)

@@ -151,3 +151,59 @@ watch is `done` / `failed` / handed off. Mark your own dispatch `done` (or `fail
 A crashed sub-orch with unfinished state and a dead window is re-animated by
 `fleet reconcile` (run opportunistically by the next dispatch, or manually) — so a
 clean exit on completion is the only correct way to stop.
+
+## 7. GATED MODE — stop at a gate, wait for the human's POP
+
+When you run the `fleet-implementation-pipeline` skill for a dispatched feature, the
+pipeline has **two human gates**. A gate is **not** a new blocking primitive — it is a
+deliberate break in your turn-chain: a claude pane only runs when input lands in it, so
+after you post a gate message you **END YOUR TURN** and sit parked. The ONLY thing that
+un-parks you is the human **popping** the gate message back into your pane.
+
+**The turn discipline (the whole trick).** Your normal phase resume-note says "proceed
+to the next phase." At a gate you change it to **post + verify + END TURN — never
+proceed.** Concretely, after the conclusion (GATE 1) or completion (GATE 2) agent goes
+idle, you wake once, confirm the inbox message exists, mark the ledger, and stop:
+
+```
+# GATE 1 — after research+debate, the conclusion agent wrote PLAN-PLAIN.md (+ SYNTHESIS.md).
+# Only on a BUILD verdict: post the gate, then PARK.
+fleet gate post 1 --slug "$slug" --summary "<one-line: what we'll build + how we prove it>" -d <id>
+fleet inbox list | grep -q "GATE 1" || fleet gate post 1 --slug "$slug" --summary "…" -d <id>  # verify; re-post if lost
+fleet gate park <id> 1     # ledger state=gate1-wait → `fleet reap` will NOT tear you down
+# …then END YOUR TURN. Do NOT spawn implementers. Nothing advances until the human pops.
+```
+
+```
+# GATE 2 — after the two testers + test-debate return DONE, the completion agent wrote
+# DONE-PLAIN.md. The merge target comes from the project integration-branch.
+fleet gate post 2 --slug "$slug" --summary "<2-4 plain sentences: how the tests prove it>" -d <id>
+fleet gate park <id> 2
+# …then END YOUR TURN.
+```
+
+`fleet gate post` enqueues the message at **sev warn** (so the desktop notify fires)
+with a machine-readable sentinel as its first body line, and bakes the GATE 2 merge
+target (`fleet integration-branch`; absent ⇒ `main`) into the sentinel.
+
+**Recognising the human's approval.** When a prompt lands in your pane, check whether it
+is a gate crossing — run it through the oracle, never eyeball it:
+
+```
+printf '%s' "$INCOMING_PROMPT" | fleet gate parse    # rc 0 + "gate=N action=… target=…" if it's an approval
+```
+
+| Parsed sentinel | What you do |
+|---|---|
+| `gate=1 action=implement slug=S` | Proceed to **Phase 3 (TDD)** for slug S using PLAN.md/SYNTHESIS.md. |
+| `gate=2 action=merge slug=S target=T` | Review the diff, **merge S → T, push T**, then `fleet ready`. |
+
+**A prompt with NO sentinel is normal input — NEVER a gate crossing.** A typed
+course-correction at a gate is a fresh instruction: re-plan (loop Phase 1) with the new
+direction; do not treat it as a go-ahead. The sentinel's presence is the sole advance
+discriminator.
+
+> Gate posts are addressed to the human's inbox, but the human's **pop routes the
+> approval back to YOUR pane and auto-submits** (you are a machine pane, no draft to
+> clobber) — resolved from the `from=so-<id>` the post stamps. You never touch the main
+> input line, and the main pane is never the parked party.
