@@ -225,24 +225,91 @@ cmd_ls() {
   # Scoping lives HERE (display only) — agents_tsv stays global so send/pick/
   # watch/dashboard callers keep the full list.
   # `--hold` keeps a popup open after printing (used by the leader menu).
-  local all=0 hold=0
+  # `--pick` makes the popup an interactive fzf jump-to-agent (Enter → switch);
+  # `--measure` is its fzf-free sizer face (rows + chrome placeholders). Both are
+  # ADD-ONLY: the default/static print path below is left byte-for-byte unchanged.
+  local all=0 hold=0 pick=0 measure=0
   while [ $# -gt 0 ]; do
     case "$1" in
-      --all|-a) all=1 ;;
-      --hold)   hold=1 ;;
+      --all|-a)  all=1 ;;
+      --hold)    hold=1 ;;
+      --pick)    pick=1 ;;
+      --measure) measure=1 ;;
     esac
     shift
   done
+  # On an interactive --pick popup, hold the (empty/degraded) frame open under -E
+  # exactly as --hold does — but only on a real TTY, so `fleet ls --pick | cat`
+  # never blocks on a read. --measure never holds (it must stay pure text).
+  local want_hold=$hold
+  if [ "$pick" -eq 1 ] && [ -t 0 ] && [ -t 1 ]; then want_hold=1; fi
 
   local out; out=$(agents_tsv)
-  [ -n "$out" ] || { echo "no agents registered"; [ "$hold" -eq 1 ] && hold_wait; return 0; }
+  [ -n "$out" ] || { echo "no agents registered"; [ "$want_hold" -eq 1 ] && hold_wait; return 0; }
 
   # Scope unless --all. session_name failing/empty (not inside tmux) → can't
   # scope, so fall through to the global listing.
   local sess
   if [ "$all" -eq 0 ] && sess=$(session_name 2>/dev/null) && [ -n "$sess" ]; then
     out=$(echo "$out" | awk -F'\t' -v s="$sess" '$3==s || $3==s"_hidden"')
-    [ -n "$out" ] || { echo "no agents in this project"; [ "$hold" -eq 1 ] && hold_wait; return 0; }
+    [ -n "$out" ] || { echo "no agents in this project"; [ "$want_hold" -eq 1 ] && hold_wait; return 0; }
+  fi
+
+  # --pick / --measure: a SEPARATE picker row-builder (NOT the static awk below).
+  # It drops *_hidden (a switch-client into the bare hidden session is a teleport
+  # trap — see cmd_pick), sorts attention-first (blocked<idle<working), and emits
+  # `session<TAB>window_id<TAB><pretty display>` so fzf can hide cols 1-2 and the
+  # two-line nav primitive can read them back. The static print path is untouched.
+  if [ "$pick" -eq 1 ] || [ "$measure" -eq 1 ]; then
+    local hdr='STATE     AGENT                     WINDOW            IN-STATE     ·  ↵ jump · esc cancel'
+    local prows
+    prows=$(echo "$out" | awk -F'\t' '
+      $3 ~ /_hidden$/ { next }
+      $1=="blocked" { c="\033[31m"; o=0 }
+      $1=="idle"    { c="\033[32m"; o=1 }
+      $1=="working" { c="\033[34m"; o=2 }
+      {
+        st=$1; extra=""
+        if ($9 != "" && $1 != "working" && $1 != "blocked") { st="done"; extra="  (ready: " $9 ")" }
+        else if ($9 != "")                                  { extra="  (ready? " $9 " — but " $1 ")" }
+        printf "%d\t%s\t%s\t%s● %-8s\033[0m %-24s %-16s %s%s\n", o, $3, $4, c, st, $2, $3":"$5, $6, extra
+      }' | sort -n | cut -f2-)
+
+    if [ "$measure" -eq 1 ]; then
+      # Pure-text sizer face: the visible display column + 3 fzf-chrome lines
+      # (header, prompt, info), mirroring cmd_sessions --measure. No fzf.
+      [ -n "$prows" ] && printf '%s\n' "$prows" | cut -f3-
+      printf '%s\n' "$hdr"
+      printf 'agent> \n\n'
+      return 0
+    fi
+
+    # --pick. No selectable agents (all hidden / none): print + hold on a TTY so
+    # the -E popup doesn't flash; plain return when piped/non-tty.
+    if [ -z "$prows" ]; then
+      echo "no agents to jump to"
+      [ "$want_hold" -eq 1 ] && hold_wait
+      return 0
+    fi
+    # No fzf, or not a TTY (piped, captured): static-style print and bail. NEVER
+    # hold here — `fleet ls --pick | cat` must not hang on a read.
+    if ! command -v fzf >/dev/null || [ ! -t 0 ] || [ ! -t 1 ]; then
+      printf '%s\n' "$prows" | cut -f3-
+      return 0
+    fi
+    # Interactive jump. --border=none (the fit-content popup already draws a
+    # rounded border; a second one clips the rightmost column). Nav = cmd_pick's
+    # two lines verbatim (window ids are server-global, so no session qualifier).
+    local choice
+    choice=$(printf '%s\n' "$prows" | fzf --ansi --delimiter='\t' --with-nth=3 \
+              --no-sort --prompt='agent> ' --height=100% --border=none \
+              --header="$hdr") || return 0
+    local psess pwin
+    psess=$(printf '%s' "$choice" | cut -f1)
+    pwin=$(printf '%s' "$choice" | cut -f2)
+    tmux switch-client -t "$psess" 2>/dev/null
+    tmux select-window -t "$pwin"  2>/dev/null
+    return 0
   fi
 
   printf 'STATE\tAGENT\tWINDOW\tIN-STATE\n'
@@ -2687,7 +2754,7 @@ sessions|o|Session|Fleet sessions|Switch between open fleet sessions
 reload|R|Session|Reload dashboard|Restart the dashboard pane in place (picks up new code)
 dispatch|d|Session|Dispatch mode|Toggle the every-prompt-dispatch front door (off/sigil/all)
 quit|Q|Session|Quit fleet|Kill this fleet session (closes all agents)
-ls|l|Info|List agents|Show agent states in a popup
+ls|l|Info|List + jump to agent|This project's agents w/ full status; Enter jumps to one
 keys|?|Info|Keys / help|List every fleet keybinding in a popup
 rebind|c|Info|Rebind a key|Change a feature's keybinding
 EOF
@@ -2853,13 +2920,13 @@ popup_fit_content() {
 cmd_popup_fit() { # cmd_popup_fit <menu|keys|ls|sessions> — thin map of kind →
   # (measure, run, fallback) feeding the one popup_fit_content helper. Keeps
   # menu/keys/ls/sessions on a single sizing path so they can never drift apart.
-  # 'sessions' is INTERACTIVE fzf, so its measure cmd is a fzf-free `--measure`
-  # dump (rows + fzf-chrome placeholder lines) — never the interactive run.
+  # 'sessions' and 'ls' are INTERACTIVE fzf, so their measure cmd is a fzf-free
+  # `--measure` dump (rows + fzf-chrome placeholder lines) — never the run.
   local self="$FLEET_DIR/bin/fleet"
   case "${1:-menu}" in
     menu)     popup_fit_content 'leader_grid'         "$self menu"        64% 80% ;;
     keys)     popup_fit_content "$self keys"          "$self keys --hold" 72% 70% ;;
-    ls)       popup_fit_content "$self ls"            "$self ls --hold"   70% 60% ;;
+    ls)       popup_fit_content "$self ls --measure"  "$self ls --pick"   70% 60% ;;
     sessions) popup_fit_content "$self sessions --measure" "$self sessions" 70% 60% ;;
   esac
 }
@@ -3575,7 +3642,7 @@ fleet — agent fleet manager (tmux + nvim + Claude Code)
   fleet restore          respawn saved agents from a previous session
   fleet new <repo> <br>  spawn agent (worktree + window + claude) [-p prompt] [--bare] [--switch|-s] [--base br] [-h harness] [--self-merge|--no-self-merge]  (workers may merge/push by default)
   fleet new --scratch    spawn a repo-less agent (no repo/branch/worktree) [label] [-p prompt] [-h harness]
-  fleet ls               list THIS project's agents and states (--all|-a = every project on the server)
+  fleet ls               list THIS project's agents and states (--all|-a = every project on the server; --pick = fzf jump-to-agent popup, Enter jumps)
   fleet pick             fzf jump-to-agent
   fleet send <a> "msg"   send message to an agent's claude
   fleet ready [a] [-m r]  flag a worktree done/ready for deletion (no arg = the one you're in) [--clear]
