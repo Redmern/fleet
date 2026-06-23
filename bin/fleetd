@@ -28,7 +28,6 @@ GLYPH_COLOR = {"working": "colour4", "blocked": "colour1", "idle": "colour2"}
 
 SWEEP_INTERVAL = 60
 SCRAPE_INTERVAL = 2          # how often hookless harnesses (omp, …) are polled
-INBOX_INTERVAL = 5          # how often the inbox unread badge + notify is refreshed
 NOTIFY_COOLDOWN = 30
 IDLE_FLAP_GUARD = 2.0
 # A window stamped @fleet_harness that has never reported a hook is surfaced as a
@@ -57,8 +56,6 @@ class Fleet:
         self.last_working = {}  # pane_id -> ts of last working report
         self.last_sweep = 0.0
         self.last_scrape = 0.0
-        self.last_inbox = 0.0
-        self.inbox_notified = set()  # inbox ids already desktop-notified (no repeats)
 
     # ---- state ingestion -------------------------------------------------
 
@@ -232,117 +229,11 @@ class Fleet:
             fmt = fmt.rstrip("\n")
             if fmt and "@agent_glyph" not in fmt:
                 tmux("set", "-g", opt, fmt + "#{?@agent_glyph, #{@agent_glyph},}")
+        # status-left ship glyph used to be re-healed off the (now-deleted) inbox
+        # poll; ride the same theme-switch healing as the window-status glyphs.
+        self.heal_status_left()
 
-    # ---- inbox (surface c: ambient unread badge; surface d: desktop notify) ----
-
-    def inbox_tick(self, force=False):
-        # Surface (c): per-session @fleet_inbox unread badge, rendered by a healed
-        # status-right. Surface (d): feed unread sev>=warn entries to notify-send.
-        # Every worker writes the inbox files directly, so when fleetd is down only
-        # the badge + desktop notify pause — reading still works (fleet inbox tails
-        # the files). Fail-silent throughout.
-        now = time.time()
-        if not force and now - self.last_inbox < INBOX_INTERVAL:
-            return
-        self.last_inbox = now
-        out = tmux("list-sessions", "-F", "#{session_name}\t#{@fleet_root}")
-        if out is None:
-            return
-        seen_roots = set()
-        for line in out.splitlines():
-            sess, _, root = line.partition("\t")
-            root = root.strip()
-            if not sess:
-                continue
-            if not root:
-                tmux("set", "-t", sess, "-u", "@fleet_inbox")
-                continue
-            unread, alerts = self.scan_inbox(root)
-            if unread > 0:
-                tmux("set", "-t", sess, "@fleet_inbox",
-                     f"#[fg=colour3,bg=default]✉{unread}#[default]")
-            else:
-                tmux("set", "-t", sess, "-u", "@fleet_inbox")
-            # desktop-notify warn/blocked once per id, but only sweep each root once
-            # (the same root can back several sessions, e.g. <sess> + <sess>_hidden)
-            if root not in seen_roots:
-                seen_roots.add(root)
-                for ident, sev, frm, title in alerts:
-                    self.notify_inbox(ident, sev, frm, title)
-        self.heal_status_right()
-
-    def scan_inbox(self, root):
-        # -> (unread_count, [(id, sev, from, title) for unread sev>=warn not yet notified])
-        d = os.path.join(root, ".fleet", "inbox")
-        try:
-            files = [f for f in os.listdir(d) if f.endswith(".msg")]
-        except OSError:
-            return 0, []
-        try:
-            with open(os.path.join(d, ".cursor")) as f:
-                cur = f.read().strip()
-        except OSError:
-            cur = ""
-        unread, alerts = 0, []
-        for fn in files:
-            ident = fn[:-4]                       # strip ".msg"
-            if cur and ident <= cur:              # lexical == chronological (id prefix)
-                continue
-            unread += 1
-            if ident in self.inbox_notified:
-                continue
-            sev, frm, title = self.read_header(os.path.join(d, fn))
-            if sev in ("warn", "blocked"):
-                alerts.append((ident, sev, frm, title))
-        return unread, alerts
-
-    @staticmethod
-    def read_header(path):
-        sev, frm, title = "info", "-", ""
-        try:
-            with open(path) as f:
-                for ln in f:
-                    ln = ln.rstrip("\n")
-                    if ln == "--":               # header ends at the separator
-                        break
-                    k, _, v = ln.partition("=")
-                    if k == "sev":
-                        sev = v
-                    elif k == "from":
-                        frm = v
-                    elif k == "title":
-                        title = v
-        except OSError:
-            pass
-        return sev, frm, title
-
-    def notify_inbox(self, ident, sev, frm, title):
-        now = time.time()
-        key = ("inbox", ident)
-        if now - self.last_notify.get(key, 0) < NOTIFY_COOLDOWN:
-            return
-        self.last_notify[key] = now
-        self.inbox_notified.add(ident)
-        urgency = "critical" if sev == "blocked" else "normal"
-        try:
-            subprocess.run(
-                ["notify-send", "-a", "fleet", "-u", urgency,
-                 f"Inbox: {frm}", title or "(summary)"],
-                timeout=5, capture_output=True,
-            )
-        except Exception:
-            pass
-
-    def heal_status_right(self):
-        # Mirror heal_status_format: re-inject the unread badge into the runtime
-        # global status-right (theme switches wipe it). The per-session
-        # @fleet_inbox option resolves in each session's own status bar.
-        fmt = tmux("show", "-g", "-v", "status-right")
-        if fmt is None:
-            return
-        fmt = fmt.rstrip("\n")
-        if fmt and "@fleet_inbox" not in fmt:
-            tmux("set", "-g", "status-right", "#{?@fleet_inbox,#{@fleet_inbox} ,}" + fmt)
+    def heal_status_left(self):
         # Mirror the status-left fleet icon (inject_status_format in `bin/fleet`).
         # Theme switches wipe status-left too; re-inject the @fleet_root-gated
         # ship ( nf-fa-ship U+F21A) INSIDE the session-name pill, right before
@@ -523,7 +414,6 @@ def main():
                         pass
         fleet.scrape_harnesses()
         fleet.sweep()
-        fleet.inbox_tick()
 
 
 if __name__ == "__main__":
