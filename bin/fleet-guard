@@ -22,7 +22,7 @@ in="$(cat 2>/dev/null || true)"
 GUARD_ON=0; [ -f "$CFG/guard-on" ] && GUARD_ON=1
 
 FLEET_GUARD_INPUT="$in" FLEET_GUARD_CFG="$CFG" FLEET_GUARD_ON="$GUARD_ON" python3 - <<'PY' || exit 0
-import json, os, fnmatch, sys, re
+import json, os, fnmatch, sys, re, shlex
 
 try:
     h = json.loads(os.environ["FLEET_GUARD_INPUT"])
@@ -41,30 +41,76 @@ def deny(reason):
     sys.exit(0)
 
 # --- (1) ALWAYS-ON: workers must not merge or push -------------------------------
-# Scan every git invocation in the command (split on shell separators) and find
-# its subcommand, skipping global options like `-C <path>` / `-c k=v`. If a worker
-# tries `git merge` or `git push`, hard-deny. Fail-open on anything ambiguous.
-# Opt-out: a worker spawned with `fleet new --self-merge` carries
-# FLEET_SELF_MERGE=1 and is exempt — the orchestrator explicitly granted it
-# merge/push rights for that branch.
+# Find `git merge`/`git push` only when `git` is the COMMAND WORD of a statement,
+# not when the words "git merge" merely appear inside some other command's quoted
+# argument (e.g. `fleet send x "... do the git merge now"`). The old scan split on
+# separators with a naive `seg.split()` and matched `git` ANYWHERE in the token
+# list, so any quoted body containing "git merge"/"git push" was falsely denied.
+#
+# The fix tokenizes QUOTE-AWARE *once* per line (shlex), so a quoted "git push"
+# stays a single token and never matches; it then segments on the shell operator
+# tokens (; & | && ||) and takes the first non-`VAR=value` token of each run as the
+# command word. A separator INSIDE a quote can no longer desync the parse (the bug
+# a split-before-parse scheme reintroduces). Newlines are real statement separators
+# in the common (unquoted) case, so we split on them first; a newline buried inside
+# a quoted string is data, not a command, so splitting it is harmless.
+#
+# fail-CLOSED for THIS block (the inverse of the guard's general "on any doubt,
+# allow"): the always-on merge/push floor is an integrity control, so on an
+# unbalanced-quote parse error we fall back to the conservative whitespace scan —
+# which over-denies but never lets a real `git merge`/`git push` (e.g. a trailing
+# `"`) slip past. A false deny on malformed input is recoverable (rephrase); a
+# false allow merges unreviewed code into main. Opt-out: a worker spawned with
+# `fleet new --self-merge` carries FLEET_SELF_MERGE=1 and is exempt.
+#
+# Known accepted gaps (pre-existing; this block is a speed-bump against ACCIDENTAL
+# self-merge, not an airtight sandbox): `sh -c 'git push'`, `eval`, aliases, and
+# wrapper scripts all have a non-`git` command word and are not caught.
+ENV_ASSIGN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
+
+def is_op(tok):  # an operator token is made solely of shell metacharacters
+    return tok != "" and all(c in "();<>|&" for c in tok)
+
+def git_sub_in_run(run):  # subcommand iff `git` is this run's command word, else None
+    k = 0
+    while k < len(run) and ENV_ASSIGN.match(run[k]):   # skip FOO=bar prefixes
+        k += 1
+    if k >= len(run) or run[k] != "git":
+        return None
+    j = k + 1
+    while j < len(run) and run[j].startswith("-"):     # skip git global opts
+        if run[j] in ("-C", "-c") and j + 1 < len(run):
+            j += 2
+        else:
+            j += 1
+    return run[j] if j < len(run) else ""
+
+def git_subcommands(line):  # all command-word git subcommands on one line
+    try:
+        lex = shlex.shlex(line, posix=True, punctuation_chars=True)
+        lex.whitespace_split = True
+        toks = list(lex)
+    except ValueError:
+        toks = line.split()            # fall CLOSED: conservative whitespace scan
+    subs, run = [], []
+    for tok in toks + ["\n"]:          # sentinel flushes the final run
+        if tok == "\n" or is_op(tok):
+            s = git_sub_in_run(run)
+            if s is not None:
+                subs.append(s)
+            run = []
+        else:
+            run.append(tok)
+    return subs
+
 if tool == "Bash" and role == "worker" and os.environ.get("FLEET_SELF_MERGE") != "1":
     cmd = str((h.get("tool_input") or {}).get("command") or "")
-    for seg in re.split(r"&&|\|\||;|\n|\|", cmd):
-        toks = seg.split()
-        if "git" not in toks:
-            continue
-        i = toks.index("git")
-        j = i + 1
-        while j < len(toks) and toks[j].startswith("-"):   # skip git global opts
-            if toks[j] in ("-C", "-c") and j + 1 < len(toks):
-                j += 2
-            else:
-                j += 1
-        sub = toks[j] if j < len(toks) else ""
-        if sub in ("merge", "push"):
-            deny("fleet-guard: workers must not run 'git %s'. Integration is the "
-                 "orchestrator's job — it reviews your diff and merges/pushes. "
-                 "Commit on your own branch and run 'fleet ready' to signal done." % sub)
+    for line in cmd.split("\n"):
+        for sub in git_subcommands(line):
+            if sub in ("merge", "push"):
+                deny("fleet-guard: workers must not run 'git %s'. Integration is the "
+                     "orchestrator's job — it reviews your diff and merges/pushes. "
+                     "Commit on your own branch and run 'fleet ready' to signal done." % sub)
 
 # --- (2) OPT-IN: protected-path edits (tests / CI / lockfiles) -------------------
 if os.environ.get("FLEET_GUARD_ON") != "1":

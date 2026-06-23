@@ -162,8 +162,15 @@ this project with the `fleet` CLI.
   `fleet reap`). When you dispatch, **instruct the worker in its `-p` prompt** to
   write research/plans/architecture/scratch markdown to `$FLEET_DOCS` instead of
   the repo root — keeps returned diffs clean.
-- `fleet send <agent> "message"` — send a follow-up message into a running
-  agent's input. `<agent>` matches window name or repo/branch.
+- `fleet send [--needs-human] <agent> "message"` — send a follow-up message into a
+  running agent's input. `<agent>` matches window name or repo/branch.
+  **A worker that needs the human, or has finished, POSTs back with
+  `fleet send main "…"`** — addressing the orchestrator NEVER send-keys into its
+  pane (which would clobber the human's in-progress prompt); the message is queued
+  into the durable inbox and surfaces as a **✉N** pill. Add **`--needs-human`** for
+  a hard block: it raises the severity to `blocked` so it fires a desktop notify
+  (a routine summary stays `info` / silent). Don't sit silent — POST. (This is the
+  canonical worker→human verb; `fleet inbox put` is the internal primitive.)
 - `fleet mode <agent>` — cycle that agent's permission mode one step. Only for
   harnesses that expose permission modes (e.g. claude); a no-op for harnesses
   like omp that have none.
@@ -188,7 +195,7 @@ any pane, including this orchestrator pane — both are prefix-table bindings, s
 plain Space typing in panes is untouched), or by pressing **bare Space while the
 dashboard pane is focused**. Press the shown key to run an action;
 **Esc/q/Space** closes. Actions are grouped **+Agents** (pick `a`, new `n`, ready
-`y`, reap `x`, orchestrator `m`, rebuild `M`), **+Session**
+`y`, reap `x`, orchestrator `m`, pop oldest message `p`, rebuild `M`), **+Session**
 (save `s`, sessions `o`, reload `R`, quit `Q`), and **+Info** (ls `l`, keys `?`,
 rebind `c`). Those single keys are pressed **inside** the popup — fleet binds
 **no direct prefix+key shortcuts** for individual actions, so every other tmux
@@ -206,7 +213,13 @@ daemon poll. Press **`e`** on the selected agent (or the trailing **⌫ orphans*
 row, for messages whose sender is gone) to open its message list, then **Enter**
 to *pop* a message into the orchestrator input (archives it = read), **`J`** to
 *jump* to the sender (never clears), **`c`** to mark all read, **`q`/Esc** back.
-`fleet inbox` remains the headless CLI (bare = consume pager; `list`/`read` peek).
+**Cross-agent FIFO pop:** the leader menu's **`p`** (and **`P`** in the dashboard's
+agents view, for draining several in a row) pops the **globally-oldest** queued
+message into the orchestrator — no need to visit each agent's row. It pastes
+without submitting (the human reviews and sends) and **skips when the orchestrator
+is mid-generation** so it never interrupts a busy prompt; retry when idle.
+`fleet inbox` remains the headless CLI (bare = consume pager; `list`/`read` peek;
+`pop [file]` = pop a specific message, or the global-oldest when no file is given).
 
 ## Delegate first
 

@@ -489,32 +489,17 @@ nav_down() { if [ "$MODE" = inbox ]; then (( isel < IN-1 )) && ((isel++)); else 
 nav_top()  { if [ "$MODE" = inbox ]; then isel=0; else sel=0; fi; }
 nav_bot()  { if [ "$MODE" = inbox ]; then (( IN > 0 )) && isel=$((IN - 1)); else (( $(arows) > 0 )) && sel=$(( $(arows) - 1 )); fi; }
 
-# Enter in the msg view = POP the selected message to the orchestrator. Paste a
-# source header line + the body into the orchestrator's input WITHOUT submitting (no
-# Enter/C-m — the human reviews and sends). On success: archive the .msg (move into
-# archive/ = mark read under archive-as-truth), which removes it from the live list
-# and decrements that agent's unread by one. The orchestrator pane is resolved via
-# fleet's is_main_pane helper (it is deliberately filtered out of agents_tsv). If it
-# can't be resolved, error and do nothing — never lose the message.
+# Enter in the msg view = POP the selected message to the orchestrator. DELEGATES to
+# the single never-clobber pop primitive `fleet inbox pop <file>` (advisor §B "one
+# pop, two selectors"): the paste (send-keys -l, no C-m), archive-as-truth, mv-verify
+# and orchestrator resolution live ONCE in bin/fleet, so the dashboard's per-agent
+# Enter and the leader-menu FIFO drain are identical by construction rather than two
+# copies that drift. Passing the file path selects this specific message (so the
+# busy-gate — FIFO-only — does not apply: this is a deliberate pop on a visible row).
+# The primitive surfaces its own outcome via tmux display-message; we always reload.
 inbox_pop() {
   (( IN == 0 )) && { status="inbox empty"; return; }
-  local f="${IROWS[$isel]}" dir; dir=$(inbox_root)
-  local id from title disp body text orch
-  id=$(basename "$f" .msg)
-  from=$(ibx_field "$f" from); title=$(ibx_field "$f" title); disp=$(ibx_field "$f" dispatch)
-  text="From $from: $title"
-  [ -n "$disp" ] && [ "$disp" != "-" ] && text+="  ($disp)"
-  body=$(ibx_body "$f")
-  text+=$'\n'"$body"
-  orch=$("$FLEET_BIN" main-pane "$SESS" 2>/dev/null)
-  if [ -z "$orch" ]; then status="couldn't resolve orchestrator pane — nothing popped"; return; fi
-  tmux send-keys -t "$orch" -l -- "$text" 2>/dev/null \
-    || { status="paste failed — nothing changed"; return; }
-  # archive-as-truth: archiving the file IS marking it read — it leaves the live set
-  # so this agent's unread drops by exactly one (no cursor, no max-over-pop bug).
-  mkdir -p "$dir/archive" 2>/dev/null
-  mv -f "$f" "$dir/archive/" 2>/dev/null
-  ibx_mark_dirty
+  "$FLEET_BIN" inbox pop "${IROWS[$isel]}" >/dev/null 2>&1
   status="popped → orchestrator"
 }
 
@@ -1332,6 +1317,13 @@ while :; do
     e)             # agents view: open the selected agent's (or orphan bucket's) messages
       [ "$MODE" = agents ] || continue
       open_msgs; last_load=$SECONDS ;;
+    P)             # agents view: DRAIN — pop the global-oldest (FIFO) message to the
+                   # orchestrator. The repeat-press home for draining several in a row
+                   # (the leader-menu pop is one-press-one-pop). Same primitive as the
+                   # menu's 'popmsg'; here the human is in the dashboard, not drafting.
+      [ "$MODE" = agents ] || continue
+      "$FLEET_BIN" inbox pop >/dev/null 2>&1
+      load_rows; load_inbox_index force; last_load=$SECONDS ;;
     c|a)           # msg view: mark all read (archive this scope's live msgs), then back
       [ "$MODE" = inbox ] || continue
       inbox_mark_all; MODE=agents; load_rows; load_inbox_index; last_load=$SECONDS ;;

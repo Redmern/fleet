@@ -786,24 +786,68 @@ cmd_new() {
 
 # ---- send ---------------------------------------------------------------------
 
-# Resolve a send target to the orchestrator pane, BYPASSING agents_tsv (which
-# filters main out so it can never be a send-keys target). Returns the pane id iff
-# the target names the orchestrator — by exact window name OR an is_main_pane role
-# match — so a literal `fleet send main` (or a drifted-name orchestrator) can be
-# captured into the inbox instead of lost. Fail-silent: no match -> rc 1, no echo.
-main_pane_for_target() { # <target> -> orchestrator pane_id, or rc 1
-  local target="$1" wname pane
+# Resolve a send target to THIS SESSION's orchestrator pane, BYPASSING agents_tsv
+# (which filters main out so it can never be a send-keys target). Returns the pane
+# id iff the target names this session's orchestrator — by exact window name AND an
+# is_main_pane role match — so a literal `fleet send main` (or a drifted-name
+# orchestrator) can be captured into the inbox instead of lost.
+#
+# SESSION-SCOPED (advisor §3a): the scan is filtered to the pressing session (and
+# its parked <sess>_hidden) so a `main` window in ANOTHER project can never be
+# resolved here and is_main_pane's session-blind name fast-path can never match a
+# foreign orchestrator. Fail-silent: no session / no match -> rc 1, no echo.
+main_pane_for_target() { # <target> -> this session's orchestrator pane_id, or rc 1
+  local target="$1" sess s wname pane
   [ -n "$target" ] || return 1
-  while IFS=$'\t' read -r wname pane; do
+  sess=$(session_name 2>/dev/null) || return 1
+  [ -n "$sess" ] || return 1
+  while IFS=$'\t' read -r s wname pane; do
+    { [ "$s" = "$sess" ] || [ "$s" = "${sess}_hidden" ]; } || continue   # SESSION-SCOPED
     [ "$wname" = "$target" ] || continue          # exact window-name match (e.g. "main")
     is_main_pane "$pane" && { printf '%s' "$pane"; return 0; }
-  done < <(tmux list-panes -a -F $'#{window_name}\t#{pane_id}' 2>/dev/null)
+  done < <(tmux list-panes -a -F $'#{session_name}\t#{window_name}\t#{pane_id}' 2>/dev/null)
   return 1
 }
 
 cmd_send() {
+  # Optional leading flags. --needs-human marks an orchestrator-bound message as a
+  # hard block (sev=blocked -> critical desktop notify) instead of a routine summary
+  # (sev=info, silent pill — preserves the documented "info summaries stay silent"
+  # behavior). Flags must precede the target; everything after is target + message.
+  local needs_human=0
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --needs-human) needs_human=1; shift ;;
+      --) shift; break ;;
+      *) break ;;
+    esac
+  done
   local target="${1:-}" text="${2:-}"
-  [ -n "$target" ] && [ -n "$text" ] || die "usage: fleet send <agent> \"message\""
+  [ -n "$target" ] && [ -n "$text" ] || die "usage: fleet send [--needs-human] <agent> \"message\""
+  local sev=info; [ "$needs_human" = 1 ] && sev=blocked
+
+  # ORCHESTRATOR GATE — runs BEFORE any agents_tsv match (advisor §1/§3a). A worker
+  # (or habit) aiming at the orchestrator must be CAPTURED into the durable inbox,
+  # never matched against agents and never send-keys'd (which would clobber the
+  # human's in-progress prompt). This fires above the global substring matcher, so
+  # `fleet send main` can no longer be shadowed by a `main`-substring agent in
+  # another session (the old bug: n>=1 skipped the n==0 redirect -> wrong-session
+  # send or `die "ambiguous"`). Two session-scoped signals, nothing server-wide:
+  #   • literal "main" — unambiguously the orchestrator, never a valid worker target;
+  #   • main_pane_for_target — this session's orchestrator by exact-name + is_main_pane.
+  if [ "$target" = main ] || main_pane_for_target "$target" >/dev/null 2>&1; then
+    echo "fleet send: '$target' is the orchestrator pane — redirecting to the inbox (the human input is never clobbered)" >&2
+    inbox_put --sev "$sev" -m "$text" >&2
+    exit 0
+  fi
+
+  # From here the target is a genuine WORKER. Scope the match to THIS session (and
+  # its parked <sess>_hidden), mirroring cmd_ls / the dashboard — a same-named
+  # window in another project must never be a send target, and an unresolved session
+  # must NOT silently fall back to the server-wide list (advisor §3b: that reopens
+  # the cross-session shadow). The orchestrator gate above already captured "main".
+  local sess; sess=$(session_name 2>/dev/null)
+  [ -n "$sess" ] || die "fleet send: cannot resolve this session — run inside a fleet pane"
 
   # Resolve the target PRECISELY. The old matcher took the first substring hit on
   # label OR window_name, which silently delivered to the wrong agent when several
@@ -811,7 +855,7 @@ cmd_send() {
   # worktree all report the same repo/branch label). Rank exact window_name >
   # exact label > substring, and refuse on a tie so we never guess.
   local all t1 t2 t3 pick n
-  all=$(agents_tsv)
+  all=$(agents_tsv | awk -F'\t' -v s="$sess" '$3==s || $3==s"_hidden"')
   t1=$(printf '%s\n' "$all" | awk -F'\t' -v t="$target" '$5==t')              # exact window name
   t2=$(printf '%s\n' "$all" | awk -F'\t' -v t="$target" '$2==t')              # exact label
   t3=$(printf '%s\n' "$all" | awk -F'\t' -v t="$target" 'index($5,t)||index($2,t)') # substring
@@ -820,18 +864,9 @@ cmd_send() {
   else pick="$t3"; fi
   n=$(printf '%s\n' "$pick" | grep -c .)
   if [ "$n" -eq 0 ]; then
-    # The orchestrator pane is DELIBERATELY filtered out of agents_tsv (so it can
-    # never be a send-keys target), which means a literal `fleet send main "msg"`
-    # resolves to nothing here. That message must still be CAPTURED, not lost
-    # (advisor §2 — the worker→main floor is a redirect, never a drop). If the
-    # target names the orchestrator pane, redirect it into the durable inbox.
-    local mpane; mpane=$(main_pane_for_target "$target")
-    if [ -n "$mpane" ]; then
-      echo "fleet send: '$target' is the orchestrator pane — redirecting to the inbox (the human input is never clobbered)" >&2
-      inbox_put --sev info -m "$text" >&2
-      exit 0
-    fi
-    die "no agent matching '$target' (try: fleet ls)"
+    # Orchestrator targets were already captured by the gate at the top, so a miss
+    # here is a genuinely unknown WORKER target — be specific, don't guess.
+    die "no agent matching '$target' in this session (try: fleet ls)"
   fi
   if [ "$n" -gt 1 ]; then
     echo "ambiguous target '$target' matches $n agents:" >&2
@@ -843,14 +878,13 @@ cmd_send() {
   wname=$(printf '%s' "$line" | cut -f5)
   pane=$(printf '%s' "$line"  | cut -f7)
 
-  # Never send-keys into the orchestrator (human) pane. A worker/sub-orch that
-  # (mis)aims a send at main does NOT get a clobber and does NOT get a silent
-  # drop — the message is REDIRECTED into the durable inbox (advisor §2: turn the
-  # floor into a safe success, "right outcome via the wrong verb"). The human's
-  # input line is never touched; the summary lands where it is read on demand.
+  # Defensive backstop: the top gate already redirects orchestrator targets, so a
+  # matched worker pane is normally never is_main_pane. Keep this so a send can
+  # NEVER clobber the human's input even if the gate is somehow bypassed — redirect
+  # into the durable inbox instead (honoring --needs-human severity).
   if is_main_pane "$pane"; then
     echo "fleet send: '$wname' is the orchestrator pane — redirecting to the inbox (the human input is never clobbered)" >&2
-    inbox_put --sev info -m "$text" >&2
+    inbox_put --sev "$sev" -m "$text" >&2
     exit 0
   fi
 
@@ -1432,10 +1466,84 @@ inbox_gc() { # cap newest-N -> MOVE overflow to archive/; cap archive too. Never
   fi
 }
 
-cmd_inbox() { # inbox [put|list|read|count|gc|clear] — bare = pager that CONSUMES (archives)
+# POP a message into THIS session's orchestrator input. The single never-clobber
+# pop, shared by two selectors (advisor §B "one pop, two selectors"):
+#   fleet inbox pop <file>  → that specific message (the dashboard's per-agent Enter
+#                             delegates here, so dash + CLI stay identical by
+#                             construction, never by careful copying)
+#   fleet inbox pop         → the GLOBAL-OLDEST live *.msg (the leader-menu FIFO drain)
+# Pastes "From <from>: <title>[ (dispatch)]" + body with send-keys -l and NO C-m,
+# so it never auto-submits — the human reviews and sends. Archives (= mark read,
+# archive-as-truth) only after a VERIFIED paste + mv; any failure leaves the message
+# live so it is never lost. Session-scoped throughout (inbox_dir + cmd_main_pane).
+# Feedback via tmux display-message (echo is invisible to a popup-dispatched action).
+inbox_pop() { # pop [file] — no file = global-oldest FIFO
+  local arg="${1:-}" f dir
+  dir=$(inbox_dir) || { tmux display-message "inbox: no project root" 2>/dev/null; return 0; }
+  if [ -n "$arg" ]; then
+    f="$arg"
+    [ -e "$f" ] || { tmux display-message "inbox: message gone" 2>/dev/null; return 0; }
+  else
+    # GLOBAL FIFO: ids are <epoch_s>.<nanos>.<pane>, all fixed-width (epoch is 10
+    # digits until year 2286; GNU `date +%N` zero-pads nanos to 9), so a LEXICAL
+    # sort is chronological and `sort | head -1` is the oldest live message. Do not
+    # "optimize" the id format without preserving this width invariant. Orphans
+    # (sender reaped) are plain *.msg files and are included — they are real unread.
+    f=$(ls -1 "$dir"/*.msg 2>/dev/null | sort | head -1)
+    [ -n "$f" ] && [ -e "$f" ] || { tmux display-message "inbox empty" 2>/dev/null; return 0; }
+  fi
+  local orch; orch=$(cmd_main_pane 2>/dev/null)
+  [ -n "$orch" ] || { tmux display-message "no orchestrator pane — nothing popped" 2>/dev/null; return 0; }
+  # BUSY-GATE — FIFO (no-arg) only. A blind leader-menu pop must not inject into an
+  # orchestrator that is mid-generation or sitting at a permission prompt: that is
+  # the very mid-prompt interruption the queue exists to prevent. A SPECIFIC file
+  # (the dashboard's deliberate per-agent Enter on a visible row) is NOT gated — the
+  # human is in the dashboard, plainly not drafting in the orch pane, and may be
+  # queueing a message for when generation finishes. (No reliable signal exists for
+  # "human has half-typed a draft"; the pop is human-initiated and never submits, so
+  # that case is the human's own timing choice — the named feedback below keeps it
+  # from being mystery text.)
+  if [ -z "$arg" ]; then
+    local st; st=$(tmux show -wqv -t "$orch" @agent_state 2>/dev/null)
+    case "$st" in
+      working|blocked) tmux display-message "orchestrator $st — pop skipped, retry when idle" 2>/dev/null; return 0 ;;
+    esac
+  fi
+  local from title disp body text
+  from=$(inbox_field "$f" from); title=$(inbox_field "$f" title); disp=$(inbox_field "$f" dispatch)
+  text="From $from: $title"
+  [ -n "$disp" ] && [ "$disp" != "-" ] && text="$text  ($disp)"
+  body=$(inbox_body "$f")
+  text="$text
+$body"
+  # Never-clobber via BRACKETED PASTE. A raw LF from `send-keys -l` acts as Enter in
+  # the target (verified: each line of a multi-line body EXECUTES/submits in a shell),
+  # which would break "the human submits, not us" for any body with a newline — the
+  # blind FIFO pop disproportionately hits long multi-line orphan bodies. paste-buffer
+  # -p wraps the text in bracketed-paste markers so a paste-aware target (the claude
+  # TUI, and modern shells) inserts it as literal input WITHOUT executing any newline
+  # (verified). No C-m is ever sent — the human reviews and submits. Private named
+  # buffer, deleted on paste (-d), so the user's paste ring is untouched.
+  tmux set-buffer -b fleet-inbox-pop -- "$text" 2>/dev/null \
+    && tmux paste-buffer -t "$orch" -b fleet-inbox-pop -p -d 2>/dev/null \
+    || { tmux display-message "paste failed — nothing changed" 2>/dev/null; return 0; }
+  # archive-as-truth = mark read. VERIFY the mv: if it fails after a successful paste
+  # the file stays live and the next FIFO pop would re-select + re-paste the SAME
+  # message forever (starving newer ones) — warn instead of silently re-popping.
+  mkdir -p "$dir/archive" 2>/dev/null
+  if mv -f "$f" "$dir/archive/" 2>/dev/null; then
+    inbox_mark_dirty "$dir"
+    tmux display-message "popped → orch: $from — $title" 2>/dev/null
+  else
+    tmux display-message "popped but archive failed — pop again to retry" 2>/dev/null
+  fi
+}
+
+cmd_inbox() { # inbox [put|list|read|count|gc|clear|pop] — bare = pager that CONSUMES (archives)
   local sub="${1:-}"; [ $# -gt 0 ] && shift
   case "$sub" in
     put)   inbox_put   "$@" ;;
+    pop)   inbox_pop   "$@" ;;   # pop [file]: file = that msg, none = global-oldest FIFO
     list)  inbox_list  "$@" ;;   # non-destructive peek
     read)  inbox_read  "$@" ;;   # non-destructive display
     count) inbox_count "$@" ;;
@@ -1449,7 +1557,7 @@ cmd_inbox() { # inbox [put|list|read|count|gc|clear] — bare = pager that CONSU
       { inbox_list; echo; inbox_read all; } | $pager
       inbox_clear >/dev/null
       ;;
-    *) die "usage: fleet inbox [put|list|read|count|gc|clear]" ;;
+    *) die "usage: fleet inbox [put|pop|list|read|count|gc|clear]" ;;
   esac
 }
 
@@ -2242,6 +2350,7 @@ new|n|Agents|New agent|Open the new-agent form on the dashboard
 ready|y|Agents|Flag ready|Flag a worktree done/ready for reap (blank = this cwd)
 reap|x|Agents|Reap ready worktrees|Remove every worktree flagged ready (confirm)
 orch-jump|m|Agents|Orchestrator|Jump to the main window's orchestrator pane
+popmsg|p|Agents|Pop oldest message|Pop the oldest queued worker message into the orchestrator
 main|M|Agents|Rebuild command center|Re-tile the main window
 save|s|Session|Save project|Save this session as a reusable project alias (fleet up <name>)
 sessions|o|Session|Fleet sessions|Switch between open fleet sessions
@@ -2273,6 +2382,7 @@ action_tmux_command() { # tmux command string run when an action's key is presse
     reap)  echo "display-menu -b rounded -T '#[align=centre]Reap every worktree flagged ready?' -x C -y C 'Yes, reap' y \"run-shell '$self reap'\" 'Cancel' n ''" ;;
     main)   echo "run-shell '$self main'" ;;
     orch-jump) echo "run-shell '$self orch-jump'" ;;
+    popmsg) echo "run-shell '$self inbox pop'" ;;   # plain run-shell, composes with the close-then-dispatch flow
     reload) echo "display-menu -b rounded -T '#[align=centre]Reload dashboard?' -x C -y C 'Yes, reload' y \"run-shell '$self main --reload'\" 'Cancel' n ''" ;;
     ls)     echo "display-popup -E -b rounded -w 70% -h 60% '$self ls --hold'" ;;
     keys)   echo "display-popup -E -b rounded -w 72% -h 70% '$self keys --hold'" ;;
