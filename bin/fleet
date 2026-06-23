@@ -2588,6 +2588,35 @@ cmd_save() { # save [name] — save the current session as a reusable project al
   echo "  'fleet up $name' now starts this project from anywhere."
 }
 
+# ---- claude profiles ------------------------------------------------------------
+
+# Resolve the Claude profile dirs to wire hooks/guard into. Precedence:
+#   1. env FLEET_CLAUDE_PROFILES (colon-separated, PATH-style), if non-empty
+#   2. config file ~/.config/fleet/profiles (one path/line; '#' comments + blanks
+#      ignored; leading ~ expanded), if it exists
+#   3. default: ~/.claude  ~/.claude_personal
+# Prints one path per line. Does NOT filter by existence — callers keep their own
+# `[ -d "$p" ] || continue` guard so they never conjure a profile dir.
+claude_profiles() {
+  if [ -n "${FLEET_CLAUDE_PROFILES:-}" ]; then
+    printf '%s\n' "$FLEET_CLAUDE_PROFILES" | tr ':' '\n' | grep -v '^[[:space:]]*$'
+    return 0
+  fi
+  local cfg="${XDG_CONFIG_HOME:-$HOME/.config}/fleet/profiles"
+  if [ -f "$cfg" ]; then
+    local line
+    while IFS= read -r line || [ -n "$line" ]; do
+      line="${line#"${line%%[![:space:]]*}"}"   # ltrim
+      line="${line%"${line##*[![:space:]]}"}"   # rtrim
+      case "$line" in ''|'#'*) continue ;; esac
+      case "$line" in '~/'*) line="$HOME/${line#\~/}" ;; '~') line="$HOME" ;; esac
+      printf '%s\n' "$line"
+    done < "$cfg"
+    return 0
+  fi
+  printf '%s\n' "$HOME/.claude" "$HOME/.claude_personal"
+}
+
 # ---- status / doctor ------------------------------------------------------------
 
 cmd_status() {
@@ -2627,11 +2656,12 @@ cmd_doctor() {
     echo "MISS fleet-hook missing or dangling symlink (run install.sh) — agents won't report"; ok=1
   fi
   local prof hooked
-  for prof in "$HOME/.claude" "$HOME/.claude_personal"; do
+  while IFS= read -r prof; do
+    [ -n "$prof" ] || continue
     [ -f "$prof/settings.json" ] || continue
     hooked=$(grep -c fleet-hook "$prof/settings.json" 2>/dev/null || true)
     if [ "${hooked:-0}" -gt 0 ]; then echo "ok   hooks wired in $prof"; else echo "warn hooks NOT wired in $prof (run install.sh)"; fi
-  done
+  done < <(claude_profiles)
   if systemctl --user show-environment >/dev/null 2>&1; then
     systemctl --user is-enabled fleetd >/dev/null 2>&1 && echo "ok   fleetd.service enabled" \
       || echo "warn fleetd.service not enabled (ok if installed --no-systemd; 'fleet up' starts it)"
@@ -2905,13 +2935,16 @@ cmd_setup() {
   fi
 
   # Wire hooks + guard into each EXISTING profile (don't conjure a profile dir).
+  # Profile list resolved via claude_profiles (FLEET_CLAUDE_PROFILES env /
+  # ~/.config/fleet/profiles / default ~/.claude ~/.claude_personal).
   local p
-  for p in "$HOME/.claude" "$HOME/.claude_personal"; do
+  while IFS= read -r p; do
+    [ -n "$p" ] || continue
     [ -d "$p" ] || continue
     [ -f "$p/settings.json" ] || echo '{}' > "$p/settings.json"
     setup_wire_hooks "$p/settings.json" "$HOOK"
     setup_wire_guard "$p/settings.json" "$GUARD"
-  done
+  done < <(claude_profiles)
 
   # --browser: vendor playwright-core into a USER-WRITABLE dir (the install tree
   # is read-only when packaged). playwright-core drives the SYSTEM Chromium, so
@@ -2950,9 +2983,10 @@ cmd_unsetup() {
     echo "  disabled fleetd.service (user)"
   fi
   local p
-  for p in "$HOME/.claude" "$HOME/.claude_personal"; do
+  while IFS= read -r p; do
+    [ -n "$p" ] || continue
     [ -f "$p/settings.json" ] && setup_unwire_hooks "$p/settings.json"
-  done
+  done < <(claude_profiles)
   echo "fleet unset up (system files left for pacman to remove)"
 }
 
@@ -2996,6 +3030,11 @@ fleet — agent fleet manager (tmux + nvim + Claude Code)
   fleet setup            per-user post-install: enable fleetd + wire Claude hooks [--no-systemd] [--browser] [--force]
   fleet unsetup          reverse setup: disable the user unit + unwire hooks
   fleet doctor           dependency / wiring check
+
+  Claude profiles wired by setup/doctor/unsetup default to ~/.claude + ~/.claude_personal.
+  Override with env FLEET_CLAUDE_PROFILES (colon-separated, PATH-style) or, if unset,
+  a config file ~/.config/fleet/profiles (one path/line; '#' comments + blanks ignored).
+  Only profile dirs that already EXIST are wired — none are ever created.
 EOF
 }
 
