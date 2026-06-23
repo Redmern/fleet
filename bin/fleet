@@ -2692,8 +2692,8 @@ action_tmux_command() { # tmux command string run when an action's key is presse
     popmsg) echo "run-shell '$self inbox pop'" ;;   # plain run-shell, composes with the close-then-dispatch flow
     triage) echo "run-shell '$self dash-triage'" ;; # focus the dash + inject its triage key (NOT a popup) — same shape as 'new'
     reload) echo "display-menu -b rounded -T '#[align=centre]Reload dashboard?' -x C -y C 'Yes, reload' y \"run-shell '$self main --reload'\" 'Cancel' n ''" ;;
-    ls)     echo "display-popup -E -b rounded -w 70% -h 60% '$self ls --hold'" ;;
-    keys)   echo "display-popup -E -b rounded -w 72% -h 70% '$self keys --hold'" ;;
+    ls)     echo "run-shell -b '$self popup-fit ls'" ;;    # measures then opens a fit-to-content popup
+    keys)   echo "run-shell -b '$self popup-fit keys'" ;;  # measures then opens a fit-to-content popup
     sessions) echo "display-popup -E -b rounded -w 70% -h 60% '$self sessions'" ;;
     rebind) echo "run-shell '$self rebind'" ;;
     quit)   echo "display-menu -b rounded -T '#[align=centre]Quit fleet session? (closes all agents)' -x C -y C 'Yes, quit' y \"run-shell '$self quit'\" 'Cancel' n ''" ;;
@@ -2782,21 +2782,28 @@ action_for_key() { # action_for_key <key> — selectable (non-hidden) action bou
   return 1
 }
 
-cmd_menu_popup() { # measure leader_grid, then open `fleet menu` as a popup sized
-  # to hug the grid (width = longest visible line, height = line count) instead
-  # of the fixed 64%x80%. Fail-silent: any measurement hiccup falls back to the
-  # old proportional size so the binding never breaks.
-  local self="$FLEET_DIR/bin/fleet" grid line w cols=0 rows=0 cw ch
-  grid=$(leader_grid 2>/dev/null) || grid=""
-  if [ -n "$grid" ]; then
-    # strip SGR/CSI escapes so width counts visible glyphs only; ${#line} is
-    # char-aware in this UTF-8 locale (nerd-font group glyphs count as width 1).
+# popup_fit_content <measure_cmd> <run_cmd> <fb_w> <fb_h>
+# Generic fit-to-content popup launcher. Runs <measure_cmd> to capture the text
+# whose longest VISIBLE line sets the width and whose line count sets the height,
+# then opens `display-popup -E -b rounded` running <run_cmd> at that absolute
+# size (+border padding, clamped to the client). Any measurement hiccup falls
+# back to the proportional `-w <fb_w> -h <fb_h>` so the binding never breaks.
+# Used by the leader menu, `keys`, and `ls` so their sizing can never drift.
+popup_fit_content() {
+  local measure_cmd="$1" run_cmd="$2" fb_w="$3" fb_h="$4"
+  local content line w cols=0 rows=0 cw ch
+  content=$(eval "$measure_cmd" 2>/dev/null) || content=""
+  if [ -n "$content" ]; then
+    # strip SGR/CSI escapes so width counts visible glyphs only (leader_grid is
+    # always coloured; keys/ls emit ANSI only on a TTY, so a captured measure is
+    # already clean — the strip is a harmless belt-and-braces). ${#line} is
+    # char-aware in this UTF-8 locale (nerd-font glyphs count as width 1).
     while IFS= read -r line || [ -n "$line" ]; do
       rows=$(( rows + 1 )); w=${#line}; (( w > cols )) && cols=$w
-    done < <(printf '%s' "$grid" | sed -E 's/\x1b\[[0-9;]*m//g' 2>/dev/null)
+    done < <(printf '%s' "$content" | sed -E 's/\x1b\[[0-9;]*m//g' 2>/dev/null)
   fi
-  if (( cols == 0 || rows == 0 )); then    # measurement failed → old fixed frame
-    tmux display-popup -E -b rounded -w 64% -h 80% "$self menu" 2>/dev/null
+  if (( cols == 0 || rows == 0 )); then    # measurement failed → fixed frame
+    tmux display-popup -E -b rounded -w "$fb_w" -h "$fb_h" "$run_cmd" 2>/dev/null
     return 0
   fi
   cols=$(( cols + 4 )); rows=$(( rows + 2 ))   # rounded border + breathing room
@@ -2805,8 +2812,21 @@ cmd_menu_popup() { # measure leader_grid, then open `fleet menu` as a popup size
   ch=$(tmux display -p '#{client_height}' 2>/dev/null)
   [[ "$cw" =~ ^[0-9]+$ ]] && (( cols > cw - 2 )) && cols=$(( cw - 2 ))
   [[ "$ch" =~ ^[0-9]+$ ]] && (( rows > ch - 2 )) && rows=$(( ch - 2 ))
-  tmux display-popup -E -b rounded -w "$cols" -h "$rows" "$self menu" 2>/dev/null
+  tmux display-popup -E -b rounded -w "$cols" -h "$rows" "$run_cmd" 2>/dev/null
 }
+
+cmd_popup_fit() { # cmd_popup_fit <menu|keys|ls> — thin map of kind → (measure,
+  # run, fallback) feeding the one popup_fit_content helper. Keeps menu/keys/ls
+  # on a single sizing path so they can never drift apart.
+  local self="$FLEET_DIR/bin/fleet"
+  case "${1:-menu}" in
+    menu) popup_fit_content 'leader_grid'  "$self menu"        64% 80% ;;
+    keys) popup_fit_content "$self keys"   "$self keys --hold" 72% 70% ;;
+    ls)   popup_fit_content "$self ls"     "$self ls --hold"   70% 60% ;;
+  esac
+}
+
+cmd_menu_popup() { cmd_popup_fit menu; }   # back-compat alias for the menu binding
 
 cmd_menu() {
   if [ "${1:-}" = "--dispatch" ]; then
@@ -3604,7 +3624,8 @@ case "${1:-}" in
   sessions|switch) shift; cmd_sessions "$@" ;;        # fzf switcher over open fleet sessions
   quit)       shift; cmd_quit "$@" ;;                 # tear down THIS fleet session
   menu)       shift; cmd_menu "$@" ;;
-  menu-popup) shift; cmd_menu_popup "$@" ;;           # internal: fit-to-content frame for the leader menu
+  menu-popup) shift; cmd_menu_popup "$@" ;;           # internal: back-compat alias -> popup-fit menu
+  popup-fit)  shift; cmd_popup_fit "$@" ;;            # internal: fit-to-content popup for menu/keys/ls
   keys)       shift; cmd_keys "$@" ;;
   rebind)     shift; cmd_rebind "$@" ;;
   rebind-set) shift; cmd_rebind_set "$@" ;;
