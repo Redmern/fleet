@@ -209,6 +209,17 @@ prefix default (`n`, `x`, `s`, … ) stays intact; the only default it reclaims 
 key; `fleet rebind` (or the menu's `c`) changes one. Per-agent verbs (msgs `e`,
 send, mode, diff, close) stay on the dashboard's selected row, not in the leader.
 
+**Two jump actions — `a` vs `l`.** Both `pick` (`a`) and `ls` (`l`) are now
+**interactive fzf jumpers** that land you on an agent's window (Enter jumps,
+Esc cancels), but they differ in scope and detail: **`a`=pick** is a fast,
+**server-wide** flat list (every project) — the quick teleport. **`l`=ls** is
+**this-project-scoped** and shows the full `STATE / AGENT / WINDOW / IN-STATE`
+table with done/ready decoration — the richer, project-local jump. Mental model:
+`o`(session) → `a`/`l`(window). Both popups drop `*_hidden` scratch sessions from
+the selectable set (switching into a bare hidden session is a teleport trap;
+reach scratch from the dashboard); `ls`'s **static/CLI** print (`fleet ls` in a
+shell, piped, or `--all`) still lists hidden agents and is unchanged.
+
 **Worker messages are per-agent.** When a worker `fleet send main`s a summary it
 lands in that worker's row as a sev-coloured **✉N** pill (the agents-view title
 also shows a **✉N ⚠M** cross-agent summary); there is no status-bar badge and no
