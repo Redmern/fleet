@@ -60,7 +60,7 @@ any pane, including this orchestrator pane — both are prefix-table bindings, s
 plain Space typing in panes is untouched), or by pressing **bare Space while the
 dashboard pane is focused**. Press the shown key to run an action;
 **Esc/q/Space** closes. Actions are grouped **+Agents** (pick `a`, new `n`, ready
-`y`, reap `x`, orchestrator `m`, rebuild `M`), **+Inbox** (view `i`), **+Session**
+`y`, reap `x`, orchestrator `m`, rebuild `M`), **+Session**
 (save `s`, sessions `o`, reload `R`, quit `Q`), and **+Info** (ls `l`, keys `?`,
 rebind `c`). Those single keys are pressed **inside** the popup — fleet binds
 **no direct prefix+key shortcuts** for individual actions, so every other tmux
@@ -68,8 +68,17 @@ prefix default (`n`, `x`, `s`, … ) stays intact; the only default it reclaims 
 **prefix+Space** (was `next-layout`). The leader key is configurable
 (`fleet rebind` → `menu`); the `prefix+Space` alias is set/disabled via
 `menu-alt=` in `keybinds.conf`. `fleet keys` lists every action and its in-menu
-key; `fleet rebind` (or the menu's `c`) changes one. Per-agent verbs (send, mode,
-diff, close) stay on the dashboard's selected row, not in the leader.
+key; `fleet rebind` (or the menu's `c`) changes one. Per-agent verbs (msgs `e`,
+send, mode, diff, close) stay on the dashboard's selected row, not in the leader.
+
+**Worker messages are per-agent.** When a worker `fleet send main`s a summary it
+lands in that worker's row as a sev-coloured **✉N** pill (the agents-view title
+also shows a **✉N ⚠M** cross-agent summary); there is no status-bar badge and no
+daemon poll. Press **`e`** on the selected agent (or the trailing **⌫ orphans**
+row, for messages whose sender is gone) to open its message list, then **Enter**
+to *pop* a message into the orchestrator input (archives it = read), **`J`** to
+*jump* to the sender (never clears), **`c`** to mark all read, **`q`/Esc** back.
+`fleet inbox` remains the headless CLI (bare = consume pager; `list`/`read` peek).
 
 ## Delegate first
 

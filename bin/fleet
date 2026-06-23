@@ -1258,6 +1258,12 @@ inbox_dir() { # echo <root>/.fleet/inbox, or fail (fail-silent: no root -> rc 1)
   printf '%s/.fleet/inbox' "$root"
 }
 
+# GATE signal for the dashboard's lazy index. A nanosecond token (NOT mtime — that
+# has 1s granularity, so two writes in the same second would look unchanged and the
+# dash would miss the second one until its TTL). The dash rebuilds its per-agent
+# unread index only when this token differs from the one it last saw. Fail-silent.
+inbox_mark_dirty() { date +%s%N > "$1/.dirty" 2>/dev/null || true; }
+
 inbox_id() { # <epoch_s>.<nanos>.<pane> — sortable + collision-free, lock-free
   local pane="${TMUX_PANE:-$$}"; pane="${pane#%}"
   local now; now=$(date +%s.%N 2>/dev/null) || now="$(date +%s 2>/dev/null).000000000"
@@ -1269,27 +1275,18 @@ inbox_id() { # <epoch_s>.<nanos>.<pane> — sortable + collision-free, lock-free
 inbox_field() { sed -n "/^--$/q; s/^$2=//p" "$1" 2>/dev/null | head -1; }
 inbox_body()  { sed -n '/^--$/,$p' "$1" 2>/dev/null | sed '1d'; }
 
-# Advance the durable read cursor MONOTONICALLY (max id wins) — a slow reader can
-# never regress the unread count. Atomic tmp+mv.
-inbox_advance_cursor() { # <dir> <id>
-  local dir="$1" id="$2" cur
-  [ -n "$id" ] || return 0
-  cur=$(cat "$dir/.cursor" 2>/dev/null)
-  if [ -z "$cur" ] || [ "$id" \> "$cur" ]; then
-    printf '%s\n' "$id" > "$dir/.cursor.tmp.$$" 2>/dev/null \
-      && mv -f "$dir/.cursor.tmp.$$" "$dir/.cursor" 2>/dev/null
-  fi
-}
+# ARCHIVE-AS-TRUTH: there is no read cursor. A message is "read" iff it has been
+# archived (POP / mark-all-read / GC move it into archive/). So "unread" == "live,
+# un-archived" — every *.msg still in the inbox dir counts as unread, and consuming
+# one is a single atomic `mv` into archive/. No .cursor anywhere.
 
-inbox_count() { # unread count (id > .cursor) — feeds the status badge
-  local dir cur f id n=0
+inbox_count() { # unread count = live (un-archived) *.msg
+  local dir f n=0
   dir=$(inbox_dir) || { echo 0; return 0; }
   [ -d "$dir" ] || { echo 0; return 0; }
-  cur=$(cat "$dir/.cursor" 2>/dev/null)
   for f in "$dir"/*.msg; do
     [ -e "$f" ] || continue
-    id=$(basename "$f" .msg)
-    { [ -z "$cur" ] || [ "$id" \> "$cur" ]; } && n=$((n+1))
+    n=$((n+1))
   done
   echo "$n"
 }
@@ -1342,36 +1339,48 @@ inbox_put() { # put [--from X] [-d dN] [--sev info|warn|blocked] [--key K] -t "t
     printf '%s\n'          "$body"
   } > "$tmp" 2>/dev/null && mv -f "$tmp" "$f" 2>/dev/null
   if [ -s "$f" ]; then
+    # GATE: the dashboard rebuilds its per-agent unread index only when this flag
+    # is newer than its last build — pay the cost ONCE here at write, never N/sec at
+    # read. (Fail-silent: a missing flag just makes the dash fall back to its TTL.)
+    inbox_mark_dirty "$dir"
+    # Enqueue-time desktop notify — the ONLY push channel now that fleetd's inbox
+    # poll is gone. Fires exactly once per id (no poll, no dedup state). Gated to
+    # warn/blocked so routine info summaries stay silent; blocked = critical.
+    case "$sev" in
+      warn|blocked)
+        if command -v notify-send >/dev/null 2>&1; then
+          local urg=normal; [ "$sev" = blocked ] && urg=critical
+          notify-send -a fleet -u "$urg" "Inbox: $from" "$title" 2>/dev/null || true
+        fi ;;
+    esac
     echo "inbox: queued $id [$sev] — $title"
   else
     rm -f "$tmp" 2>/dev/null; echo "inbox: could not write entry" >&2; return 1
   fi
 }
 
-inbox_list() { # titles newest-first with an unread (*) marker — no cursor change
-  local dir cur f id mark sev from title any=0
+inbox_list() { # NON-DESTRUCTIVE peek: titles newest-first. Every live msg is unread
+  local dir f id sev from title any=0
   dir=$(inbox_dir) || { echo "inbox: no project root"; return 0; }
   [ -d "$dir" ] || { echo "inbox empty"; return 0; }
-  cur=$(cat "$dir/.cursor" 2>/dev/null)
   while IFS= read -r f; do
     [ -e "$f" ] || continue
-    any=1; id=$(basename "$f" .msg)
-    mark=" "; { [ -z "$cur" ] || [ "$id" \> "$cur" ]; } && mark="*"
+    any=1
     sev=$(inbox_field "$f" sev); from=$(inbox_field "$f" from); title=$(inbox_field "$f" title)
-    printf '%s %-9s %-24s %s\n' "$mark" "[$sev]" "$from" "$title"
+    printf '%s %-9s %-24s %s\n' '*' "[$sev]" "$from" "$title"
   done < <(ls -1 "$dir"/*.msg 2>/dev/null | sort -r)
   [ "$any" = 1 ] || echo "inbox empty"
 }
 
-inbox_read() { # [id|all] — show full bodies newest-first, then advance .cursor
-  local want="${1:-all}" dir f id newest="" files sev from disp ts title
+inbox_read() { # [id|all] — show full bodies newest-first (pure display, no archive)
+  local want="${1:-all}" dir f id files sev from disp ts title
   dir=$(inbox_dir) || { echo "inbox: no project root"; return 0; }
   [ -d "$dir" ] || { echo "inbox empty"; return 0; }
   files=$(ls -1 "$dir"/*.msg 2>/dev/null | sort -r)
   [ -n "$files" ] || { echo "inbox empty"; return 0; }
   while IFS= read -r f; do
     [ -e "$f" ] || continue
-    id=$(basename "$f" .msg); [ -z "$newest" ] && newest="$id"
+    id=$(basename "$f" .msg)
     [ "$want" != all ] && [ "$id" != "$want" ] && continue
     sev=$(inbox_field "$f" sev);   from=$(inbox_field "$f" from)
     disp=$(inbox_field "$f" dispatch); ts=$(inbox_field "$f" ts)
@@ -1380,16 +1389,19 @@ inbox_read() { # [id|all] — show full bodies newest-first, then advance .curso
     printf '   %s  %s\n\n' "$ts" "$title"
     inbox_body "$f"; printf '\n'
   done <<< "$files"
-  inbox_advance_cursor "$dir" "$newest"
 }
 
-inbox_clear() { # mark all read (advance cursor to newest) — no display
-  local dir newest
+inbox_clear() { # mark all read = ARCHIVE every live msg (archive-as-truth)
+  local dir f n=0
   dir=$(inbox_dir) || return 0
   [ -d "$dir" ] || { echo "inbox empty"; return 0; }
-  newest=$(ls -1 "$dir"/*.msg 2>/dev/null | sort -r | head -1)
-  [ -n "$newest" ] && inbox_advance_cursor "$dir" "$(basename "$newest" .msg)"
-  echo "inbox: marked all read"
+  mkdir -p "$dir/archive" 2>/dev/null || true
+  for f in "$dir"/*.msg; do
+    [ -e "$f" ] || continue
+    mv -f "$f" "$dir/archive/" 2>/dev/null && n=$((n+1))
+  done
+  inbox_mark_dirty "$dir"
+  echo "inbox: marked all read ($n archived)"
 }
 
 inbox_gc() { # cap newest-N -> MOVE overflow to archive/; cap archive too. Never silent.
@@ -1412,6 +1424,7 @@ inbox_gc() { # cap newest-N -> MOVE overflow to archive/; cap archive too. Never
     done < <(ls -1 "$dir/archive"/*.msg 2>/dev/null | sort | head -n "$((n - INBOX_ARCHIVE_KEEP))")
   fi
   if [ "$archived" -gt 0 ] || [ "$deleted" -gt 0 ]; then
+    inbox_mark_dirty "$dir"
     append_dashboard_alert "inbox: archived $archived old summaries, deleted $deleted from archive"
     echo "inbox gc: archived $archived, deleted $deleted"
   else
@@ -1419,19 +1432,22 @@ inbox_gc() { # cap newest-N -> MOVE overflow to archive/; cap archive too. Never
   fi
 }
 
-cmd_inbox() { # inbox [put|list|read|count|gc|clear] — bare = read pager (marks read)
+cmd_inbox() { # inbox [put|list|read|count|gc|clear] — bare = pager that CONSUMES (archives)
   local sub="${1:-}"; [ $# -gt 0 ] && shift
   case "$sub" in
     put)   inbox_put   "$@" ;;
-    list)  inbox_list  "$@" ;;
-    read)  inbox_read  "$@" ;;
+    list)  inbox_list  "$@" ;;   # non-destructive peek
+    read)  inbox_read  "$@" ;;   # non-destructive display
     count) inbox_count "$@" ;;
     gc)    inbox_gc    "$@" ;;
-    clear) inbox_clear "$@" ;;
+    clear) inbox_clear "$@" ;;    # archive all live (mark-all-read)
     ""|view)
+      # bare pager = consume: display every live msg, THEN archive them all (POP's
+      # CLI sibling). list/read stay the non-destructive peeks.
       local pager=cat
       [ -t 1 ] && command -v less >/dev/null 2>&1 && pager="less -R"
       { inbox_list; echo; inbox_read all; } | $pager
+      inbox_clear >/dev/null
       ;;
     *) die "usage: fleet inbox [put|list|read|count|gc|clear]" ;;
   esac
@@ -2057,22 +2073,6 @@ cmd_main_pane() { # main-pane [session]
   printf '%s\n' "$pane"
 }
 
-# prefix+i (global): focus the dashboard pane and toggle its inbox/agents view.
-# Sends a dedicated toggle key (i) into the dash, which flips MODE in its own key
-# loop — no polling lag. Session-relative; fail-silent throughout.
-cmd_dash_inbox() {
-  local sess; sess=$(session_name 2>/dev/null) || exit 0
-  [ -n "$sess" ] || exit 0
-  local win; win=$(main_window_id "$sess") || exit 0
-  [ -n "$win" ] || exit 0
-  local dash; dash=$(dash_pane_id "$sess") || exit 0
-  [ -n "$dash" ] || exit 0
-  tmux select-window -t "$win" 2>/dev/null || exit 0
-  tmux select-pane -t "$dash" 2>/dev/null || true
-  tmux send-keys -t "$dash" i 2>/dev/null || true
-  exit 0
-}
-
 # Tear down the CURRENT fleet session: kill the command center + every agent
 # window in one shot. Session-relative — run via a prefix keybind/menu, so
 # session_name() resolves to the client that triggered it. Does NOT stop fleetd
@@ -2167,14 +2167,8 @@ inject_status_format() { # append agent glyph to window-status formats.
     [ -n "$fmt" ] || continue
     case "$fmt" in *@agent_glyph*) ;; *) tmux set -g "$opt" "$fmt#{?@agent_glyph, #{@agent_glyph},}" ;; esac
   done
-  # Ambient inbox unread badge: fleetd sets @fleet_inbox per session each tick
-  # (heal_status_right), but inject it here too so the badge appears at boot
-  # before the first tick. Prepended so it sits at the left of status-right.
-  fmt=$(tmux show -g -v status-right 2>/dev/null)
-  case "$fmt" in
-    *@fleet_inbox*) ;;
-    *) [ -n "$fmt" ] && tmux set -g status-right "#{?@fleet_inbox,#{@fleet_inbox} ,}$fmt" ;;
-  esac
+  # (The ambient inbox unread badge is gone — unread now lives per-agent in the
+  # dashboard rows + the agents-view title summary, not on the status bar.)
   # Fleet session marker: inject a ship glyph ( nf-fa-ship U+F21A — "a fleet of
   # ships") INSIDE the session-name pill, immediately before the #S token, gated
   # per-session on @fleet_root. status-left is a global option, but the
@@ -2222,7 +2216,6 @@ ready|y|Agents|Flag ready|Flag a worktree done/ready for reap (blank = this cwd)
 reap|x|Agents|Reap ready worktrees|Remove every worktree flagged ready (confirm)
 orch-jump|m|Agents|Orchestrator|Jump to the main window's orchestrator pane
 main|M|Agents|Rebuild command center|Re-tile the main window
-inbox|i|Inbox|Inbox view|Toggle the dashboard inbox view (worker→orchestrator summaries; unread badge rides the status bar)
 save|s|Session|Save project|Save this session as a reusable project alias (fleet up <name>)
 sessions|o|Session|Fleet sessions|Switch between open fleet sessions
 reload|R|Session|Reload dashboard|Restart the dashboard pane in place (picks up new code)
@@ -2256,7 +2249,6 @@ action_tmux_command() { # tmux command string run when an action's key is presse
     reload) echo "display-menu -b rounded -T '#[align=centre]Reload dashboard?' -x C -y C 'Yes, reload' y \"run-shell '$self main --reload'\" 'Cancel' n ''" ;;
     ls)     echo "display-popup -E -b rounded -w 70% -h 60% '$self ls --hold'" ;;
     keys)   echo "display-popup -E -b rounded -w 72% -h 70% '$self keys --hold'" ;;
-    inbox)  echo "run-shell '$self dash-inbox'" ;;
     sessions) echo "display-popup -E -b rounded -w 70% -h 60% '$self sessions'" ;;
     rebind) echo "run-shell '$self rebind'" ;;
     quit)   echo "display-menu -b rounded -T '#[align=centre]Quit fleet session? (closes all agents)' -x C -y C 'Yes, quit' y \"run-shell '$self quit'\" 'Cancel' n ''" ;;
@@ -2306,7 +2298,7 @@ apply_keybinds() {
 #                                      has closed, so popup/prompt-opening
 #                                      actions don't try to nest inside the popup.
 # Data-driven off fleet_actions: new actions appear in their group automatically.
-LEADER_GROUPS="Agents Inbox Session Info"   # render order; others follow
+LEADER_GROUPS="Agents Session Info"   # render order; others follow
 
 leader_section() { # leader_section <group> — print header + lines if non-empty
   local want="$1" action kd grp label desc key out=""
@@ -2444,6 +2436,8 @@ cmd_keys() { # plain text listing; --hold keeps a popup open until a key is pres
   echo "leader: prefix+$mkey${akey:+ / prefix+$akey} (the only fleet prefix bindings), or bare Space in the dashboard pane"
   echo "all other actions: open the leader, then press their 'menu <key>' inside the popup"
   echo "fleet binds no other prefix keys — tmux defaults (n, x, s, … ) are untouched"
+  echo "dashboard row verbs (selected agent): e msgs · s send · m mode · v diff · d close · h hide"
+  echo "  in the 'e' message view: Ent pop→orch · J jump to source · c mark all read · q/Esc back"
   echo "config: $KEYBINDS_CONF  (edit or use the leader menu / 'fleet rebind'; menu-alt= sets/disables the prefix+Space alias)"
   if [ "$hold" -eq 1 ]; then hold_wait; fi
 }
@@ -2973,7 +2967,7 @@ fleet — agent fleet manager (tmux + nvim + Claude Code)
   fleet send <a> "msg"   send message to an agent's claude
   fleet ready [a] [-m r]  flag a worktree done/ready for deletion (no arg = the one you're in) [--clear]
   fleet reap             remove all worktrees flagged ready (skips unmerged/dirty unless --force)
-  fleet inbox            read worker→orchestrator summaries (bare=pager; put|list|read|count|gc|clear)
+  fleet inbox            worker→orchestrator summaries (bare=pager that consumes; list/read peek; put|count|gc|clear). In the dashboard: 'e' on an agent row opens its messages.
   fleet browser [u] [a]  drive a real Chromium against the dev app (headless; --watch = visible tiled window) [url|port] [agent]
   fleet devport <port>   record the worktree's dev-server port (read by 'fleet browser')
   fleet fan <repo> <nm>  best-of-N: spawn N agents on one prompt [-n N] [-p prompt] [--base br] [--bare]
@@ -3034,7 +3028,6 @@ case "${1:-}" in
   restamp)       shift; install_orch_guide --restamp "$(fleet_root)" ;;  # re-propagate FLEET.md
   main)       shift; cmd_main "$@" ;;
   orch-jump)  shift; cmd_orch_jump "$@" ;;            # internal: prefix-key jump to orchestrator pane
-  dash-inbox) shift; cmd_dash_inbox "$@" ;;           # internal: prefix+i toggle the dash inbox view
   main-pane)  shift; cmd_main_pane "$@" ;;            # internal: orchestrator pane id (dash pop target)
   apply-keybinds) shift; apply_keybinds ;;            # internal: re-apply runtime keybinds live
   orchestrator|orch) shift; cmd_orchestrator "$@" ;;  # switch orchestrator harness live

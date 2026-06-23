@@ -36,12 +36,26 @@ CFG_LABEL="live"                            # row label ("live" for pc-tune, els
 
 sel=0                                     # selected row index (agents view)
 status=""                                 # transient status line
-MODE=agents                               # view: 'agents' (default) or 'inbox'
+MODE=agents                               # view: 'agents' (default) or 'inbox' (the per-agent 'e' msg view)
 isel=0                                    # selected row index (inbox view)
-IN=0                                      # inbox row count
+IN=0                                      # inbox row count (filtered to the scoped agent)
 IROWS=()                                  # inbox rows: one .msg path each, newest-first
-ICUR=""                                   # cached .cursor value (unread = id > ICUR)
-IUNREAD=0                                 # unread count (for the inbox title)
+IUNREAD=0                                 # unread count for the msg-view title (== IN, archive-as-truth)
+IFILTER=""                               # 'e' view scope: only msgs whose agent-key == IFILTER
+IORPHAN=0                                # 'e' view: 1 = orphan bucket (msgs from no live window)
+
+# Per-agent unread INDEX (rebuilt lazily — see load_inbox_index / THE GATE).
+declare -A UNREAD                          # UNREAD[agent-key] = live (unread) msg count
+declare -A MAXSEV                          # MAXSEV[agent-key] = highest severity among its unread
+declare -A LIVEWIN                         # LIVEWIN[window-name] = 1 for each live agent row
+declare -A LIVEPANE                        # LIVEPANE[pane-id-no-%] = 1 for each live pane
+IBX_TS=0                                   # SECONDS of the last index build (0 = never)
+IBX_DIRTY=""                               # .dirty mtime seen at the last build
+IBX_TOTAL=0                                # total unread across all live agents (title summary)
+IBX_WARN=0                                 # of those, count at sev warn|blocked (the ⚠ summary)
+ORPHAN_N=0                                 # unread msgs whose sender matches no live window
+ORPHAN_MAXSEV=""                           # highest severity among orphan msgs
+ORPHAN_ROW=0                               # 1 = render the synthetic '⌫ orphans' row (ORPHAN_N>0)
 
 # --- terminal setup ----------------------------------------------------------
 # The loop runs load_rows+render between key reads; in cooked mode the tty echoes
@@ -341,8 +355,11 @@ load_rows() {
                 $1=="blocked"{o=0} $1=="idle"{o=1} $1=="working"{o=2} $1!~/blocked|idle|working/{o=3}
                 {print o"\t"$0}' | sort -n | cut -f2-)
   N=${#ROWS[@]}
-  (( N == 0 )) && sel=0
-  (( sel >= N )) && sel=$((N - 1))
+  # selectable rows = live agents + the synthetic orphans row (if any). ORPHAN_ROW
+  # is a global kept fresh by the last load_inbox_index, so sel can rest on it.
+  local tot=$(( N + ORPHAN_ROW ))
+  (( tot == 0 )) && sel=0
+  (( sel >= tot )) && sel=$(( tot - 1 ))
   (( sel < 0 )) && sel=0
 }
 
@@ -357,19 +374,78 @@ inbox_root() { printf '%s/.fleet/inbox' "$(dash_root)"; }
 ibx_field()  { sed -n "/^--$/q; s/^$2=//p" "$1" 2>/dev/null | head -1; }   # ibx_field <file> <key>
 ibx_body()   { sed -n '/^--$/,$p' "$1" 2>/dev/null | sed '1d'; }
 
-# Advance the durable read cursor MONOTONICALLY (max id wins), atomic tmp+mv —
-# same semantics as fleet's inbox_advance_cursor.
-ibx_advance_cursor() { # <dir> <id>
-  local dir="$1" id="$2" cur
-  [ -n "$id" ] || return 0
-  cur=$(cat "$dir/.cursor" 2>/dev/null)
-  if [ -z "$cur" ] || [ "$id" \> "$cur" ]; then
-    printf '%s\n' "$id" > "$dir/.cursor.tmp.$$" 2>/dev/null \
-      && mv -f "$dir/.cursor.tmp.$$" "$dir/.cursor" 2>/dev/null
+# ARCHIVE-AS-TRUTH: no read cursor. unread == live (un-archived) *.msg. POP and
+# mark-all-read consume by moving the file into archive/ (a single atomic mv);
+# JUMP never archives, so glancing never clears the indicator.
+
+# Bump the GATE token (nanosecond, NOT mtime — see fleet's inbox_mark_dirty) after
+# a dash-side mutation (POP / mark-all) so the next index build re-scans at once.
+ibx_mark_dirty() { date +%s%N > "$(inbox_root)/.dirty" 2>/dev/null || true; }
+
+sev_color() { case "$1" in blocked) printf '\033[31m' ;; warn) printf '\033[33m' ;; *) printf '\033[2m' ;; esac; }
+sev_rank()  { case "$1" in blocked) echo 3 ;; warn) echo 2 ;; info) echo 1 ;; *) echo 0 ;; esac; }
+sev_max()   { # <a> <b> -> the higher-severity string
+  local a="$1" b="$2"; [ "$(sev_rank "$b")" -gt "$(sev_rank "$a")" ] && printf '%s' "$b" || printf '%s' "$a"; }
+sev_pcol()  { case "$1" in blocked) echo 1 ;; warn) echo 3 ;; *) echo 6 ;; esac; }  # ✉ pill colour by max sev
+
+# THE join, localized behind one accessor (Q3/Q7). A message's id is epoch.nanos.pane.
+# It attaches to a LIVE agent row iff its 'from' names a live window AND its pane
+# suffix is still a live pane. A respawned same-name agent has fresh pane ids, so a
+# prior incarnation's msg (dead pane) routes to the orphan bucket, not the new row.
+# Relies on LIVEWIN/LIVEPANE populated by load_inbox_index. Echoes the agent key, or
+# "" for an orphan.
+msg_agent_key() { # <from> <pane-no-%> -> live agent key | ""
+  local from="$1" pane="${2#%}"
+  if [ -n "$from" ] && [ -n "${LIVEWIN[$from]:-}" ] && [ -n "${LIVEPANE[$pane]:-}" ]; then
+    printf '%s' "$from"
   fi
 }
 
-sev_color() { case "$1" in blocked) printf '\033[31m' ;; warn) printf '\033[33m' ;; *) printf '\033[2m' ;; esac; }
+# THE GATE. Rebuild the per-agent unread index ONLY when the inbox changed (the
+# .dirty token inbox_put/clear/gc/pop write differs from the one seen at the last
+# build) or a 30s safety TTL elapsed (catches external archive moves: reap/gc).
+# Called every refresh, but the common path is a single cheap `cat` of a tiny token
+# file that returns immediately — the 1s hot loop NEVER sweeps the *.msg files
+# unless something actually wrote one. THIS IS THE COST GATE: without it this would
+# be a 200-file sed sweep every second.
+load_inbox_index() { # [force]
+  local dir; dir=$(inbox_root)
+  local tok; tok=$(cat "$dir/.dirty" 2>/dev/null || echo 0)   # nanosecond GATE token
+  if [ "${1:-}" != force ] && (( IBX_TS != 0 )) && [ "$tok" = "$IBX_DIRTY" ] && (( SECONDS - IBX_TS < 30 )); then
+    return                                   # token unchanged, within TTL — skip the sweep
+  fi
+  IBX_TS=$SECONDS; IBX_DIRTY="$tok"
+  UNREAD=(); MAXSEV=(); LIVEWIN=(); LIVEPANE=()
+  IBX_TOTAL=0; IBX_WARN=0; ORPHAN_N=0; ORPHAN_MAXSEV=""
+  local i wn p
+  for (( i=0; i<N; i++ )); do wn=$(field "$i" 4); [ -n "$wn" ] && LIVEWIN["$wn"]=1; done
+  while IFS= read -r p; do p="${p#%}"; [ -n "$p" ] && LIVEPANE["$p"]=1; done < <(
+    tmux list-panes -s -t "$SESS" -F '#{pane_id}' 2>/dev/null
+    tmux list-panes -s -t "${SESS}_hidden" -F '#{pane_id}' 2>/dev/null)
+  local f id from pane sev key
+  if [ -d "$dir" ]; then
+    for f in "$dir"/*.msg; do
+      [ -e "$f" ] || continue
+      id=$(basename "$f" .msg); pane="${id##*.}"
+      from=$(ibx_field "$f" from); sev=$(ibx_field "$f" sev)
+      key=$(msg_agent_key "$from" "$pane")
+      if [ -n "$key" ]; then
+        UNREAD["$key"]=$(( ${UNREAD["$key"]:-0} + 1 ))
+        MAXSEV["$key"]=$(sev_max "${MAXSEV[$key]:-}" "$sev")
+      else
+        ORPHAN_N=$(( ORPHAN_N + 1 )); ORPHAN_MAXSEV=$(sev_max "$ORPHAN_MAXSEV" "$sev")
+      fi
+      IBX_TOTAL=$(( IBX_TOTAL + 1 ))
+      case "$sev" in warn|blocked) IBX_WARN=$(( IBX_WARN + 1 )) ;; esac
+    done
+  fi
+  ORPHAN_ROW=0; (( ORPHAN_N > 0 )) && ORPHAN_ROW=1
+  # re-clamp selection now that the orphan row's existence is known
+  local tot=$(( N + ORPHAN_ROW ))
+  (( tot == 0 )) && sel=0
+  (( sel >= tot )) && sel=$(( tot - 1 ))
+  (( sel < 0 )) && sel=0
+}
 
 fmt_age() { # seconds -> compact 5s/3m/2h/4d
   local s="${1:-0}"; (( s < 0 )) && s=0
@@ -379,38 +455,47 @@ fmt_age() { # seconds -> compact 5s/3m/2h/4d
   else printf '%dd' "$(( s / 86400 ))"; fi
 }
 
-# IROWS[] entries: the .msg file path. Fields are read lazily per-row (like fleet).
+# IROWS[] = the .msg paths for the SCOPED 'e' view, newest-first. The scope is one
+# agent (IFILTER) or the orphan bucket (IORPHAN). Archive-as-truth: every listed
+# msg is unread, so IUNREAD == IN. Relies on LIVEWIN/LIVEPANE from load_inbox_index.
 load_inbox() {
-  IROWS=(); IUNREAD=0
-  local dir f id; dir=$(inbox_root)
-  ICUR=$(cat "$dir/.cursor" 2>/dev/null)
+  IROWS=()
+  local dir f id from pane key; dir=$(inbox_root)
   if [ -d "$dir" ]; then
     while IFS= read -r f; do
       [ -e "$f" ] || continue
-      IROWS+=("$f"); id=$(basename "$f" .msg)
-      { [ -z "$ICUR" ] || [ "$id" \> "$ICUR" ]; } && (( IUNREAD++ ))
+      id=$(basename "$f" .msg); pane="${id##*.}"
+      from=$(ibx_field "$f" from); key=$(msg_agent_key "$from" "$pane")
+      if (( IORPHAN )); then
+        [ -z "$key" ] || continue            # orphan view: keep only no-live-window msgs
+      else
+        [ "$key" = "$IFILTER" ] || continue   # agent view: keep only this agent's msgs
+      fi
+      IROWS+=("$f")
     done < <(ls -1 "$dir"/*.msg 2>/dev/null | sort -r)
   fi
-  IN=${#IROWS[@]}
+  IN=${#IROWS[@]}; IUNREAD=$IN
   (( IN == 0 )) && isel=0
   (( isel >= IN )) && isel=$((IN - 1))
   (( isel < 0 )) && isel=0
 }
 
 # Mode-aware navigation: act on the active view's index/count so the same j/k/g/G
-# (and the arrow keys, and drain_nav's coalescing) drive whichever view is up.
+# (and the arrow keys, and drain_nav's coalescing) drive whichever view is up. In
+# agents mode the row count includes the synthetic orphans row (ORPHAN_ROW).
+arows()    { echo $(( N + ORPHAN_ROW )); }
 nav_up()   { if [ "$MODE" = inbox ]; then (( isel > 0 )) && ((isel--)); else (( sel > 0 )) && ((sel--)); fi; }
-nav_down() { if [ "$MODE" = inbox ]; then (( isel < IN-1 )) && ((isel++)); else (( sel < N-1 )) && ((sel++)); fi; }
+nav_down() { if [ "$MODE" = inbox ]; then (( isel < IN-1 )) && ((isel++)); else (( sel < $(arows)-1 )) && ((sel++)); fi; }
 nav_top()  { if [ "$MODE" = inbox ]; then isel=0; else sel=0; fi; }
-nav_bot()  { if [ "$MODE" = inbox ]; then (( IN > 0 )) && isel=$((IN - 1)); else (( N > 0 )) && sel=$((N - 1)); fi; }
+nav_bot()  { if [ "$MODE" = inbox ]; then (( IN > 0 )) && isel=$((IN - 1)); else (( $(arows) > 0 )) && sel=$(( $(arows) - 1 )); fi; }
 
-# Enter in inbox = POP the selected message to the orchestrator. Paste a source
-# header line + the body into the orchestrator's input WITHOUT submitting (no
-# Enter/C-m — the human reviews and sends). On success: mark read + archive (move
-# the .msg into archive/, advance .cursor to its id), which drops the unread badge
-# and removes it from the live list. The orchestrator pane is resolved via fleet's
-# is_main_pane helper (it is deliberately filtered out of agents_tsv). If it can't
-# be resolved, error and do nothing — never lose the message.
+# Enter in the msg view = POP the selected message to the orchestrator. Paste a
+# source header line + the body into the orchestrator's input WITHOUT submitting (no
+# Enter/C-m — the human reviews and sends). On success: archive the .msg (move into
+# archive/ = mark read under archive-as-truth), which removes it from the live list
+# and decrements that agent's unread by one. The orchestrator pane is resolved via
+# fleet's is_main_pane helper (it is deliberately filtered out of agents_tsv). If it
+# can't be resolved, error and do nothing — never lose the message.
 inbox_pop() {
   (( IN == 0 )) && { status="inbox empty"; return; }
   local f="${IROWS[$isel]}" dir; dir=$(inbox_root)
@@ -425,10 +510,34 @@ inbox_pop() {
   if [ -z "$orch" ]; then status="couldn't resolve orchestrator pane — nothing popped"; return; fi
   tmux send-keys -t "$orch" -l -- "$text" 2>/dev/null \
     || { status="paste failed — nothing changed"; return; }
+  # archive-as-truth: archiving the file IS marking it read — it leaves the live set
+  # so this agent's unread drops by exactly one (no cursor, no max-over-pop bug).
   mkdir -p "$dir/archive" 2>/dev/null
   mv -f "$f" "$dir/archive/" 2>/dev/null
-  ibx_advance_cursor "$dir" "$id"
+  ibx_mark_dirty
   status="popped → orchestrator"
+}
+
+# c/a in the 'e' view = MARK ALL READ: archive every msg in the current scope (this
+# agent's, or the orphan bucket). Reuses POP's archive = consume semantics in bulk.
+inbox_mark_all() {
+  (( IN == 0 )) && { status="nothing to mark"; return; }
+  local dir f n=0; dir=$(inbox_root); mkdir -p "$dir/archive" 2>/dev/null
+  for f in "${IROWS[@]}"; do [ -e "$f" ] && mv -f "$f" "$dir/archive/" 2>/dev/null && n=$((n+1)); done
+  ibx_mark_dirty
+  status="marked $n read"
+}
+
+# 'e' (or Enter on the orphan row) -> open the scoped message view. Scope = the
+# selected agent, or the orphan bucket when the synthetic row is selected.
+open_msgs() {
+  if (( ORPHAN_ROW && sel == N )); then
+    IORPHAN=1; IFILTER=""
+  else
+    (( N == 0 )) && return 1
+    IORPHAN=0; IFILTER=$(field "$sel" 4)
+  fi
+  MODE=inbox; isel=0; load_inbox_index force; load_inbox; status=""
 }
 
 # J in inbox = JUMP to the message's source agent. 'from' is a window name at send
@@ -509,8 +618,13 @@ render() {
   # top border with title. Keep label text to width-1 glyphs only (box-drawing
   # chars and · are reliable; wide/ambiguous glyphs like ⏎ or nerd icons break
   # the char-count = display-width assumption hrule relies on).
+  # title carries the cross-agent unread summary (replaces the removed status badge):
+  # '✉<total>' and, when any are warn/blocked, '⚠<count>'. Rendered only when >0 so
+  # it costs zero width when everything is read.
+  local title="FLEET · $SESS · $N agent$([ "$N" = 1 ] || echo s)"
+  (( IBX_TOTAL > 0 )) && { title+=" · ✉$IBX_TOTAL"; (( IBX_WARN > 0 )) && title+=" ⚠$IBX_WARN"; }
   printf '\033[2m%s\033[0m\033[K\n' \
-    "$(hrule '╭' '╮' "$inner" "FLEET · $SESS · $N agent$([ "$N" = 1 ] || echo s)")"
+    "$(hrule '╭' '╮' "$inner" "$title")"
 
   local drawn=0 i
   for (( i=0; i<PAD_Y && drawn<slots; i++ )); do   # top padding rows
@@ -534,7 +648,7 @@ render() {
     fi
   fi
 
-  if (( N == 0 )); then
+  if (( N == 0 && ORPHAN_ROW == 0 )); then
     (( drawn < slots )) && { printf '\033[2m│\033[0m%s%-*s%s\033[2m│\033[0m\033[K\n' \
       "$ins" "$cw" "no agents yet — press n to spawn one" "$ins"; (( drawn++ )); }
   else
@@ -559,10 +673,16 @@ render() {
       if harness_has_modes "$(harness_of "$pane")"; then mode=$(mode_label "$pane"); hmode=1; np=3
       else mode=""; hmode=0; np=2; fi
       git_show=1; mode_show=$hmode; cost_show=1
+      # per-agent unread pill (✉N), coloured by the agent's max unread severity.
+      # Rendered only when this agent has unread msgs, so all-read rows cost nothing.
+      local iunread=${UNREAD[$wname]:-0} ibx_show=0
+      (( iunread > 0 )) && ibx_show=1
+      np=$(( 1 + git_show + mode_show + ibx_show ))   # state always + git/mode/✉ optional
       LW=$(( cw - np*PW - CF - (np+1)*G ))         # np pills + cost + gaps
-      (( LW < 1 )) && { cost_show=0; LW=$(( cw - np*PW - np*G )); }
-      (( LW < 1 )) && (( hmode )) && { mode_show=0; np=2; LW=$(( cw - np*PW - np*G )); }
-      (( LW < 1 )) && { git_show=0; LW=$(( cw - PW - G )); }
+      (( LW < 1 )) && { cost_show=0; LW=$(( cw - np*PW - np*G )); }                 # drop cost
+      (( LW < 1 )) && (( mode_show )) && { mode_show=0; np=$((np-1)); LW=$(( cw - np*PW - np*G )); }  # drop mode
+      (( LW < 1 )) && (( ibx_show )) && { ibx_show=0; np=$((np-1)); LW=$(( cw - np*PW - np*G )); }    # drop ✉
+      (( LW < 1 )) && { git_show=0; ibx_show=0; mode_show=0; LW=$(( cw - PW - G )); }                 # state+label only
       (( LW < 0 )) && LW=0
       # stall: an agent stuck "working" too long shows a red 'stalled' pill
       sdisp="$state"; scol=$(state_pcol "$state")
@@ -580,6 +700,7 @@ render() {
       content+=$(printf "%s${lblsgr}%b\033[22m" "$gap" "$(fit_left "$label" "$LW")")
       (( git_show )) && content+="$gap$(pill "$gt" "$(git_pcol "$g")")"
       (( mode_show )) && content+="$gap$(pill "$(mode_short "$mode")" "$(mode_pcol "$mode")")"
+      (( ibx_show )) && content+="$gap$(pill "✉$iunread" "$(sev_pcol "${MAXSEV[$wname]:-}")")"
       if (( cost_show )); then
         cost=$(cost_cached "$pane")
         content+=$(printf "%s\033[2m%-*.*s\033[0m" "$gap" "$CF" "$CF" "$cost")
@@ -596,6 +717,29 @@ render() {
         printf '\033[2m│%s│\033[0m\033[K\n' "$blank"; (( drawn++ ))
       done
     done
+    # Synthetic '⌫ orphans' row (combined bucket, trailing position) for unread msgs
+    # whose sender matches no live window — reaped/gone agents, or a prior incarnation
+    # of a respawned name (pane-suffix mismatch). Selectable at index N; 'e'/Enter
+    # opens its filtered view. Rendered only when ORPHAN_N>0.
+    if (( ORPHAN_ROW && drawn < slots )); then
+      (( N > 0 && drawn < slots )) && { printf '\033[2m│%s│\033[0m\033[K\n' "$blank"; (( drawn++ )); }
+      if (( drawn < slots )); then
+        local oidx=$N olbl ocont ocol OLW
+        olbl="⌫ orphans ($ORPHAN_N) — reaped/gone senders"
+        ocol=$(sev_pcol "$ORPHAN_MAXSEV")
+        OLW=$(( cw - PW - G )); (( OLW < 0 )) && OLW=0
+        (( oidx == sel )) && lblsgr='\033[1m' || lblsgr='\033[2m'
+        ocont=$(pill "✉$ORPHAN_N" "$ocol")
+        ocont+=$(printf "%s${lblsgr}%b\033[22m" "$gap" "$(fit_left "$olbl" "$OLW")")
+        if (( oidx == sel )); then
+          printf '\033[2m│\033[0m%b▌\033[0m%s%b%s\033[2m│\033[0m\033[K\n' \
+            "$markc" "$ins1" "$ocont" "$ins"
+        else
+          printf '\033[2m│\033[0m%s%b%s\033[2m│\033[0m\033[K\n' "$ins" "$ocont" "$ins"
+        fi
+        (( drawn++ ))
+      fi
+    fi
   fi
 
   # empty side rails fill the box down to the bottom border (also = bottom pad)
@@ -607,7 +751,7 @@ render() {
   # bottom border with key hints (or a transient status)
   local hint
   if [ -n "$status" ]; then hint="$status"
-  else hint="Spc leader · j/k · Ent jump · h hide · v diff · m mode · s send · n new · d close · r/R refresh/reload"; fi
+  else hint="Spc leader · j/k · Ent jump · e msgs · h hide · v diff · m mode · s send · n new · d close · r/R refresh"; fi
   tput cup $(( rows - 1 )) 0 2>/dev/null
   printf '\033[2m%s\033[0m\033[K' "$(hrule '╰' '╯' "$inner" "$hint")"
 }
@@ -628,8 +772,9 @@ render_inbox() {
   local now; now=$(date +%s 2>/dev/null); [ -n "$now" ] || now=0
   tput cup 0 0 2>/dev/null
 
+  local scope; if (( IORPHAN )); then scope="orphans"; else scope="${IFILTER:-?}"; fi
   printf '\033[2m%s\033[0m\033[K\n' \
-    "$(hrule '╭' '╮' "$inner" "INBOX · $SESS · $IUNREAD unread / $IN")"
+    "$(hrule '╭' '╮' "$inner" "MSGS · $scope · $IUNREAD")"
 
   local drawn=0 i
   for (( i=0; i<PAD_Y && drawn<slots; i++ )); do
@@ -649,26 +794,31 @@ render_inbox() {
       (( drawn++ ))
     done
   else
-    local SEVW=9 FROMW=14 AGEW=5
-    local f id unread sev from title epoch age sevf
+    # archive-as-truth: every listed msg is unread, so the leading '*' is constant.
+    # The 'from' column is shown only in the orphan view (Q4 — identify each dead
+    # sender); in an agent-scoped view 'from' is constant (== IFILTER) so it's dropped.
+    local SEVW=9 FROMW=14 AGEW=5 showfrom=0 base
+    (( IORPHAN )) && showfrom=1
+    if (( showfrom )); then base=33; else base=18; fi   # see width math below
+    local f id sev from title epoch age sevf
     local sevtxt fromtxt titletxt agetxt content LW ageshow lblsgr
     for (( i=0; i<IN && drawn<slots; i++ )); do
       f="${IROWS[$i]}"; id=$(basename "$f" .msg)
-      unread=' '; { [ -z "$ICUR" ] || [ "$id" \> "$ICUR" ]; } && unread='*'
       sev=$(ibx_field "$f" sev); from=$(ibx_field "$f" from); title=$(ibx_field "$f" title)
       epoch="${id%%.*}"; case "$epoch" in *[!0-9]*|'') epoch=$now ;; esac
       age=$(fmt_age $(( now - epoch )))
-      ageshow=1; LW=$(( cw - 33 ))                 # 1+1+SEVW+1+FROMW+1+1+AGEW = 33
-      (( LW < 1 )) && { ageshow=0; LW=$(( cw - 27 )); }   # drop age (6 cols)
+      # widths: '*'(1) sp(1) sev(SEVW) sp(1) [from(FROMW) sp(1)] title sp(1) age(AGEW)
+      ageshow=1; LW=$(( cw - base ))
+      (( LW < 1 )) && { ageshow=0; LW=$(( cw - base + AGEW + 1 )); }   # drop age
       (( LW < 1 )) && LW=0
       sevf=$(printf '[%s]' "$sev")
       sevtxt=$(printf '%s%-*.*s\033[0m' "$(sev_color "$sev")" "$SEVW" "$SEVW" "$sevf")
-      fromtxt=$(printf '%-*.*s' "$FROMW" "$FROMW" "$from")
+      fromtxt=""; (( showfrom )) && fromtxt=$(printf '%-*.*s ' "$FROMW" "$FROMW" "$from")
       titletxt=$(fit_left "$title" "$LW")
       agetxt=""; (( ageshow )) && agetxt=$(printf ' %*s' "$AGEW" "$age")
       (( i == isel )) && lblsgr='\033[1m' || lblsgr='\033[2m'
-      content=$(printf '%s %s %s %b%s\033[22m%s' \
-        "$unread" "$sevtxt" "$fromtxt" "$lblsgr" "$titletxt" "$agetxt")
+      content=$(printf '* %s %s%b%s\033[22m%s' \
+        "$sevtxt" "$fromtxt" "$lblsgr" "$titletxt" "$agetxt")
       if (( i == isel )); then
         printf '\033[2m│\033[0m%b▌\033[0m%s%s%s\033[2m│\033[0m\033[K\n' \
           "$markc" "$ins1" "$content" "$ins"
@@ -685,7 +835,7 @@ render_inbox() {
 
   local hint
   if [ -n "$status" ]; then hint="$status"
-  else hint="j/k · Ent pop → orch · J jump to source · i agents · r/R refresh/reload"; fi
+  else hint="j/k · Ent pop → orch · J jump to source · c mark all read · q/Esc back · r refresh"; fi
   tput cup $(( rows - 1 )) 0 2>/dev/null
   printf '\033[2m%s\033[0m\033[K' "$(hrule '╰' '╯' "$inner" "$hint")"
 }
@@ -1150,7 +1300,9 @@ while :; do
   # REFRESH while keeping the ~34ms `fleet agents` RPC off every keypress
   # (≤1 RPC/sec even under a mash). Nav itself never reloads — it only moves sel.
   if (( SECONDS - last_load >= REFRESH )); then
-    if [ "$MODE" = inbox ]; then load_inbox; else load_rows; fi
+    load_rows                       # ROWS feed both the agents view AND the index's live-window set
+    load_inbox_index                # GATE: stat-only no-op unless the inbox changed (or 30s TTL)
+    [ "$MODE" = inbox ] && load_inbox
     last_load=$SECONDS
   fi
   render
@@ -1163,6 +1315,8 @@ while :; do
       case "$rest" in
         '[A') nav_up ;;
         '[B') nav_down ;;
+        '')   # bare Esc: leave the msg view back to the agents list
+          [ "$MODE" = inbox ] && { MODE=agents; load_rows; load_inbox_index; status=""; last_load=$SECONDS; } ;;
       esac
       drain_nav ;;
     k) nav_up; drain_nav ;;
@@ -1175,14 +1329,20 @@ while :; do
       # The same popup as prefix+Space; it schedules its own action on close.
       "$FLEET_BIN" menu-popup 2>/dev/null   # fit-to-content frame; blocks until the popup closes
       clear; status="" ;;
-    i)             # toggle inbox/agents view (also the key prefix+i sends in)
-      if [ "$MODE" = inbox ]; then MODE=agents; load_rows
-      else MODE=inbox; load_inbox; fi
-      status=""; last_load=$SECONDS ;;
-    r) status=""; if [ "$MODE" = inbox ]; then load_inbox; else load_rows; fi; last_load=$SECONDS ;;   # manual refresh
+    e)             # agents view: open the selected agent's (or orphan bucket's) messages
+      [ "$MODE" = agents ] || continue
+      open_msgs; last_load=$SECONDS ;;
+    c|a)           # msg view: mark all read (archive this scope's live msgs), then back
+      [ "$MODE" = inbox ] || continue
+      inbox_mark_all; MODE=agents; load_rows; load_inbox_index; last_load=$SECONDS ;;
+    q)             # msg view: back to the agents list (no-op in agents view)
+      [ "$MODE" = inbox ] || continue
+      MODE=agents; load_rows; load_inbox_index; status=""; last_load=$SECONDS ;;
+    r) status=""; load_rows; load_inbox_index; [ "$MODE" = inbox ] && load_inbox; last_load=$SECONDS ;;   # manual refresh
     R) cleanup; exec "$SELF" "$SESS" ;;   # reload the dashboard with fresh code
-    $'\n'|$'\r')   # inbox: pop to orchestrator. agents: jump to selected window
+    $'\n'|$'\r')   # inbox: pop to orchestrator. agents: jump (orphan row: open its msgs)
       if [ "$MODE" = inbox ]; then inbox_pop; load_inbox; last_load=$SECONDS; continue; fi
+      (( ORPHAN_ROW && sel == N )) && { open_msgs; last_load=$SECONDS; continue; }
       (( N == 0 )) && continue
       win=$(field "$sel" 3)
       # A window parked in <sess>_hidden is not a member of $SESS, so a bare
@@ -1202,6 +1362,7 @@ while :; do
     h)             # hide the selected scratch agent back off the bar (into <sess>_hidden)
       [ "$MODE" = inbox ] && continue
       (( N == 0 )) && continue
+      (( sel >= N )) && { status="orphans row — press e for messages"; continue; }
       win=$(field "$sel" 3); wname=$(field "$sel" 4)
       # Gate on the @fleet_hidden marker so ONLY scratch agents are hideable —
       # worker windows must never be yanked off the bar. (Unset on workers; 0/1 on
@@ -1230,6 +1391,7 @@ while :; do
     m)             # permission-mode pick-list for the selected agent (sets status)
       [ "$MODE" = inbox ] && continue
       (( N == 0 )) && continue
+      (( sel >= N )) && { status="orphans row — press e for messages"; continue; }
       label=$(field "$sel" 2); pane=$(field "$sel" 6)
       case "$(field "$sel" 1)" in
         starting|stale) status="$label still starting — no hook yet" ;;
@@ -1240,6 +1402,7 @@ while :; do
     s)             # send a message to selected agent
       [ "$MODE" = inbox ] && continue
       (( N == 0 )) && continue
+      (( sel >= N )) && { status="orphans row — press e for messages"; continue; }
       label=$(field "$sel" 2)
       msg=$(ask "send to $label> "); clear   # repaint: read -e may have scrolled
       [ -n "$msg" ] && { "$FLEET_BIN" send "$label" "$msg" >/dev/null 2>&1 \
@@ -1251,15 +1414,17 @@ while :; do
     d)             # close/teardown the selected agent (confirm popup)
       [ "$MODE" = inbox ] && continue
       (( N == 0 )) && continue
+      (( sel >= N )) && { status="orphans row — press e for messages"; continue; }
       label=$(field "$sel" 2); win=$(field "$sel" 3); pane=$(field "$sel" 6)
       dir=$(tmux display -p -t "$pane" '#{pane_current_path}' 2>/dev/null)
       confirm_teardown "$label" "$win" "$pane" "$dir"; clear; load_rows; last_load=$SECONDS ;;
     v)             # view the selected agent's git diff in a popup pager
       [ "$MODE" = inbox ] && continue
       (( N == 0 )) && continue
+      (( sel >= N )) && { status="orphans row — press e for messages"; continue; }
       label=$(field "$sel" 2); pane=$(field "$sel" 6)
       dir=$(tmux display -p -t "$pane" '#{pane_current_path}' 2>/dev/null)
       view_diff "$dir" "$label"; clear ;;
-    *) : ;;        # ignore everything else (no q — this is the persistent pane)
+    *) : ;;        # ignore everything else (q only backs out of the msg view)
   esac
 done
