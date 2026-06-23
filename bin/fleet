@@ -208,24 +208,41 @@ PY
   fi
 }
 
+# Keep a display-popup open until a key is pressed. Lives here (bash) rather
+# than as an inline `read` in the tmux command string, because display-popup
+# runs that string under the user's default-shell — and `read -n1` is bashism
+# that errors instantly under zsh, closing the popup (the flash bug). Running
+# the wait inside bin/fleet (which is bash) makes it default-shell-agnostic.
+hold_wait() {
+  echo
+  read -rsn1 -p 'press any key…' _ 2>/dev/null || read -r _ 2>/dev/null || true
+}
+
 cmd_ls() {
   # By default, scope the listing to the CURRENT project: keep rows whose
   # session (field 3) is this session or its parked-scratch sibling
   # "<sess>_hidden". `--all`/`-a` restores the full server-wide listing.
   # Scoping lives HERE (display only) — agents_tsv stays global so send/pick/
   # watch/dashboard callers keep the full list.
-  local all=0
-  case "${1:-}" in --all|-a) all=1 ;; esac
+  # `--hold` keeps a popup open after printing (used by the leader menu).
+  local all=0 hold=0
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --all|-a) all=1 ;;
+      --hold)   hold=1 ;;
+    esac
+    shift
+  done
 
   local out; out=$(agents_tsv)
-  [ -n "$out" ] || { echo "no agents registered"; return 0; }
+  [ -n "$out" ] || { echo "no agents registered"; [ "$hold" -eq 1 ] && hold_wait; return 0; }
 
   # Scope unless --all. session_name failing/empty (not inside tmux) → can't
   # scope, so fall through to the global listing.
   local sess
   if [ "$all" -eq 0 ] && sess=$(session_name 2>/dev/null) && [ -n "$sess" ]; then
     out=$(echo "$out" | awk -F'\t' -v s="$sess" '$3==s || $3==s"_hidden"')
-    [ -n "$out" ] || { echo "no agents in this project"; return 0; }
+    [ -n "$out" ] || { echo "no agents in this project"; [ "$hold" -eq 1 ] && hold_wait; return 0; }
   fi
 
   printf 'STATE\tAGENT\tWINDOW\tIN-STATE\n'
@@ -238,6 +255,7 @@ cmd_ls() {
     else if ($9 != "")                                  { extra="  (ready? " $9 " — but " $1 ")" }
     printf "%s\t%s\t%s:%s\t%s%s\n", st, $2, $3, $5, $6, extra
   }'
+  if [ "$hold" -eq 1 ]; then hold_wait; fi
 }
 
 # ---- pick ---------------------------------------------------------------------
@@ -2233,8 +2251,8 @@ action_tmux_command() { # tmux command string run when an action's key is presse
     main)   echo "run-shell '$self main'" ;;
     orch-jump) echo "run-shell '$self orch-jump'" ;;
     reload) echo "display-menu -b rounded -T '#[align=centre]Reload dashboard?' -x C -y C 'Yes, reload' y \"run-shell '$self main --reload'\" 'Cancel' n ''" ;;
-    ls)     echo "display-popup -E -b rounded -w 70% -h 60% \"$self ls; echo; read -n1 -r -p 'press any key'\"" ;;
-    keys)   echo "display-popup -E -b rounded -w 72% -h 70% \"$self keys; echo; read -n1 -r -p 'press any key'\"" ;;
+    ls)     echo "display-popup -E -b rounded -w 70% -h 60% '$self ls --hold'" ;;
+    keys)   echo "display-popup -E -b rounded -w 72% -h 70% '$self keys --hold'" ;;
     inbox)  echo "run-shell '$self dash-inbox'" ;;
     sessions) echo "display-popup -E -b rounded -w 70% -h 60% '$self sessions'" ;;
     rebind) echo "run-shell '$self rebind'" ;;
@@ -2388,7 +2406,9 @@ cmd_rebind_set() { # rebind-set <action> <key>
   fi
 }
 
-cmd_keys() { # plain text listing
+cmd_keys() { # plain text listing; --hold keeps a popup open until a key is pressed
+  local hold=0
+  case "${1:-}" in --hold) hold=1 ;; esac
   printf 'ACTION\tKEY\tGROUP\tDESCRIPTION\n'
   local action key grp label desc
   while IFS='|' read -r action key_default grp label desc; do
@@ -2398,6 +2418,7 @@ cmd_keys() { # plain text listing
   echo
   echo "leader: prefix+Space (or prefix+F), or bare Space in the dashboard pane"
   echo "config: $KEYBINDS_CONF  (edit or use the leader menu / 'fleet rebind')"
+  if [ "$hold" -eq 1 ]; then hold_wait; fi
 }
 
 cmd_up() {
