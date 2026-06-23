@@ -44,6 +44,10 @@ IUNREAD=0                                 # unread count for the msg-view title 
 IFILTER=""                               # 'e' view scope: only msgs whose agent-key == IFILTER
 IORPHAN=0                                # 'e' view: 1 = orphan bucket (msgs from no live window)
 ISYSTEM=0                                # 'e' view: 1 = system bucket (orchestrator/gate notes)
+IALL=0                                   # triage scope: 1 = cross-agent (every *.msg, no filter), multi-select
+ISORT=asc                                # triage sort: asc (oldest↑, default) | desc (newest↓); 'o' toggles
+ITOK=""                                  # .dirty token seen at the last triage load (stale-list "changed—r" hint)
+declare -A MARKED                        # triage marked-set, keyed by *.msg PATH (stable across re-sorts)
 
 # Per-agent unread INDEX (rebuilt lazily — see load_inbox_index / THE GATE).
 declare -A UNREAD                          # UNREAD[agent-key] = live (unread) msg count
@@ -477,10 +481,16 @@ fmt_age() { # seconds -> compact 5s/3m/2h/4d
 # msg is unread, so IUNREAD == IN. Relies on LIVEWIN/LIVEPANE from load_inbox_index.
 load_inbox() {
   IROWS=()
-  local dir f id from pane key; dir=$(inbox_root)
+  local dir f id from pane key sortf="-r"; dir=$(inbox_root)
+  # Triage (IALL) lists EVERYTHING unfiltered, default oldest-first (asc) — the
+  # opposite of the per-agent view's newest-first; 'o' flips to desc. ids are
+  # <epoch>.<nanos>.<pane> (fixed-width) so a lexical sort is chronological.
+  if (( IALL )); then [ "$ISORT" = desc ] && sortf="-r" || sortf=""; fi
   if [ -d "$dir" ]; then
     while IFS= read -r f; do
       [ -e "$f" ] || continue
+      if (( IALL )); then IROWS+=("$f"); continue   # triage: everything, no agent/orphan/system filter
+      fi
       id=$(basename "$f" .msg); pane="${id##*.}"
       from=$(ibx_field "$f" from); key=$(msg_agent_key "$from" "$pane")
       if (( IORPHAN )); then
@@ -491,7 +501,7 @@ load_inbox() {
         [ "$key" = "$IFILTER" ] || continue   # agent view: keep only this agent's msgs
       fi
       IROWS+=("$f")
-    done < <(ls -1 "$dir"/*.msg 2>/dev/null | sort -r)
+    done < <(ls -1 "$dir"/*.msg 2>/dev/null | sort $sortf)
   fi
   IN=${#IROWS[@]}; IUNREAD=$IN
   (( IN == 0 )) && isel=0
@@ -544,6 +554,79 @@ open_msgs() {
     IORPHAN=0; ISYSTEM=0; IFILTER=$(field "$sel" 4)
   fi
   MODE=inbox; isel=0; load_inbox_index force; load_inbox; status=""
+}
+
+# 't' (agents view) or the leader 'triage' -> open the CROSS-AGENT triage: the inbox
+# view with the per-agent filter removed (IALL=1), every queued msg listed oldest-first,
+# multi-select armed (a fresh MARKED set). Built by EXTENDING the inbox view — no new
+# popup, no second key loop (advisor D1 / B-minimal). ITOK records the load-time .dirty
+# token so render can flag a list that changed underneath the open view.
+open_triage() {
+  IALL=1; IORPHAN=0; ISYSTEM=0; IFILTER=""
+  ISORT=asc; MARKED=()
+  MODE=inbox; isel=0
+  load_inbox_index force; load_inbox
+  ITOK=$(cat "$(inbox_root)/.dirty" 2>/dev/null || echo 0)
+  status=""
+}
+
+# Leave triage (or the per-agent inbox view) back to the agents list, clearing the
+# triage scope + marks so the next open starts clean.
+close_inbox_view() {
+  MODE=agents; IALL=0; MARKED=()
+  load_rows; load_inbox_index; status=""
+}
+
+# The triage header label (scope · direction · counts · stale-flag). Factored out so it
+# is render-free and unit-testable. 'oldest↑' / 'newest↓' makes the sort direction (and
+# the toggle) legible; 'N marked' is the selection counter; 'changed—r' appears when the
+# inbox .dirty token moved since the view loaded (a non-stale "everything" view).
+triage_header() {
+  local arrow nm=0 k stale="" cur
+  [ "$ISORT" = desc ] && arrow="newest↓" || arrow="oldest↑"
+  for k in "${!MARKED[@]}"; do [ -n "${MARKED[$k]:-}" ] && nm=$((nm+1)); done
+  cur=$(cat "$(inbox_root)/.dirty" 2>/dev/null || echo 0)
+  [ -n "$ITOK" ] && [ "$cur" != "$ITOK" ] && stale=" · changed—r"
+  printf 'MSGS · triage · %s · %d msgs · %d marked%s' "$arrow" "$IN" "$nm" "$stale"
+}
+
+# The marked messages in CURRENT DISPLAY order (advisor D2): iterate IROWS (already
+# sorted per ISORT) and emit those marked. Deterministic — NEVER bash associative-array
+# order (advisor S3). This is the order Enter pops them, so the human pops the set in the
+# order they read it.
+triage_marked_order() {
+  local f
+  for f in "${IROWS[@]}"; do [ -n "${MARKED[$f]:-}" ] && printf '%s\n' "$f"; done
+}
+
+# Enter in triage = pop every marked message, in display order, into the orchestrator.
+# Each goes through the shared `fleet inbox pop <file>` primitive (no-submit bracketed
+# paste that appends + archive-verify + the D4 separator), so a batch concatenates,
+# self-separates and never auto-submits. SAFETY: the whole batch is gated ONCE up front
+# via the SAME extracted busy helper the FIFO pop uses (`fleet inbox orch-busy`); if the
+# orch is mid-generation it pops NOTHING and KEEPS the marks (advisor D3). Nothing marked
+# = no-op + hint (D5/Q4). Vanished marked files are skipped + counted (S3). On success
+# the view closes and we land in the orch pane to review the assembled batch (D5/Q7).
+triage_pop() {
+  local order=() f
+  while IFS= read -r f; do [ -n "$f" ] && order+=("$f"); done < <(triage_marked_order)
+  if (( ${#order[@]} == 0 )); then status="nothing marked — Space to mark, then Enter to pop"; return; fi
+  local bstate
+  if bstate=$("$FLEET_BIN" inbox orch-busy 2>/dev/null); then
+    status="orchestrator ${bstate:-busy} — retry when idle (${#order[@]} marks kept)"; return
+  fi
+  local popped=0 gone=0
+  for f in "${order[@]}"; do
+    if [ -e "$f" ]; then
+      "$FLEET_BIN" inbox pop "$f" >/dev/null 2>&1 && popped=$((popped+1))
+    else
+      gone=$((gone+1))
+    fi
+    unset 'MARKED[$f]'
+  done
+  close_inbox_view                          # clears status -> set the outcome AFTER
+  status="popped $popped → orch"; (( gone )) && status="$status, $gone already gone"
+  "$FLEET_BIN" orch-jump >/dev/null 2>&1    # land in the orch pane to review the batch
 }
 
 # J in inbox = JUMP to the message's source agent. 'from' is a window name at send
@@ -800,12 +883,18 @@ render_inbox() {
   local now; now=$(date +%s 2>/dev/null); [ -n "$now" ] || now=0
   tput cup 0 0 2>/dev/null
 
-  local scope
-  if   (( IORPHAN )); then scope="orphans"
-  elif (( ISYSTEM )); then scope="system"
-  else scope="${IFILTER:-?}"; fi
+  local htitle
+  if (( IALL )); then
+    htitle="$(triage_header)"
+  else
+    local scope
+    if   (( IORPHAN )); then scope="orphans"
+    elif (( ISYSTEM )); then scope="system"
+    else scope="${IFILTER:-?}"; fi
+    htitle="MSGS · $scope · $IUNREAD"
+  fi
   printf '\033[2m%s\033[0m\033[K\n' \
-    "$(hrule '╭' '╮' "$inner" "MSGS · $scope · $IUNREAD")"
+    "$(hrule '╭' '╮' "$inner" "$htitle")"
 
   local drawn=0 i
   for (( i=0; i<PAD_Y && drawn<slots; i++ )); do
@@ -829,7 +918,7 @@ render_inbox() {
     # The 'from' column is shown only in the orphan view (Q4 — identify each dead
     # sender); in an agent-scoped view 'from' is constant (== IFILTER) so it's dropped.
     local SEVW=9 FROMW=14 AGEW=5 showfrom=0 base
-    (( IORPHAN || ISYSTEM )) && showfrom=1   # show 'from' in the cross-sender buckets
+    (( IORPHAN || ISYSTEM || IALL )) && showfrom=1   # show 'from' in the cross-sender views (incl. triage)
     if (( showfrom )); then base=33; else base=18; fi   # see width math below
     local f id sev from title epoch age sevf
     local sevtxt fromtxt titletxt agetxt content LW ageshow lblsgr
@@ -844,12 +933,27 @@ render_inbox() {
       (( LW < 1 )) && LW=0
       sevf=$(printf '[%s]' "$sev")
       sevtxt=$(printf '%s%-*.*s\033[0m' "$(sev_color "$sev")" "$SEVW" "$SEVW" "$sevf")
-      fromtxt=""; (( showfrom )) && fromtxt=$(printf '%-*.*s ' "$FROMW" "$FROMW" "$from")
+      # Leading slot: constant '*' in the per-agent views; in triage it is the
+      # multi-select marker — '◉' (bright) when marked, '·' (dim) when not.
+      local mk='*'
+      if (( IALL )); then
+        if [ -n "${MARKED[$f]:-}" ]; then mk=$'\033[1;32m◉\033[0m'; else mk=$'\033[2m·\033[0m'; fi
+      fi
+      # In triage, de-emphasise (dim) system/orchestrator-origin senders so worker
+      # pleas stand out — shown, never filtered (advisor D5/Q5).
+      fromtxt=""
+      if (( showfrom )); then
+        if (( IALL )) && msg_from_is_system "$from"; then
+          fromtxt=$(printf '\033[2m%-*.*s\033[0m ' "$FROMW" "$FROMW" "$from")
+        else
+          fromtxt=$(printf '%-*.*s ' "$FROMW" "$FROMW" "$from")
+        fi
+      fi
       titletxt=$(fit_left "$title" "$LW")
       agetxt=""; (( ageshow )) && agetxt=$(printf ' %*s' "$AGEW" "$age")
       (( i == isel )) && lblsgr='\033[1m' || lblsgr='\033[2m'
-      content=$(printf '* %s %s%b%s\033[22m%s' \
-        "$sevtxt" "$fromtxt" "$lblsgr" "$titletxt" "$agetxt")
+      content=$(printf '%b %s %s%b%s\033[22m%s' \
+        "$mk" "$sevtxt" "$fromtxt" "$lblsgr" "$titletxt" "$agetxt")
       if (( i == isel )); then
         printf '\033[2m│\033[0m%b▌\033[0m%s%s%s\033[2m│\033[0m\033[K\n' \
           "$markc" "$ins1" "$content" "$ins"
@@ -866,6 +970,7 @@ render_inbox() {
 
   local hint
   if [ -n "$status" ]; then hint="$status"
+  elif (( IALL )); then hint="Space mark · o order · Ent pop marked → orch · c mark all read · q/Esc back · r refresh"
   else hint="j/k · Ent pop → orch · J jump to source · c mark all read · q/Esc back · r refresh"; fi
   tput cup $(( rows - 1 )) 0 2>/dev/null
   printf '\033[2m%s\033[0m\033[K' "$(hrule '╰' '╯' "$inner" "$hint")"
@@ -1351,20 +1456,34 @@ while :; do
       case "$rest" in
         '[A') nav_up ;;
         '[B') nav_down ;;
-        '')   # bare Esc: leave the msg view back to the agents list
-          [ "$MODE" = inbox ] && { MODE=agents; load_rows; load_inbox_index; status=""; last_load=$SECONDS; } ;;
+        '')   # bare Esc: leave the msg/triage view back to the agents list
+          [ "$MODE" = inbox ] && { close_inbox_view; last_load=$SECONDS; } ;;
       esac
       drain_nav ;;
     k) nav_up; drain_nav ;;
     j) nav_down; drain_nav ;;
     g) nav_top; drain_nav ;;
     G) nav_bot; drain_nav ;;
-    ' ')           # leader: open the which-key popup (dash-local trigger).
-      # Bare Space is free inside this TUI loop (it never types text), so this
-      # needs NO tmux root binding — nvim/claude/shell Space stays untouched.
-      # The same popup as prefix+Space; it schedules its own action on close.
+    ' ')           # triage: toggle the marked-set on the cursor row. Otherwise: leader.
+      if [ "$MODE" = inbox ] && (( IALL )); then
+        if (( IN > 0 )); then
+          tf="${IROWS[$isel]}"
+          if [ -n "${MARKED[$tf]:-}" ]; then unset 'MARKED[$tf]'; else MARKED["$tf"]=1; fi
+        fi
+        continue
+      fi
+      # leader: open the which-key popup (dash-local trigger). Bare Space is free
+      # inside this TUI loop (it never types text), so this needs NO tmux root binding
+      # — nvim/claude/shell Space stays untouched. Same popup as prefix+Space.
       "$FLEET_BIN" menu-popup 2>/dev/null   # fit-to-content frame; blocks until the popup closes
       clear; status="" ;;
+    t)             # agents view: open the cross-agent message triage (all queued msgs)
+      [ "$MODE" = agents ] || continue
+      open_triage; last_load=$SECONDS ;;
+    o)             # triage: toggle sort direction (oldest↑ <-> newest↓)
+      [ "$MODE" = inbox ] && (( IALL )) || continue
+      [ "$ISORT" = asc ] && ISORT=desc || ISORT=asc
+      load_inbox; status="" ;;
     e)             # agents view: open the selected agent's (or orphan bucket's) messages
       [ "$MODE" = agents ] || continue
       open_msgs; last_load=$SECONDS ;;
@@ -1377,15 +1496,18 @@ while :; do
       load_rows; load_inbox_index force; last_load=$SECONDS ;;
     c|a)           # msg view: mark all read (archive this scope's live msgs), then back
       [ "$MODE" = inbox ] || continue
-      inbox_mark_all; MODE=agents; load_rows; load_inbox_index; last_load=$SECONDS ;;
-    q)             # msg view: back to the agents list (no-op in agents view)
-      # bin/fleet cmd_dash_new injects 'q' to leave inbox before 'n' for the leader 'new' action — keep in sync.
+      inbox_mark_all; close_inbox_view; last_load=$SECONDS ;;
+    q)             # msg/triage view: back to the agents list (no-op in agents view)
+      # bin/fleet cmd_dash_new/cmd_dash_triage inject 'q' to leave inbox before n/t — keep in sync.
       [ "$MODE" = inbox ] || continue
-      MODE=agents; load_rows; load_inbox_index; status=""; last_load=$SECONDS ;;
+      close_inbox_view; last_load=$SECONDS ;;
     r) status=""; load_rows; load_inbox_index; [ "$MODE" = inbox ] && load_inbox; last_load=$SECONDS ;;   # manual refresh
     R) cleanup; exec "$SELF" "$SESS" ;;   # reload the dashboard with fresh code
     $'\n'|$'\r')   # inbox: pop to orchestrator. agents: jump (orphan row: open its msgs)
-      if [ "$MODE" = inbox ]; then inbox_pop; load_inbox; last_load=$SECONDS; continue; fi
+      if [ "$MODE" = inbox ]; then
+        if (( IALL )); then triage_pop; last_load=$SECONDS; continue; fi   # triage: pop the marked set
+        inbox_pop; load_inbox; last_load=$SECONDS; continue
+      fi
       (( (ORPHAN_ROW && sel == N) || (SYSTEM_ROW && sel == N + ORPHAN_ROW) )) && { open_msgs; last_load=$SECONDS; continue; }
       (( N == 0 )) && continue
       win=$(field "$sel" 3)

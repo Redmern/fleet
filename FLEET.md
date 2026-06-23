@@ -69,7 +69,8 @@ any pane, including this orchestrator pane — both are prefix-table bindings, s
 plain Space typing in panes is untouched), or by pressing **bare Space while the
 dashboard pane is focused**. Press the shown key to run an action;
 **Esc/q/Space** closes. Actions are grouped **+Agents** (pick `a`, new `n`, ready
-`y`, reap `x`, orchestrator `m`, pop oldest message `p`, rebuild `M`), **+Session**
+`y`, reap `x`, orchestrator `m`, pop oldest message `p`, triage messages `t`,
+rebuild `M`), **+Session**
 (save `s`, sessions `o`, reload `R`, quit `Q`), and **+Info** (ls `l`, keys `?`,
 rebind `c`). Those single keys are pressed **inside** the popup — fleet binds
 **no direct prefix+key shortcuts** for individual actions, so every other tmux
@@ -97,6 +98,17 @@ without submitting (the human reviews and sends) and **skips when the orchestrat
 is mid-generation** so it never interrupts a busy prompt; retry when idle.
 `fleet inbox` remains the headless CLI (bare = consume pager; `list`/`read` peek;
 `pop [file]` = pop a specific message, or the global-oldest when no file is given).
+**Cross-agent triage:** the leader menu's **`t`** opens the dashboard's inbox view
+with the per-agent filter removed — **every** queued message across all agents,
+oldest-first. **Space** marks rows (a **◉** + an `N marked` counter), **`o`** flips
+the sort (oldest↑ / newest↓), and **Enter** pops the **marked set in display order**,
+each separated by a blank line, into the orchestrator with **nothing submitted** — you
+land in the orch pane to review and send the assembled batch. **The one gate rule:**
+any pop that can land a *batch* is gated on the orchestrator being idle (leader `p`,
+dash `P`, triage Enter) — if it's mid-generation the batch pops **nothing** and **keeps
+your marks**; only a single deliberate pop (`e`→Enter on one visible row) is ungated.
+Popping a worker's needs-human message via triage marks it read, which unblocks that
+worktree's `reap` exactly as any pop does.
 
 ## Delegate first
 

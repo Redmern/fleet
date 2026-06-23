@@ -1703,6 +1703,35 @@ inbox_route() { # route <from>
   printf 'dest=main submit=0 pane=%s\n' "${mp:-}"
 }
 
+# SINGLE-SOURCE busy check. The one definition of "is THIS session's orchestrator
+# pane mid-flight (working|blocked)?" shared by every BATCH-CAPABLE pop: the FIFO
+# (no-arg) gate in inbox_pop AND the dashboard's triage Enter (via `inbox orch-busy`)
+# both consult this — no duplicated @agent_state read, no --gated flag widening the
+# primitive's signature (advisor D3). Echoes the busy state + rc 0 when busy; silent
+# rc 1 otherwise (no pane / daemon down / idle). Fail-silent.
+inbox_orch_busy() { # <orch-pane> -> echo working|blocked + rc 0 when busy
+  local pane="${1:-}" st
+  [ -n "$pane" ] || return 1
+  st=$(tmux show -wqv -t "$pane" @agent_state 2>/dev/null)
+  case "$st" in working|blocked) printf '%s' "$st"; return 0 ;; *) return 1 ;; esac
+}
+
+# Assemble the never-clobber paste text for ONE message: "From <from>: <title>[ (disp)]"
+# + body, then a TRAILING blank-line separator so a SEQUENCE of pops (the triage batch,
+# each its own bracketed paste that appends) self-separates instead of running together
+# (…body1From bob:) — advisor D4 / CON M1. Behaviour-preserving for a single pop (one
+# harmless trailing blank line). The primitive OWNS the paste text; triage never
+# assembles its own. Pure; trailing newlines are significant — callers that capture it
+# with $() must use the printf-x idiom to keep them.
+inbox_pop_text() { # <file>
+  local f="${1:-}" from title disp body
+  from=$(inbox_field "$f" from); title=$(inbox_field "$f" title); disp=$(inbox_field "$f" dispatch)
+  local head="From $from: $title"
+  [ -n "$disp" ] && [ "$disp" != "-" ] && head="$head  ($disp)"
+  body=$(inbox_body "$f")
+  printf '%s\n%s\n\n' "$head" "$body"
+}
+
 inbox_pop() { # pop [file] — no file = global-oldest FIFO
   local arg="${1:-}" f dir
   dir=$(inbox_dir) || { tmux display-message "inbox: no project root" 2>/dev/null; return 0; }
@@ -1736,18 +1765,17 @@ inbox_pop() { # pop [file] — no file = global-oldest FIFO
   # that case is the human's own timing choice — the named feedback below keeps it
   # from being mystery text.)
   if [ -z "$arg" ]; then
-    local st; st=$(tmux show -wqv -t "$orch" @agent_state 2>/dev/null)
-    case "$st" in
-      working|blocked) tmux display-message "orchestrator $st — pop skipped, retry when idle" 2>/dev/null; return 0 ;;
-    esac
+    local st
+    if st=$(inbox_orch_busy "$orch"); then
+      tmux display-message "orchestrator $st — pop skipped, retry when idle" 2>/dev/null; return 0
+    fi
   fi
-  local from title disp body text
-  from=$(inbox_field "$f" from); title=$(inbox_field "$f" title); disp=$(inbox_field "$f" dispatch)
-  text="From $from: $title"
-  [ -n "$disp" ] && [ "$disp" != "-" ] && text="$text  ($disp)"
-  body=$(inbox_body "$f")
-  text="$text
-$body"
+  local from title text
+  from=$(inbox_field "$f" from); title=$(inbox_field "$f" title)
+  # Build the paste text via the shared assembler (owns the trailing separator). $()
+  # strips trailing newlines, so use the printf-x idiom to preserve the separator that
+  # makes a batch self-separate when the next pop appends.
+  text="$(inbox_pop_text "$f"; printf x)"; text="${text%x}"
   # Never-clobber via BRACKETED PASTE. A raw LF from `send-keys -l` acts as Enter in
   # the target (verified: each line of a multi-line body EXECUTES/submits in a shell),
   # which would break "the human submits, not us" for any body with a newline — the
@@ -1781,6 +1809,7 @@ cmd_inbox() { # inbox [put|list|read|count|gc|clear|pop] — bare = pager that C
     put)   inbox_put   "$@" ;;
     pop)   inbox_pop   "$@" ;;   # pop [file]: file = that msg, none = global-oldest FIFO
     route) inbox_route "$@" ;;   # internal: where a from= routes (dest/submit/pane)
+    orch-busy) inbox_orch_busy "$(cmd_main_pane 2>/dev/null)" ;;  # internal: triage's batch gate (rc0+state if busy)
     needs-human) inbox_has_needs_human_from "$@" ;; # internal: reap-guard predicate (rc 0 = block)
     list)  inbox_list  "$@" ;;   # non-destructive peek
     read)  inbox_read  "$@" ;;   # non-destructive display
@@ -2450,6 +2479,24 @@ cmd_dash_new() {
   exit 0
 }
 
+# Leader 'triage' (t): focus the dashboard and inject its triage key, modelled exactly
+# on cmd_dash_new. `q` first backs the dash out of any open inbox view (no-op in agents
+# mode) so the `t` always lands and opens the cross-agent triage. Reuses the injection
+# shape — no popup, no second TUI loop (advisor D1 / B-minimal).
+cmd_dash_triage() {
+  local sess; sess=$(session_name 2>/dev/null) || exit 0
+  [ -n "$sess" ] || exit 0
+  local win; win=$(main_window_id "$sess") || exit 0
+  [ -n "$win" ] || exit 0
+  local dash; dash=$(dash_pane_id "$sess") || exit 0
+  [ -n "$dash" ] || { tmux display-message "fleet: no dashboard — run 'fleet main'" 2>/dev/null; exit 0; }
+  tmux select-window -t "$win" 2>/dev/null
+  tmux select-pane  -t "$dash" 2>/dev/null
+  tmux send-keys -t "$dash" -l q 2>/dev/null
+  tmux send-keys -t "$dash" -l t 2>/dev/null
+  exit 0
+}
+
 # Print the orchestrator (human) pane id of a session's main window — the dash
 # uses this to resolve the pop target. The leftmost non-dashboard pane, verified
 # through is_main_pane (the same role check fleet trusts everywhere). Fail-silent:
@@ -2610,6 +2657,7 @@ ready|y|Agents|Flag ready|Flag a worktree done/ready for reap (blank = this cwd)
 reap|x|Agents|Reap ready worktrees|Remove every worktree flagged ready (confirm)
 orch-jump|m|Agents|Orchestrator|Jump to the main window's orchestrator pane
 popmsg|p|Agents|Pop oldest message|Pop the oldest queued worker message into the orchestrator
+triage|t|Agents|Triage messages|Open the cross-agent message triage view (mark several, pop the set)
 main|M|Agents|Rebuild command center|Re-tile the main window
 save|s|Session|Save project|Save this session as a reusable project alias (fleet up <name>)
 sessions|o|Session|Fleet sessions|Switch between open fleet sessions
@@ -2642,6 +2690,7 @@ action_tmux_command() { # tmux command string run when an action's key is presse
     main)   echo "run-shell '$self main'" ;;
     orch-jump) echo "run-shell '$self orch-jump'" ;;
     popmsg) echo "run-shell '$self inbox pop'" ;;   # plain run-shell, composes with the close-then-dispatch flow
+    triage) echo "run-shell '$self dash-triage'" ;; # focus the dash + inject its triage key (NOT a popup) — same shape as 'new'
     reload) echo "display-menu -b rounded -T '#[align=centre]Reload dashboard?' -x C -y C 'Yes, reload' y \"run-shell '$self main --reload'\" 'Cancel' n ''" ;;
     ls)     echo "display-popup -E -b rounded -w 70% -h 60% '$self ls --hold'" ;;
     keys)   echo "display-popup -E -b rounded -w 72% -h 70% '$self keys --hold'" ;;
@@ -3501,6 +3550,7 @@ case "${1:-}" in
   orch-jump)  shift; cmd_orch_jump "$@" ;;            # internal: prefix-key jump to orchestrator pane
   main-pane)  shift; cmd_main_pane "$@" ;;            # internal: orchestrator pane id (dash pop target)
   dash-new)   shift; cmd_dash_new "$@" ;;             # internal: leader 'new' -> dash's own form
+  dash-triage) shift; cmd_dash_triage "$@" ;;         # internal: leader 'triage' -> dash's cross-agent triage view
   apply-keybinds) shift; apply_keybinds ;;            # internal: re-apply runtime keybinds live
   orchestrator|orch) shift; cmd_orchestrator "$@" ;;  # switch orchestrator harness live
   sessions|switch) shift; cmd_sessions "$@" ;;        # fzf switcher over open fleet sessions
