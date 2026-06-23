@@ -2884,13 +2884,19 @@ cmd_menu() {
 }
 
 cmd_rebind() {
-  local args=() action key label grp
+  local args=() action key label grp cur
+  cur=$(tmux show -gv prefix 2>/dev/null)
   while IFS='|' read -r action key_default grp label _; do
     key=$(keybind_for "$action")
     args+=("$label  [$key]" "" \
       "command-prompt -1 -p 'new key for $action:' \"run-shell '$FLEET_DIR/bin/fleet rebind-set $action %%'\"")
   done < <(fleet_actions)
-  tmux display-menu -b rounded -T "#[align=centre]Rebind which feature?" -x C -y C "${args[@]}"
+  # tmux prefix is a server option, not a fleet leader/in-popup key, so it's NOT
+  # in fleet_actions — append one dedicated row after the loop. Unlike every other
+  # rebind row this one is ephemeral (until restart); cmd_prefix_set surfaces that.
+  args+=("tmux prefix  [$cur]  (until restart)" "" \
+    "command-prompt -1 -p 'new tmux prefix (e.g. C-a, C-Space, M-x):' \"run-shell '$FLEET_DIR/bin/fleet prefix-set %%'\"")
+  tmux display-menu -b rounded -T "#[align=centre]Rebind which feature?   (tmux prefix: $cur)" -x C -y C "${args[@]}"
 }
 
 cmd_rebind_set() { # rebind-set <action> <key>
@@ -2923,6 +2929,31 @@ cmd_rebind_set() { # rebind-set <action> <key>
   else
     tmux display-message "fleet: $action → $where $key"
   fi
+}
+
+cmd_prefix_set() { # prefix-set <key> — change the tmux server prefix live (ephemeral)
+  # Ephemeral by design: changes this tmux SERVER's prefix for its lifetime, never
+  # written to tmux.conf or keybinds.conf. apply_keybinds (what `fleet up` re-runs)
+  # never touches the prefix, so the change persists across `fleet up` but NOT a
+  # server restart — restart durability stays delegated to tmux.conf. The leader
+  # bind lives on the prefix key-table (no -T) so it follows the new prefix with
+  # no re-bind. tmux's secondary prefix2 is intentionally out of scope.
+  local key="$1"
+  # Reject empty AND none/None (case-insensitive): tmux ACCEPTS `None` and would
+  # DISABLE the prefix entirely, stranding the leader — so we reject it up front.
+  case "$key" in
+    ''|[Nn][Oo][Nn][Ee]) tmux display-message 'fleet: prefix unchanged (empty/none rejected)' 2>/dev/null; return 0 ;;
+  esac
+  local old; old=$(tmux show -gv prefix 2>/dev/null)
+  # The set's exit code IS the validation: tmux rejects an unparseable key here.
+  tmux set -g prefix "$key" 2>/dev/null || { tmux display-message "fleet: invalid tmux key: $key" 2>/dev/null; return 0; }
+  # Blindly remove the old prefix-table key (assumed to be its send-prefix
+  # double-press) so it doesn't linger after the prefix moves.
+  if [ -n "$old" ] && [ "$old" != "$key" ] && [ "$old" != none ]; then
+    tmux unbind-key "$old" 2>/dev/null
+  fi
+  tmux bind-key "$key" send-prefix 2>/dev/null
+  tmux display-message "fleet: tmux prefix → $key (this server only; edit tmux.conf to persist across restart)" 2>/dev/null
 }
 
 cmd_keys() { # styled keybinding overview; --hold keeps a popup open until a key is pressed
@@ -2988,6 +3019,8 @@ cmd_keys() { # styled keybinding overview; --hold keeps a popup open until a key
   # dim footer: the bits that aren't per-action rows
   printf '\n  %sopen the leader, then press a row'\''s menu key inside the popup%s\n' "$C_DIM" "$R"
   printf '  %sfleet binds no other prefix keys — tmux defaults (n, x, s, … ) are untouched%s\n' "$C_DIM" "$R"
+  local _curpfx; _curpfx=$(tmux show -gv prefix 2>/dev/null)
+  [ -n "$_curpfx" ] && printf '  %stmux prefix: %s  ·  set in tmux.conf to keep across restart%s\n' "$C_DIM" "$_curpfx" "$R"
   printf '  %sdashboard row verbs (selected agent): %se%s msgs · %ss%s send · %sm%s mode · %sv%s diff · %sd%s close · %sh%s hide%s\n' \
     "$C_DIM" "$C_KEY" "$C_DIM" "$C_KEY" "$C_DIM" "$C_KEY" "$C_DIM" "$C_KEY" "$C_DIM" "$C_KEY" "$C_DIM" "$C_KEY" "$C_DIM" "$R"
   printf '  %s  in the '\''e'\'' message view: %sEnt%s pop→orch · %sJ%s jump · %sc%s mark all read · %sq/Esc%s back%s\n' \
@@ -3218,6 +3251,8 @@ cmd_doctor() {
   else
     echo "ok   no systemd user bus — fleetd runs on demand (nohup via 'fleet up')"
   fi
+  local _curpfx; _curpfx=$(tmux show -gv prefix 2>/dev/null)
+  [ -n "$_curpfx" ] && echo "ok   tmux prefix: $_curpfx (leader: prefix+$(keybind_for menu))"
   doctor_config_sync   # non-fatal advisories: symlinks / chezmoi / stale clones
   return $ok
 }
@@ -3667,6 +3702,7 @@ case "${1:-}" in
   keys)       shift; cmd_keys "$@" ;;
   rebind)     shift; cmd_rebind "$@" ;;
   rebind-set) shift; cmd_rebind_set "$@" ;;
+  prefix-set) shift; cmd_prefix_set "$@" ;;            # change the tmux server prefix live (ephemeral)
   status)     shift; cmd_status "$@" ;;
   setup)      shift; cmd_setup "$@" ;;     # per-user post-install: systemd + hook wiring (+ --browser)
   unsetup)    shift; cmd_unsetup "$@" ;;   # reverse setup: disable unit + unwire hooks (per-user only)
