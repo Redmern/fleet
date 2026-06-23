@@ -2266,9 +2266,11 @@ action_tmux_command() { # tmux command string run when an action's key is presse
 # Optional secondary prefix alias for the leader menu. Configurable via
 # keybinds.conf `menu-alt=<key>`. Default is EMPTY (disabled) so fleet's ONLY
 # prefix binding is prefix+<menu-key> (prefix+F) and tmux's prefix+Space=next-layout
-# stays untouched — fleet clashes with NO tmux default out of the box. Opt back in
-# to a Space leader with `menu-alt=Space`. (The dashboard's bare-Space leader is a
-# separate, pane-local key and is unaffected either way.)
+# stays untouched — fleet clashes with NO tmux default out of the box. Opt in to a
+# Space leader with `menu-alt=Space`: the binding is @fleet_root-GATED (see
+# apply_keybinds), so prefix+Space opens the menu ONLY in a fleet session and is a
+# no-op elsewhere — it never clobbers next-layout for non-fleet sessions on the same
+# server. (The dashboard's bare-Space leader is a separate, pane-local key.)
 MENU_ALT_DEFAULT=""
 menu_alt_key() {
   local key=""
@@ -2286,14 +2288,17 @@ apply_keybinds() {
   # Two PREFIX-table triggers open the same menu (both prefix-table, so plain
   # typing in nvim/claude/shell panes is untouched):
   #   • prefix+<menu-key> (default prefix+F) — configurable via the `menu` action.
-  #   • prefix+<menu-alt> (default prefix+Space) — secondary alias, reclaims
-  #     tmux's prefix+Space=next-layout; configurable / disable via `menu-alt=`.
+  #   • prefix+<menu-alt> (e.g. prefix+Space) — secondary alias, @fleet_root-GATED:
+  #     opens the menu ONLY in a fleet session, does nothing elsewhere. So it
+  #     reclaims prefix+Space for fleet WITHOUT clobbering tmux's next-layout in
+  #     non-fleet sessions on the same server. Configurable / disable via `menu-alt=`.
   local mkey mcmd akey
   mkey=$(keybind_for menu)
   mcmd=$(action_tmux_command menu)
   [ -n "$mkey" ] && [ -n "$mcmd" ] && eval "tmux bind-key '$mkey' $mcmd" 2>/dev/null
   akey=$(menu_alt_key)
-  [ -n "$akey" ] && [ -n "$mcmd" ] && eval "tmux bind-key '$akey' $mcmd" 2>/dev/null
+  # Gate on @fleet_root (per-session): fleet session -> menu; otherwise no-op.
+  [ -n "$akey" ] && [ -n "$mcmd" ] && eval "tmux bind-key '$akey' if-shell -F '#{@fleet_root}' \"$mcmd\" ''" 2>/dev/null
 }
 
 # which-key leader menu. Two faces share one entry point:
