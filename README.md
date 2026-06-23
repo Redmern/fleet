@@ -182,6 +182,12 @@ fleet up ~/path/to/project-root     # boot a project (any root folder of repos)
 `install.sh --uninstall` reverses everything. (The `~/.local/bin` symlinks
 intentionally shadow a packaged `/usr/bin/fleet`, so a dev checkout always wins.)
 
+**Claude profiles.** Hooks are wired into `~/.claude` and `~/.claude_personal` by
+default (only those that already exist). Override the list with env
+`FLEET_CLAUDE_PROFILES` (colon-separated, PATH-style) or, if unset, a config file
+`~/.config/fleet/profiles` (one path per line; `#` comments and blanks ignored).
+`install.sh`, `fleet setup`, `fleet doctor`, and `fleet unsetup` all honor it.
+
 **No systemd?** `./install.sh --no-systemd` skips the user unit (auto-detected
 when `systemctl --user` isn't usable — containers, no user bus). The daemon then
 starts on demand: `fleet up`'s `ensure_daemon` runs `nohup fleetd &` whenever the

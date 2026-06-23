@@ -6,7 +6,34 @@ set -euo pipefail
 FLEET_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
 BIN_DIR="$HOME/.local/bin"
 UNIT_DIR="$HOME/.config/systemd/user"
-PROFILES=("$HOME/.claude" "$HOME/.claude_personal")
+
+# Resolve the Claude profile dirs to wire hooks/guard into. Kept in parity with
+# claude_profiles() in bin/fleet (cmd_setup uses the same env + config file).
+# Precedence: 1) env FLEET_CLAUDE_PROFILES (colon-separated, PATH-style); else
+# 2) config file ~/.config/fleet/profiles (one path/line; '#' comments + blanks
+# ignored; leading ~ expanded); else 3) default ~/.claude ~/.claude_personal.
+# Prints one path/line; does NOT filter by existence (callers keep their own
+# `[ -d "$p" ] || continue` guard so no profile dir is ever conjured).
+claude_profiles() {
+  if [ -n "${FLEET_CLAUDE_PROFILES:-}" ]; then
+    printf '%s\n' "$FLEET_CLAUDE_PROFILES" | tr ':' '\n' | grep -v '^[[:space:]]*$'
+    return 0
+  fi
+  local cfg="${XDG_CONFIG_HOME:-$HOME/.config}/fleet/profiles"
+  if [ -f "$cfg" ]; then
+    local line
+    while IFS= read -r line || [ -n "$line" ]; do
+      line="${line#"${line%%[![:space:]]*}"}"   # ltrim
+      line="${line%"${line##*[![:space:]]}"}"   # rtrim
+      case "$line" in ''|'#'*) continue ;; esac
+      case "$line" in '~/'*) line="$HOME/${line#\~/}" ;; '~') line="$HOME" ;; esac
+      printf '%s\n' "$line"
+    done < "$cfg"
+    return 0
+  fi
+  printf '%s\n' "$HOME/.claude" "$HOME/.claude_personal"
+}
+mapfile -t PROFILES < <(claude_profiles)
 
 HOOK_CMD="$BIN_DIR/fleet-hook"
 
