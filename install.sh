@@ -193,14 +193,14 @@ if [ -f "$FLEET_DIR/lib/package.json" ]; then
   if command -v npm >/dev/null 2>&1; then
     if [ ! -d "$FLEET_DIR/lib/node_modules/playwright-core" ]; then
       echo "  installing fleet-browser driver deps (playwright-core, no browser download)…"
-      ( cd "$FLEET_DIR/lib" && PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1 npm i --no-audit --no-fund ) \
+      ( cd "$FLEET_DIR/lib" && PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1 npm ci --no-fund ) \
         && echo "  fleet browser ready (system Chromium via playwright-core)" \
-        || echo "  WARN: 'cd lib && npm i' failed — 'fleet browser' unavailable until you run it"
+        || echo "  WARN: 'cd lib && npm ci' failed — 'fleet browser' unavailable until you run it"
     else
       echo "  fleet-browser driver deps already vendored"
     fi
   else
-    echo "  note: npm not found — run '(cd $FLEET_DIR/lib && npm i)' to enable 'fleet browser'"
+    echo "  note: npm not found — run '(cd $FLEET_DIR/lib && npm ci)' to enable 'fleet browser'"
   fi
 fi
 

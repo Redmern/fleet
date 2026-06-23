@@ -76,9 +76,10 @@ package() {
   # `fleet dispatch enable`; run via `sh` — 644 here is fine, matches repo)
   install -m644 bin/fleet-dispatch.sh "$libdir/bin/fleet-dispatch.sh"
 
-  # node driver source + manifest — NOT node_modules (per-user cache, §3/§7.3),
-  # and NOT package-lock.json (the repo ships none).
-  install -m644 lib/browser-test.js lib/package.json "$libdir/lib/"
+  # node driver source + manifest + lockfile — NOT node_modules (per-user cache,
+  # §3/§7.3). The lockfile IS shipped now (it pins playwright-core), so the
+  # per-user `fleet setup --browser` vendor step can `npm ci` reproducibly.
+  install -m644 lib/browser-test.js lib/package.json lib/package-lock.json "$libdir/lib/"
 
   # harness adapters, nvim plugin, orchestrator guides
   install -m644 harness.d/*.conf "$libdir/harness.d/"

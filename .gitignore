@@ -1,9 +1,9 @@
 __pycache__/
 *.pyc
 
-# vendored Playwright driver deps (one-time `cd lib && npm i`; see install.sh)
+# vendored Playwright driver deps (one-time `cd lib && npm ci`; see install.sh).
+# package-lock.json IS tracked + shipped (pins playwright-core for `npm ci`).
 lib/node_modules/
-lib/package-lock.json
 
 # disposable browser-test screenshots dropped under each worktree
 .fleet/shots/
