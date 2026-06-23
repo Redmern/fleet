@@ -43,6 +43,7 @@ IROWS=()                                  # inbox rows: one .msg path each, newe
 IUNREAD=0                                 # unread count for the msg-view title (== IN, archive-as-truth)
 IFILTER=""                               # 'e' view scope: only msgs whose agent-key == IFILTER
 IORPHAN=0                                # 'e' view: 1 = orphan bucket (msgs from no live window)
+ISYSTEM=0                                # 'e' view: 1 = system bucket (orchestrator/gate notes)
 
 # Per-agent unread INDEX (rebuilt lazily — see load_inbox_index / THE GATE).
 declare -A UNREAD                          # UNREAD[agent-key] = live (unread) msg count
@@ -53,9 +54,12 @@ IBX_TS=0                                   # SECONDS of the last index build (0 
 IBX_DIRTY=""                               # .dirty mtime seen at the last build
 IBX_TOTAL=0                                # total unread across all live agents (title summary)
 IBX_WARN=0                                 # of those, count at sev warn|blocked (the ⚠ summary)
-ORPHAN_N=0                                 # unread msgs whose sender matches no live window
+ORPHAN_N=0                                 # unread msgs from a REAPED/GONE worker (no live window)
 ORPHAN_MAXSEV=""                           # highest severity among orphan msgs
 ORPHAN_ROW=0                               # 1 = render the synthetic '⌫ orphans' row (ORPHAN_N>0)
+SYSTEM_N=0                                 # unread orchestrator/system msgs (main/-) — NOT reaped workers
+SYSTEM_MAXSEV=""                           # highest severity among system msgs
+SYSTEM_ROW=0                               # 1 = render the synthetic '⚙ system' row (SYSTEM_N>0)
 
 # --- terminal setup ----------------------------------------------------------
 # The loop runs load_rows+render between key reads; in cooked mode the tty echoes
@@ -66,19 +70,23 @@ ORPHAN_ROW=0                               # 1 = render the synthetic '⌫ orpha
 # unrecoverable path is SIGKILL with a surviving pane (untrappable) — rare and
 # the pane's pty is usually destroyed with the process anyway.
 STTY_SAVED=""
-[ -t 0 ] && STTY_SAVED=$(stty -g 2>/dev/null)
 raw_mode()    { stty -echo -icanon min 1 time 0 2>/dev/null; }
 cooked_mode() { [ -n "$STTY_SAVED" ] && stty "$STTY_SAVED" 2>/dev/null; }
 cleanup() { cooked_mode; printf '\033[?1004l' 2>/dev/null; tput rmcup 2>/dev/null; tput cnorm 2>/dev/null; }
-trap cleanup EXIT INT TERM
-tput smcup 2>/dev/null                    # alternate screen
-tput civis 2>/dev/null                    # hide cursor
-raw_mode                                  # no echo, char-at-a-time (see above)
+# Test/lib seam: `DASH_LIB=1 source fleet-dash <sess>` loads every function (so shell
+# tests can drive load_inbox_index/classification) WITHOUT grabbing the tty, the
+# alternate screen, or entering the event loop. The gate keeps all that off tests.
+if [ -z "${DASH_LIB:-}" ]; then
+  [ -t 0 ] && STTY_SAVED=$(stty -g 2>/dev/null)
+  trap cleanup EXIT INT TERM
+  tput smcup 2>/dev/null                    # alternate screen
+  tput civis 2>/dev/null                    # hide cursor
+  raw_mode                                  # no echo, char-at-a-time (see above)
+fi
 # Focus reporting: ask the terminal to send \033[I / \033[O on focus change, and
 # have tmux forward them. They wake the read loop so the focus marker updates
 # instantly instead of on the next ~2s refresh.
-tmux set -g focus-events on 2>/dev/null
-printf '\033[?1004h'
+[ -z "${DASH_LIB:-}" ] && { tmux set -g focus-events on 2>/dev/null; printf '\033[?1004h'; }
 
 # --- helpers -----------------------------------------------------------------
 glyph_color() { # state -> SGR color
@@ -355,9 +363,9 @@ load_rows() {
                 $1=="blocked"{o=0} $1=="idle"{o=1} $1=="working"{o=2} $1!~/blocked|idle|working/{o=3}
                 {print o"\t"$0}' | sort -n | cut -f2-)
   N=${#ROWS[@]}
-  # selectable rows = live agents + the synthetic orphans row (if any). ORPHAN_ROW
-  # is a global kept fresh by the last load_inbox_index, so sel can rest on it.
-  local tot=$(( N + ORPHAN_ROW ))
+  # selectable rows = live agents + the synthetic orphans/system rows (if any). The
+  # *_ROW globals are kept fresh by the last load_inbox_index, so sel can rest on them.
+  local tot=$(( N + ORPHAN_ROW + SYSTEM_ROW ))
   (( tot == 0 )) && sel=0
   (( sel >= tot )) && sel=$(( tot - 1 ))
   (( sel < 0 )) && sel=0
@@ -401,6 +409,12 @@ msg_agent_key() { # <from> <pane-no-%> -> live agent key | ""
   fi
 }
 
+# An UNATTACHED message (no live agent key) is one of two things: a SYSTEM/orchestrator
+# note (the main window's own gate/conclusion post, or a sender-less "-") which is NOT a
+# reaped worker, OR a true ORPHAN whose worker window is gone. This split keeps gate/system
+# messages out of the "reaped/gone senders" bucket. Mirrors fleet:inbox_from_is_system.
+msg_from_is_system() { case "${1:-}" in ""|-|main) return 0 ;; *) return 1 ;; esac; }
+
 # THE GATE. Rebuild the per-agent unread index ONLY when the inbox changed (the
 # .dirty token inbox_put/clear/gc/pop write differs from the one seen at the last
 # build) or a 30s safety TTL elapsed (catches external archive moves: reap/gc).
@@ -416,7 +430,7 @@ load_inbox_index() { # [force]
   fi
   IBX_TS=$SECONDS; IBX_DIRTY="$tok"
   UNREAD=(); MAXSEV=(); LIVEWIN=(); LIVEPANE=()
-  IBX_TOTAL=0; IBX_WARN=0; ORPHAN_N=0; ORPHAN_MAXSEV=""
+  IBX_TOTAL=0; IBX_WARN=0; ORPHAN_N=0; ORPHAN_MAXSEV=""; SYSTEM_N=0; SYSTEM_MAXSEV=""
   local i wn p
   for (( i=0; i<N; i++ )); do wn=$(field "$i" 4); [ -n "$wn" ] && LIVEWIN["$wn"]=1; done
   while IFS= read -r p; do p="${p#%}"; [ -n "$p" ] && LIVEPANE["$p"]=1; done < <(
@@ -432,6 +446,8 @@ load_inbox_index() { # [force]
       if [ -n "$key" ]; then
         UNREAD["$key"]=$(( ${UNREAD["$key"]:-0} + 1 ))
         MAXSEV["$key"]=$(sev_max "${MAXSEV[$key]:-}" "$sev")
+      elif msg_from_is_system "$from"; then
+        SYSTEM_N=$(( SYSTEM_N + 1 )); SYSTEM_MAXSEV=$(sev_max "$SYSTEM_MAXSEV" "$sev")
       else
         ORPHAN_N=$(( ORPHAN_N + 1 )); ORPHAN_MAXSEV=$(sev_max "$ORPHAN_MAXSEV" "$sev")
       fi
@@ -440,8 +456,9 @@ load_inbox_index() { # [force]
     done
   fi
   ORPHAN_ROW=0; (( ORPHAN_N > 0 )) && ORPHAN_ROW=1
-  # re-clamp selection now that the orphan row's existence is known
-  local tot=$(( N + ORPHAN_ROW ))
+  SYSTEM_ROW=0; (( SYSTEM_N > 0 )) && SYSTEM_ROW=1
+  # re-clamp selection now that the synthetic rows' existence is known
+  local tot=$(( N + ORPHAN_ROW + SYSTEM_ROW ))
   (( tot == 0 )) && sel=0
   (( sel >= tot )) && sel=$(( tot - 1 ))
   (( sel < 0 )) && sel=0
@@ -467,7 +484,9 @@ load_inbox() {
       id=$(basename "$f" .msg); pane="${id##*.}"
       from=$(ibx_field "$f" from); key=$(msg_agent_key "$from" "$pane")
       if (( IORPHAN )); then
-        [ -z "$key" ] || continue            # orphan view: keep only no-live-window msgs
+        { [ -z "$key" ] && ! msg_from_is_system "$from"; } || continue  # orphans: unattached & NOT system
+      elif (( ISYSTEM )); then
+        { [ -z "$key" ] &&   msg_from_is_system "$from"; } || continue  # system: unattached & system-origin
       else
         [ "$key" = "$IFILTER" ] || continue   # agent view: keep only this agent's msgs
       fi
@@ -483,7 +502,7 @@ load_inbox() {
 # Mode-aware navigation: act on the active view's index/count so the same j/k/g/G
 # (and the arrow keys, and drain_nav's coalescing) drive whichever view is up. In
 # agents mode the row count includes the synthetic orphans row (ORPHAN_ROW).
-arows()    { echo $(( N + ORPHAN_ROW )); }
+arows()    { echo $(( N + ORPHAN_ROW + SYSTEM_ROW )); }
 nav_up()   { if [ "$MODE" = inbox ]; then (( isel > 0 )) && ((isel--)); else (( sel > 0 )) && ((sel--)); fi; }
 nav_down() { if [ "$MODE" = inbox ]; then (( isel < IN-1 )) && ((isel++)); else (( sel < $(arows)-1 )) && ((sel++)); fi; }
 nav_top()  { if [ "$MODE" = inbox ]; then isel=0; else sel=0; fi; }
@@ -517,10 +536,12 @@ inbox_mark_all() {
 # selected agent, or the orphan bucket when the synthetic row is selected.
 open_msgs() {
   if (( ORPHAN_ROW && sel == N )); then
-    IORPHAN=1; IFILTER=""
+    IORPHAN=1; ISYSTEM=0; IFILTER=""
+  elif (( SYSTEM_ROW && sel == N + ORPHAN_ROW )); then
+    ISYSTEM=1; IORPHAN=0; IFILTER=""
   else
     (( N == 0 )) && return 1
-    IORPHAN=0; IFILTER=$(field "$sel" 4)
+    IORPHAN=0; ISYSTEM=0; IFILTER=$(field "$sel" 4)
   fi
   MODE=inbox; isel=0; load_inbox_index force; load_inbox; status=""
 }
@@ -633,7 +654,7 @@ render() {
     fi
   fi
 
-  if (( N == 0 && ORPHAN_ROW == 0 )); then
+  if (( N == 0 && ORPHAN_ROW == 0 && SYSTEM_ROW == 0 )); then
     (( drawn < slots )) && { printf '\033[2m│\033[0m%s%-*s%s\033[2m│\033[0m\033[K\n' \
       "$ins" "$cw" "no agents yet — press n to spawn one" "$ins"; (( drawn++ )); }
   else
@@ -725,6 +746,28 @@ render() {
         (( drawn++ ))
       fi
     fi
+    # Synthetic '⚙ system' row for unread orchestrator/gate notes (sender == main or
+    # systemic '-') — these are NOT reaped workers, so they get their own bucket below
+    # the orphans row, never folded into it. Selectable at index N+ORPHAN_ROW.
+    if (( SYSTEM_ROW && drawn < slots )); then
+      (( (N > 0 || ORPHAN_ROW) && drawn < slots )) && { printf '\033[2m│%s│\033[0m\033[K\n' "$blank"; (( drawn++ )); }
+      if (( drawn < slots )); then
+        local sysidx=$(( N + ORPHAN_ROW )) syslbl syscont syscol SLW
+        syslbl="⚙ system ($SYSTEM_N) — orchestrator/gate notes"
+        syscol=$(sev_pcol "$SYSTEM_MAXSEV")
+        SLW=$(( cw - PW - G )); (( SLW < 0 )) && SLW=0
+        (( sysidx == sel )) && lblsgr='\033[1m' || lblsgr='\033[2m'
+        syscont=$(pill "✉$SYSTEM_N" "$syscol")
+        syscont+=$(printf "%s${lblsgr}%b\033[22m" "$gap" "$(fit_left "$syslbl" "$SLW")")
+        if (( sysidx == sel )); then
+          printf '\033[2m│\033[0m%b▌\033[0m%s%b%s\033[2m│\033[0m\033[K\n' \
+            "$markc" "$ins1" "$syscont" "$ins"
+        else
+          printf '\033[2m│\033[0m%s%b%s\033[2m│\033[0m\033[K\n' "$ins" "$syscont" "$ins"
+        fi
+        (( drawn++ ))
+      fi
+    fi
   fi
 
   # empty side rails fill the box down to the bottom border (also = bottom pad)
@@ -757,7 +800,10 @@ render_inbox() {
   local now; now=$(date +%s 2>/dev/null); [ -n "$now" ] || now=0
   tput cup 0 0 2>/dev/null
 
-  local scope; if (( IORPHAN )); then scope="orphans"; else scope="${IFILTER:-?}"; fi
+  local scope
+  if   (( IORPHAN )); then scope="orphans"
+  elif (( ISYSTEM )); then scope="system"
+  else scope="${IFILTER:-?}"; fi
   printf '\033[2m%s\033[0m\033[K\n' \
     "$(hrule '╭' '╮' "$inner" "MSGS · $scope · $IUNREAD")"
 
@@ -783,7 +829,7 @@ render_inbox() {
     # The 'from' column is shown only in the orphan view (Q4 — identify each dead
     # sender); in an agent-scoped view 'from' is constant (== IFILTER) so it's dropped.
     local SEVW=9 FROMW=14 AGEW=5 showfrom=0 base
-    (( IORPHAN )) && showfrom=1
+    (( IORPHAN || ISYSTEM )) && showfrom=1   # show 'from' in the cross-sender buckets
     if (( showfrom )); then base=33; else base=18; fi   # see width math below
     local f id sev from title epoch age sevf
     local sevtxt fromtxt titletxt agetxt content LW ageshow lblsgr
@@ -1274,6 +1320,11 @@ drain_nav() {
 }
 
 # --- main loop ---------------------------------------------------------------
+# Test/lib seam: under DASH_LIB the functions are loaded but the interactive loop
+# (and its tty/render side effects) never runs — the sourcing test drives the
+# functions directly.
+[ -n "${DASH_LIB:-}" ] && return 0 2>/dev/null
+
 clear
 load_rows                       # initial data; thereafter only on refresh/actions
 last_load=$SECONDS
@@ -1335,7 +1386,7 @@ while :; do
     R) cleanup; exec "$SELF" "$SESS" ;;   # reload the dashboard with fresh code
     $'\n'|$'\r')   # inbox: pop to orchestrator. agents: jump (orphan row: open its msgs)
       if [ "$MODE" = inbox ]; then inbox_pop; load_inbox; last_load=$SECONDS; continue; fi
-      (( ORPHAN_ROW && sel == N )) && { open_msgs; last_load=$SECONDS; continue; }
+      (( (ORPHAN_ROW && sel == N) || (SYSTEM_ROW && sel == N + ORPHAN_ROW) )) && { open_msgs; last_load=$SECONDS; continue; }
       (( N == 0 )) && continue
       win=$(field "$sel" 3)
       # A window parked in <sess>_hidden is not a member of $SESS, so a bare

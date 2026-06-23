@@ -185,7 +185,9 @@ this project with the `fleet` CLI.
   and the dashboard. `--clear` removes the flag.
 - `fleet reap [<target>] [--force]` — remove every worktree flagged ready (close
   its window, delete the worktree and its merged branch). Refuses any worktree
-  with uncommitted changes or a branch not merged into its base unless `--force`.
+  with uncommitted changes, a branch not merged into its base, or a worker that
+  still has an **unread needs-human message** (sev warn/blocked) in the inbox —
+  pop/handle that message first so reaping can never orphan it — unless `--force`.
 
 ## Leader menu (which-key)
 
@@ -209,10 +211,13 @@ send, mode, diff, close) stay on the dashboard's selected row, not in the leader
 **Worker messages are per-agent.** When a worker `fleet send main`s a summary it
 lands in that worker's row as a sev-coloured **✉N** pill (the agents-view title
 also shows a **✉N ⚠M** cross-agent summary); there is no status-bar badge and no
-daemon poll. Press **`e`** on the selected agent (or the trailing **⌫ orphans**
-row, for messages whose sender is gone) to open its message list, then **Enter**
-to *pop* a message into the orchestrator input (archives it = read), **`J`** to
-*jump* to the sender (never clears), **`c`** to mark all read, **`q`/Esc** back.
+daemon poll. Press **`e`** on the selected agent (or on the trailing synthetic
+rows: **⌫ orphans**, for messages from a reaped/gone worker, and **⚙ system**, for
+the orchestrator's own gate/conclusion notes — these stay out of the orphan bucket
+so a gate message is never mislabelled as a reaped worker) to open its message
+list, then **Enter** to *pop* a message into the orchestrator input (archives it =
+read), **`J`** to *jump* to the sender (never clears), **`c`** to mark all read,
+**`q`/Esc** back.
 **Cross-agent FIFO pop:** the leader menu's **`p`** (and **`P`** in the dashboard's
 agents view, for draining several in a row) pops the **globally-oldest** queued
 message into the orchestrator — no need to visit each agent's row. It pastes

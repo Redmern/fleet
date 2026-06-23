@@ -1309,6 +1309,36 @@ inbox_id() { # <epoch_s>.<nanos>.<pane> — sortable + collision-free, lock-free
 inbox_field() { sed -n "/^--$/q; s/^$2=//p" "$1" 2>/dev/null | head -1; }
 inbox_body()  { sed -n '/^--$/,$p' "$1" 2>/dev/null | sed '1d'; }
 
+# Is a message's `from` the ORCHESTRATOR itself or the SYSTEM — rather than a worker?
+# The orchestrator's own gate/conclusion notes (sent from the "main" window) and
+# system posts with no resolved sender ("-"/empty) are NOT reaped workers, so the
+# dashboard must keep them OUT of the "reaped/gone senders" orphan bucket and the
+# reap-guard must not read them as a worker's plea. Pure; rc 0 = system/orchestrator
+# origin. (Mirrored verbatim in fleet-dash:msg_from_is_system — keep in sync.)
+inbox_from_is_system() { # <from>
+  case "${1:-}" in ""|-|main) return 0 ;; *) return 1 ;; esac
+}
+
+# REAP-GUARD predicate. Does the orchestrator inbox still hold an UNREAD (live,
+# un-archived) message FROM one of <from-names> that needs a human (sev warn|blocked)?
+# The human handling that message gates the reap: `fleet reap` must never tear a
+# worker's worktree out from under its own unread needs-human post, which would
+# orphan the very message asking for input. Pure read of the inbox dir; rc 0 = a
+# needs-human message exists for this agent → block the reap.
+inbox_has_needs_human_from() { # <from-name> [<from-name>...]
+  [ $# -gt 0 ] || return 1
+  local dir; dir=$(inbox_dir 2>/dev/null) || return 1
+  [ -d "$dir" ] || return 1
+  local f from a
+  for f in "$dir"/*.msg; do
+    [ -e "$f" ] || continue
+    case "$(inbox_field "$f" sev)" in warn|blocked) ;; *) continue ;; esac
+    from=$(inbox_field "$f" from)
+    for a in "$@"; do [ -n "$a" ] && [ "$from" = "$a" ] && return 0; done
+  done
+  return 1
+}
+
 # ARCHIVE-AS-TRUTH: there is no read cursor. A message is "read" iff it has been
 # archived (POP / mark-all-read / GC move it into archive/). So "unread" == "live,
 # un-archived" — every *.msg still in the inbox dir counts as unread, and consuming
@@ -1752,6 +1782,18 @@ cmd_reap() { # reap [<target>] [--force] — remove worktrees flagged ready
       fi
       if ! git -C "$dir" merge-base --is-ancestor HEAD "$baseref" 2>/dev/null; then
         echo "skip   $lbl: branch not merged into $b (use --force)"; continue
+      fi
+      # REAP-GUARD: never reap a worktree whose worker still has an UNREAD needs-human
+      # message (sev warn/blocked) in the orchestrator inbox — the human must pop/handle
+      # it first, else removing the worktree orphans the very message asking for input.
+      # `from` is the sender's window name: reconstruct the cmd_new format
+      # ("$repo/${branch//\//_}") and also try the live window name (in case of rename).
+      # Like the dirty/unmerged guards, --force overrides.
+      local wrecon="${repo:-}/${branch//\//_}" wlive
+      wlive=$(tmux list-panes -a -F '#{pane_current_path}'$'\t''#{window_name}' 2>/dev/null \
+                | awk -F'\t' -v d="$dir" '$1==d{print $2; exit}')
+      if inbox_has_needs_human_from "$wrecon" ${wlive:+"$wlive"}; then
+        echo "skip   $lbl: unread needs-human message in inbox — pop/handle it first (use --force)"; continue
       fi
     fi
     local win; win=$(tmux list-panes -a -F '#{pane_current_path}'$'\t''#{window_id}' 2>/dev/null \
@@ -3165,7 +3207,7 @@ fleet — agent fleet manager (tmux + nvim + Claude Code)
   fleet pick             fzf jump-to-agent
   fleet send <a> "msg"   send message to an agent's claude
   fleet ready [a] [-m r]  flag a worktree done/ready for deletion (no arg = the one you're in) [--clear]
-  fleet reap             remove all worktrees flagged ready (skips unmerged/dirty unless --force)
+  fleet reap             remove all worktrees flagged ready (skips unmerged/dirty/unread-needs-human unless --force)
   fleet inbox            worker→orchestrator summaries (bare=pager that consumes; list/read peek; put|count|gc|clear). In the dashboard: 'e' on an agent row opens its messages.
   fleet browser [u] [a]  drive a real Chromium against the dev app (headless; --watch = visible tiled window) [url|port] [agent]
   fleet devport <port>   record the worktree's dev-server port (read by 'fleet browser')
@@ -3196,6 +3238,11 @@ fleet — agent fleet manager (tmux + nvim + Claude Code)
   Only profile dirs that already EXIST are wired — none are ever created.
 EOF
 }
+
+# Test/lib seam: `FLEET_SOURCE_ONLY=1 source fleet` loads every cmd_*/helper WITHOUT
+# dispatching (so shell tests can call inbox_*/reap predicates directly). `return`
+# is valid only in a sourced file; the gate keeps it off the exec path.
+[ "${FLEET_SOURCE_ONLY:-}" = 1 ] && return 0 2>/dev/null
 
 case "${1:-}" in
   up)      shift; cmd_up "$@" ;;
