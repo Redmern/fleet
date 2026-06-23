@@ -1336,6 +1336,7 @@ while :; do
       [ "$MODE" = inbox ] || continue
       inbox_mark_all; MODE=agents; load_rows; load_inbox_index; last_load=$SECONDS ;;
     q)             # msg view: back to the agents list (no-op in agents view)
+      # bin/fleet cmd_dash_new injects 'q' to leave inbox before 'n' for the leader 'new' action — keep in sync.
       [ "$MODE" = inbox ] || continue
       MODE=agents; load_rows; load_inbox_index; status=""; last_load=$SECONDS ;;
     r) status=""; load_rows; load_inbox_index; [ "$MODE" = inbox ] && load_inbox; last_load=$SECONDS ;;   # manual refresh
@@ -1409,6 +1410,7 @@ while :; do
         && status="sent → $label" || status="send failed → $label"; }
       load_rows; last_load=$SECONDS ;;
     n)             # spawn a new agent via the in-box form (sets status)
+      # bin/fleet cmd_dash_new injects this key for the leader 'new' action — keep in sync.
       [ "$MODE" = inbox ] && continue
       new_agent_form; clear; load_rows; last_load=$SECONDS ;;
     d)             # close/teardown the selected agent (confirm popup)

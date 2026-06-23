@@ -2056,6 +2056,33 @@ cmd_orch_jump() {
   exit 0
 }
 
+# Open the dashboard's native new-agent form: focus the dash pane and inject `n`,
+# so the dashboard's OWN main loop runs new_agent_form() in-place — the single
+# agent-creation path. Mirrors cmd_orch_jump's fail-silent resolution chain.
+# NOTE: this couples the leader `new` action to the dash keymap — keep in sync
+# with the `n)` and `q)` cases in bin/fleet-dash.
+cmd_dash_new() {
+  local sess; sess=$(session_name 2>/dev/null) || exit 0
+  [ -n "$sess" ] || exit 0
+  local win; win=$(main_window_id "$sess") || exit 0
+  [ -n "$win" ] || exit 0
+  local dash; dash=$(dash_pane_id "$sess") || exit 0
+  # No dash → emit a hint rather than die silently (the menu's prefix+F is bound
+  # server-globally, so it can open in a non-fleet session). Do NOT build one:
+  # sync_main_tiles needs a main window and would race injection into a booting
+  # dash read loop.
+  [ -n "$dash" ] || { tmux display-message "fleet: no dashboard — run 'fleet main'" 2>/dev/null; exit 0; }
+  tmux select-window -t "$win" 2>/dev/null
+  tmux select-pane  -t "$dash" 2>/dev/null
+  # `q` first (NOT Escape): backs the dash out of the inbox view (no-op in agents
+  # mode, fleet-dash:1338) so `n` always lands. `q` is a plain byte read by the
+  # bare `read -rsN1`; Escape would trigger the dash's 2-byte arrow sub-read,
+  # which gobbles the buffered `n` and the form never opens.
+  tmux send-keys -t "$dash" -l q 2>/dev/null
+  tmux send-keys -t "$dash" -l n 2>/dev/null
+  exit 0
+}
+
 # Print the orchestrator (human) pane id of a session's main window — the dash
 # uses this to resolve the pop target. The leftmost non-dashboard pane, verified
 # through is_main_pane (the same role check fleet trusts everywhere). Fail-silent:
@@ -2211,7 +2238,7 @@ fleet_actions() {
   cat <<'EOF'
 menu|F|-|Leader menu|Open the which-key leader menu (the only prefix binding: prefix+F)
 pick|a|Agents|Pick / jump to agent|fzf popup of all agents, Enter jumps
-new|n|Agents|New agent|Prompt for "repo branch", spawn agent
+new|n|Agents|New agent|Open the new-agent form on the dashboard
 ready|y|Agents|Flag ready|Flag a worktree done/ready for reap (blank = this cwd)
 reap|x|Agents|Reap ready worktrees|Remove every worktree flagged ready (confirm)
 orch-jump|m|Agents|Orchestrator|Jump to the main window's orchestrator pane
@@ -2240,7 +2267,7 @@ action_tmux_command() { # tmux command string run when an action's key is presse
   case "$action" in
     menu) echo "run-shell -b '$self menu-popup'" ;;   # measures then opens a fit-to-content popup
     pick) echo "display-popup -E -b rounded -w 80% -h 60% '$self pick'" ;;
-    new)  echo "command-prompt -p 'fleet new (repo branch):' \"run-shell '$self new %%'\"" ;;
+    new)  echo "run-shell '$self dash-new'" ;;
     save) echo "command-prompt -p 'fleet save (name, blank=session):' \"run-shell '$self save %%'\"" ;;
     ready) echo "command-prompt -p 'fleet ready (agent, blank=cwd):' \"run-shell '$self ready %%'\"" ;;
     reap)  echo "display-menu -b rounded -T '#[align=centre]Reap every worktree flagged ready?' -x C -y C 'Yes, reap' y \"run-shell '$self reap'\" 'Cancel' n ''" ;;
@@ -3096,6 +3123,7 @@ case "${1:-}" in
   main)       shift; cmd_main "$@" ;;
   orch-jump)  shift; cmd_orch_jump "$@" ;;            # internal: prefix-key jump to orchestrator pane
   main-pane)  shift; cmd_main_pane "$@" ;;            # internal: orchestrator pane id (dash pop target)
+  dash-new)   shift; cmd_dash_new "$@" ;;             # internal: leader 'new' -> dash's own form
   apply-keybinds) shift; apply_keybinds ;;            # internal: re-apply runtime keybinds live
   orchestrator|orch) shift; cmd_orchestrator "$@" ;;  # switch orchestrator harness live
   sessions|switch) shift; cmd_sessions "$@" ;;        # fzf switcher over open fleet sessions
