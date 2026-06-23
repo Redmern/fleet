@@ -2546,7 +2546,12 @@ cmd_quit() {
 # cmd_pick's fzf styling. Plain tmux sessions (no @fleet_root) are excluded.
 # Fallbacks: fzf missing or non-interactive -> print the list plainly (never
 # hang); zero or one fleet session -> a friendly message (nothing to switch to).
-cmd_sessions() {
+# Build the switcher rows ONCE, shared by the interactive picker and `--measure`.
+# stdout is tab-separated (col1=session name for the action, col2+=the display
+# string fzf shows via --with-nth=2). Returns 1 (and prints a one-line friendly
+# message instead of rows) for the zero/one-session short-circuits, so callers
+# can mirror today's "nothing to switch to" behaviour.
+sessions_rows() {
   local cur; cur=$(session_name 2>/dev/null)
   local list
   # Exclude *_hidden: scratch agents are parked in a "<sess>_hidden" sibling that
@@ -2554,10 +2559,10 @@ cmd_sessions() {
   # never be offered as a switchable project.
   list=$(tmux list-sessions -F $'#{session_name}\t#{@fleet_root}' 2>/dev/null \
           | awk -F'\t' '$2!="" && $1 !~ /_hidden$/')
-  [ -n "$list" ] || { echo "no open fleet sessions"; return 0; }
+  [ -n "$list" ] || { echo "no open fleet sessions"; return 1; }
   local n; n=$(printf '%s\n' "$list" | grep -c .)
   if [ "$n" -le 1 ]; then
-    echo "only one open fleet session (${cur:-?}) — nothing to switch to"; return 0
+    echo "only one open fleet session (${cur:-?}) — nothing to switch to"; return 1
   fi
   # agent counts per session, fetched once (cheap), keyed by session name (col 3).
   local tsv; tsv=$(agents_tsv 2>/dev/null)
@@ -2572,13 +2577,31 @@ cmd_sessions() {
     fi
     rows+=$(printf '%s\t%s %-18s %s  [%s agents]%s' "$name" "$mark" "$name" "$root" "$cnt" "$tag")$'\n'
   done <<< "$list"
+  printf '%s' "$rows"
+}
+
+cmd_sessions() {
+  # --measure: print ONLY what fzf shows (the col2+ visible text), for the
+  # fit-to-content popup sizer (popup_fit_content). No fzf launched here. Two
+  # extra placeholder lines stand in for fzf's chrome (the prompt line + the
+  # info/count line of the default layout) so the fitted popup is tall enough to
+  # show every session without scrolling. Width is set by the data rows (these
+  # placeholders are short), height by total line count. SGR is stripped by the
+  # sizer, so the ANSI in the rows is harmless.
+  if [ "${1:-}" = "--measure" ]; then
+    local rows; rows=$(sessions_rows) || { printf '%s\n' "$rows"; return 0; }
+    printf '%s\n' "$rows" | cut -f2-
+    printf 'fleet session> \n\n'   # +2 lines: fzf prompt + info chrome
+    return 0
+  fi
+  local rows; rows=$(sessions_rows) || { printf '%s\n' "$rows"; return 0; }
   # no fzf / not a tty: print the list plainly and bail (don't hang on fzf).
   if ! command -v fzf >/dev/null || [ ! -t 0 ] || [ ! -t 1 ]; then
-    printf '%s' "$rows" | cut -f2-
+    printf '%s\n' "$rows" | cut -f2-
     return 0
   fi
   local choice
-  choice=$(printf '%s' "$rows" | fzf --ansi --delimiter='\t' --with-nth=2 \
+  choice=$(printf '%s\n' "$rows" | fzf --ansi --delimiter='\t' --with-nth=2 \
             --no-sort --prompt='fleet session> ' --height=100% --border=none) || return 0
   local chosen; chosen=$(printf '%s' "$choice" | cut -f1)
   [ -n "$chosen" ] && tmux switch-client -t "$chosen" 2>/dev/null
@@ -2706,7 +2729,7 @@ action_tmux_command() { # tmux command string run when an action's key is presse
       echo "display-menu -b rounded -T '#[align=centre]Dispatch mode  (now: $dmode · hook $dwired)' -x C -y C 'off (disabled)' o \"run-shell '$self dispatch mode off'\" 'sigil (,-prefix dispatches)' s \"run-shell '$self dispatch enable && $self dispatch mode sigil'\" 'all (every prompt dispatches; \\ escapes)' a \"run-shell '$self dispatch enable && $self dispatch mode all'\" 'Cancel' c ''" ;;
     ls)     echo "run-shell -b '$self popup-fit ls'" ;;    # measures then opens a fit-to-content popup
     keys)   echo "run-shell -b '$self popup-fit keys'" ;;  # measures then opens a fit-to-content popup
-    sessions) echo "display-popup -E -b rounded -w 70% -h 60% '$self sessions'" ;;
+    sessions) echo "run-shell -b '$self popup-fit sessions'" ;;  # measures then opens a fit-to-content popup
     rebind) echo "run-shell '$self rebind'" ;;
     quit)   echo "display-menu -b rounded -T '#[align=centre]Quit fleet session? (closes all agents)' -x C -y C 'Yes, quit' y \"run-shell '$self quit'\" 'Cancel' n ''" ;;
   esac
@@ -2827,14 +2850,17 @@ popup_fit_content() {
   tmux display-popup -E -b rounded -w "$cols" -h "$rows" "$run_cmd" 2>/dev/null
 }
 
-cmd_popup_fit() { # cmd_popup_fit <menu|keys|ls> — thin map of kind → (measure,
-  # run, fallback) feeding the one popup_fit_content helper. Keeps menu/keys/ls
-  # on a single sizing path so they can never drift apart.
+cmd_popup_fit() { # cmd_popup_fit <menu|keys|ls|sessions> — thin map of kind →
+  # (measure, run, fallback) feeding the one popup_fit_content helper. Keeps
+  # menu/keys/ls/sessions on a single sizing path so they can never drift apart.
+  # 'sessions' is INTERACTIVE fzf, so its measure cmd is a fzf-free `--measure`
+  # dump (rows + fzf-chrome placeholder lines) — never the interactive run.
   local self="$FLEET_DIR/bin/fleet"
   case "${1:-menu}" in
-    menu) popup_fit_content 'leader_grid'  "$self menu"        64% 80% ;;
-    keys) popup_fit_content "$self keys"   "$self keys --hold" 72% 70% ;;
-    ls)   popup_fit_content "$self ls"     "$self ls --hold"   70% 60% ;;
+    menu)     popup_fit_content 'leader_grid'         "$self menu"        64% 80% ;;
+    keys)     popup_fit_content "$self keys"          "$self keys --hold" 72% 70% ;;
+    ls)       popup_fit_content "$self ls"            "$self ls --hold"   70% 60% ;;
+    sessions) popup_fit_content "$self sessions --measure" "$self sessions" 70% 60% ;;
   esac
 }
 
@@ -3637,7 +3663,7 @@ case "${1:-}" in
   quit)       shift; cmd_quit "$@" ;;                 # tear down THIS fleet session
   menu)       shift; cmd_menu "$@" ;;
   menu-popup) shift; cmd_menu_popup "$@" ;;           # internal: back-compat alias -> popup-fit menu
-  popup-fit)  shift; cmd_popup_fit "$@" ;;            # internal: fit-to-content popup for menu/keys/ls
+  popup-fit)  shift; cmd_popup_fit "$@" ;;            # internal: fit-to-content popup for menu/keys/ls/sessions
   keys)       shift; cmd_keys "$@" ;;
   rebind)     shift; cmd_rebind "$@" ;;
   rebind-set) shift; cmd_rebind_set "$@" ;;
