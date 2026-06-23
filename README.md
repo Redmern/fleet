@@ -171,6 +171,39 @@ fleet doctor        # verify
 Full guide (update flow, security note, GPG hardening): [`docs/custom-repo.md`](docs/custom-repo.md).
 CI republishes the package on every push to `main`.
 
+**Any Linux (`curl … | sh`).** Rolling install — clones fleet into
+`~/.local/share/fleet` and runs its `install.sh`:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/Redmern/fleet/main/install-web.sh | sh
+fleet doctor && fleet up <project-root>
+```
+
+Trust model is HTTPS-TOFU; the cautious can download, read, then run instead.
+This wires `fleet-hook`/`fleet-guard` into Claude Code `settings.json` (they run
+on every prompt/tool/notification — the installer says so before doing it).
+
+- **Update:** re-run the one-liner (it `git pull`s and re-runs `install.sh`).
+- **Uninstall:** `bash ~/.local/share/fleet/install.sh --uninstall && rm -rf ~/.local/share/fleet`
+  (removes the `~/.local/bin` shims + systemd unit and unwires the Claude hooks).
+
+It refuses to clobber an existing `~/.local/bin/fleet` that points outside its
+managed dir, so a dev checkout always wins.
+
+**Homebrew (Linux).** A `head`-only Linuxbrew tap (`Formula/fleet.rb`):
+
+```sh
+brew tap redmern/fleet
+brew install --HEAD fleet
+fleet setup            # per-user: fleetd unit + Claude Code hooks (brew can't do this)
+fleet setup --browser  # optional: vendor playwright-core for `fleet browser`
+fleet doctor           # verify
+```
+
+macOS is **not** supported (fleetd needs a Linux user runtime dir; the formula
+refuses on macOS). Before `brew uninstall fleet`, run `fleet unsetup` to remove
+the per-user half (unit + hooks + `~/.local/bin` shims) brew can't track.
+
 **From source (dev box).** Use this on a machine where you develop fleet:
 
 ```sh
