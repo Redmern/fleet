@@ -1140,13 +1140,26 @@ alloc_id() { # <led> -> echoes d<N> (atomic, under a reaped lock)
 }
 
 meta_get() { # <dispatch-dir> <key> -> value (tab-separated meta.tsv)
-  awk -F'\t' -v k="$2" '$1==k{print $2; exit}' "$1/meta.tsv" 2>/dev/null
+  # LAST-WINS: legacy append-only meta.tsv files can stack multiple lines per key;
+  # the live value is the last write, so keep it (drop the early `exit`). Robust to
+  # both modern upsert (single line) and legacy stacked files.
+  awk -F'\t' -v k="$2" '$1==k{v=$2} END{if(v!="")print v}' "$1/meta.tsv" 2>/dev/null
 }
 meta_set() { # <dispatch-dir> <key> <value> — upsert one key, atomic tmp+mv
   local d="$1" k="$2" v="$3" f="$1/meta.tsv"
   mkdir -p "$d" 2>/dev/null || return 0
   { [ -f "$f" ] && awk -F'\t' -v k="$k" '$1!=k' "$f"; printf '%s\t%s\n' "$k" "$v"; } \
     > "$f.tmp" 2>/dev/null && mv "$f.tmp" "$f" 2>/dev/null
+}
+# Collapse a legacy stacked meta.tsv to one last-wins line per key. One-time
+# defensive pass (meta_get already reads correctly); atomic tmp+mv, fail-silent.
+meta_compact() { # <dispatch-dir>
+  local f="$1/meta.tsv"
+  [ -f "$f" ] || return 0
+  # last-wins per key, preserve first-seen key order for stable output
+  awk -F'\t' '{v[$1]=$2; if(!($1 in seen)){seen[$1]=1; order[++n]=$1}}
+              END{for(i=1;i<=n;i++) printf "%s\t%s\n", order[i], v[order[i]]}' \
+    "$f" > "$f.tmp" 2>/dev/null && mv "$f.tmp" "$f" 2>/dev/null || return 0
 }
 
 # Record an optional pane-role registry entry (cross-check for the hook's env gate).
@@ -1431,6 +1444,7 @@ cmd_reconcile() {
   for d in "$led"/d*/; do
     [ -d "$d" ] || continue
     id=$(basename "$d")
+    meta_compact "$d"   # collapse legacy stacked meta.tsv before reading state
     state=$(meta_get "$d" state)
     case "$state" in done|failed|cancelled) continue ;; esac
     if ! suborch_live "$d" "$sess" "so-$id"; then
