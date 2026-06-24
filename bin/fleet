@@ -769,6 +769,12 @@ cmd_new() {
       # dashboard moves them into "$sess" on Enter and back out on 'h'.
       local hidden="${sess}_hidden"
       win_id=""
+      # Common spawn env. FLEET_NEW_SUBORCH_ID (set only by resolve_or_spawn_suborch)
+      # means THIS scratch pane IS a sub-orch: carry FLEET_SUBORCH_ID=so-<id> in its env
+      # so a worker it later spawns inherits the owner edge (Phase B). Plain scratch /
+      # worker spawns leave it unset.
+      local _eargs=(-e FLEET_ROLE=worker -e FLEET_DOCS="$docs" -e FLEET_SELF_MERGE="$self_merge")
+      [ -n "${FLEET_NEW_SUBORCH_ID:-}" ] && _eargs+=(-e FLEET_SUBORCH_ID="$FLEET_NEW_SUBORCH_ID")
       # has-session||new-session is TOCTOU: two concurrent scratch spawns when the
       # hidden session is absent both miss has-session and race new-session — the
       # loser gets rc=1 / empty win_id and the agent is LOST. So try BOTH primitives
@@ -779,14 +785,14 @@ cmd_new() {
       #              new-window. Exact-match (=$hidden) so fnmatch can't mis-target.
       if tmux has-session -t "=$hidden" 2>/dev/null; then
         win_id=$(tmux new-window -d -P -F '#{window_id}' -t "=$hidden" -n "$wname" -c "$dir" \
-          -e FLEET_ROLE=worker -e FLEET_DOCS="$docs" -e FLEET_SELF_MERGE="$self_merge" "${argv[@]}" 2>/dev/null)
+          "${_eargs[@]}" "${argv[@]}" 2>/dev/null)
         [ -n "$win_id" ] || win_id=$(tmux new-session -d -P -F '#{window_id}' -s "$hidden" -n "$wname" -c "$dir" \
-          -e FLEET_ROLE=worker -e FLEET_DOCS="$docs" -e FLEET_SELF_MERGE="$self_merge" "${argv[@]}" 2>/dev/null)
+          "${_eargs[@]}" "${argv[@]}" 2>/dev/null)
       else
         win_id=$(tmux new-session -d -P -F '#{window_id}' -s "$hidden" -n "$wname" -c "$dir" \
-          -e FLEET_ROLE=worker -e FLEET_DOCS="$docs" -e FLEET_SELF_MERGE="$self_merge" "${argv[@]}" 2>/dev/null)
+          "${_eargs[@]}" "${argv[@]}" 2>/dev/null)
         [ -n "$win_id" ] || win_id=$(tmux new-window -d -P -F '#{window_id}' -t "=$hidden" -n "$wname" -c "$dir" \
-          -e FLEET_ROLE=worker -e FLEET_DOCS="$docs" -e FLEET_SELF_MERGE="$self_merge" "${argv[@]}" 2>/dev/null)
+          "${_eargs[@]}" "${argv[@]}" 2>/dev/null)
       fi
       # Mirror @fleet_root onto the hidden session (idempotent) so `fleet`
       # sub-commands run from INSIDE a scratch agent resolve the project root.
@@ -819,8 +825,20 @@ cmd_new() {
   # sub-orch can be resolved session-independently — a scratch sub-orch lives in
   # the detached <sess>_hidden session, so a "$sess:$wname" lookup never finds it).
   [ -n "${FLEET_NEW_WID_FILE:-}" ] && printf '%s\n' "$win_id" > "$FLEET_NEW_WID_FILE" 2>/dev/null
-  # optional pane-role registry entry (cross-check for the dispatch hook's env gate)
-  record_pane_role "$root" "$(tmux list-panes -t "$win_id" -F '#{pane_id}' 2>/dev/null | head -1)" worker
+  # optional pane-role registry entry (cross-check for the dispatch hook's env gate).
+  # OWNER edge (Phase B): a worker spawned BY a sub-orch inherits FLEET_SUBORCH_ID in its
+  # env; stamp the new worker pane with a NON-FORGEABLE owner — the @fleet_owner window
+  # option (live fast-path for inbox_put) plus the durable roles-file backstop
+  # `worker:so-<id>` (survives daemon/tmux restart). FLEET_NEW_SUBORCH_ID marks the spawn
+  # of a sub-orch ITSELF (not an owned worker), so it is excluded → bare `worker`. The
+  # roles value stays `worker[:…]`, never `main`, so the fork-bomb role gate is intact.
+  local _wpane; _wpane=$(tmux list-panes -t "$win_id" -F '#{pane_id}' 2>/dev/null | head -1)
+  if [ -n "${FLEET_SUBORCH_ID:-}" ] && [ -z "${FLEET_NEW_SUBORCH_ID:-}" ]; then
+    tmux set -w -t "$win_id" @fleet_owner "$FLEET_SUBORCH_ID" 2>/dev/null || true
+    record_pane_role "$root" "$_wpane" "worker:$FLEET_SUBORCH_ID"
+  else
+    record_pane_role "$root" "$_wpane" worker
+  fi
   # Let fleetd derive state for hookless harnesses without knowing them: stamp
   # the state source + the "busy" scrape pattern onto the window.
   tmux set -w -t "$win_id" @fleet_state_src "$H_STATE_SRC"
@@ -1186,7 +1204,12 @@ resolve_or_spawn_suborch() { # <sess> <wname> <id> <root>
     # the sub-orch in <sess>_hidden, which "$sess:$wname" can't see.
     local widf="$led/.wid-$wname.$$"
     rm -f "$widf" 2>/dev/null
+    # FLEET_NEW_SUBORCH_ID marks THIS spawn as the sub-orch ITSELF: cmd_new puts
+    # FLEET_SUBORCH_ID=so-<id> in the new pane's ENV (so when that sub-orch later shells
+    # `fleet new <worker>`, cmd_new inherits it and stamps the worker's @fleet_owner),
+    # and EXCLUDES this pane from owner-stamping (a sub-orch is not its own worker).
     FLEET_NEW_WID_FILE="$widf" FLEET_SESSION="$sess" FLEET_ROOT="$root" \
+    FLEET_NEW_SUBORCH_ID="$wname" \
       cmd_new --scratch "$wname" -p "$(suborch_seed)
 DISPATCH ID: $id"
     local wid; wid=$(cat "$widf" 2>/dev/null); rm -f "$widf" 2>/dev/null
@@ -1617,6 +1640,12 @@ inbox_put() { # put [--from X] [-d dN] [--sev info|warn|blocked] [--key K] -t "t
       *)             if [ -z "$title" ]; then title="$1"; else body="$body$1"; got_body=1; fi; shift ;;
     esac
   done
+  # Anti-forgery (Phase B security): a caller-SUPPLIED --from must not CLAIM a sub-orch
+  # identity (so-*). Legit gate messages get from=so-<id> from the auto-derived
+  # window_name below (the sub-orch's REAL window), never via this flag — so drop a
+  # forged so-* override here, blocking a worker from spoofing a gate sender to win the
+  # legacy auto-submit route in inbox_route.
+  case "$from" in so-*) from="" ;; esac
   # body via stdin when nothing inline and input is piped
   [ "$got_body" = 0 ] && [ ! -t 0 ] && body=$(cat 2>/dev/null)
   case "$sev" in info|warn|blocked) ;; *) sev=info ;; esac
@@ -1629,6 +1658,13 @@ inbox_put() { # put [--from X] [-d dN] [--sev info|warn|blocked] [--key K] -t "t
     # sender. Fall back to "-" when not in a pane / lookup fails.
     from=$(tmux display -p -t "${TMUX_PANE:-}" '#{window_name}' 2>/dev/null); [ -n "$from" ] || from="-"
   fi
+  # owner= (Phase B): stamp the caller pane's @fleet_owner — a WINDOW OPTION cmd_new set
+  # at spawn from the env-inherited FLEET_SUBORCH_ID, NOT a message field, so a worker
+  # cannot forge it via put args. A leaf worker's message thus carries owner=so-<id> and
+  # routes BACK to its owning sub-orch on pop (inbox_route owner branch). Empty for
+  # main/standalone panes (no @fleet_owner). Mirrors how from= auto-derives above.
+  local owner=""
+  [ -n "${TMUX_PANE:-}" ] && owner=$(tmux show -wqv -t "$TMUX_PANE" @fleet_owner 2>/dev/null)
   local dir; dir=$(inbox_dir) || { echo "inbox: no project root (run inside a fleet session)" >&2; return 1; }
   mkdir -p "$dir" 2>/dev/null || return 1
   local id ts f tmp
@@ -1636,9 +1672,11 @@ inbox_put() { # put [--from X] [-d dN] [--sev info|warn|blocked] [--key K] -t "t
   f="$dir/$id.msg"; tmp="$dir/.tmp.$id.$$"       # .tmp. prefix: the *.msg glob never sees it
   title=$(printf '%s' "$title" | tr '\t\n' '  ')  # keep the header one clean line
   from=$(printf '%s' "$from" | tr '\t\n' '  ')
+  owner=$(printf '%s' "$owner" | tr '\t\n' '  ')
   {
     printf 'id=%s\n'       "$id"
     printf 'from=%s\n'     "$from"
+    [ -n "$owner" ] && printf 'owner=%s\n' "$owner"
     printf 'dispatch=%s\n' "${dispatch:--}"
     printf 'ts=%s\n'       "$ts"
     printf 'sev=%s\n'      "$sev"
@@ -1758,8 +1796,25 @@ inbox_gc() { # cap newest-N -> MOVE overflow to archive/; cap archive too. Never
 # paste and advance). Everything else (human/system/orphan, or a reaped sub-orch whose
 # window is gone) routes to the MAIN pane with NO auto-submit — protect a half-typed
 # draft. Prints "dest=<main|suborch> submit=<0|1> pane=<id>". Pure resolution, no paste.
-inbox_route() { # route <from>
-  local from="${1:-}" sp
+inbox_route() { # route <from> [owner]
+  local from="${1:-}" owner="${2:-}" sp
+  # OWNER edge (pop-routing Phase B). A non-forgeable owner=so-<id> — stamped by
+  # inbox_put from the sender pane's @fleet_owner window option, which cmd_new set at
+  # spawn from the env-inherited FLEET_SUBORCH_ID — routes a worker's message BACK to
+  # its LIVE owning sub-orch and AUTO-SUBMITS. Resolved FIRST, ahead of the legacy
+  # from= branch, so auto-submit keys off the trusted owner stamp, NEVER a forgeable
+  # from=/--from. A DEAD owner (window reaped/gone) falls through to main with NO
+  # auto-submit (revive != resume: never auto-submit into a respawned amnesiac orch).
+  case "$owner" in
+    so-*)
+      sp=$(window_pane_for "$owner" 2>/dev/null)
+      [ -n "$sp" ] && { printf 'dest=suborch submit=1 pane=%s\n' "$sp"; return 0; }
+      ;;
+  esac
+  # LEGACY from=so-* — a sub-orch's OWN gate escalation to main (from= = its real
+  # window_name). Still auto-submits to resume the parked gate, but no longer a forgery
+  # vector: inbox_put HARD-BLOCKS a caller-supplied `--from so-*`, so from= can be so-*
+  # ONLY when the caller's window is genuinely a sub-orch — a worker body can't spoof it.
   case "$from" in
     so-*)
       sp=$(window_pane_for "$from" 2>/dev/null)
@@ -1824,7 +1879,19 @@ inbox_paste_to() { # <pane> <file> <submit 0|1>
   tmux set-buffer -b fleet-inbox-pop -- "$text" 2>/dev/null \
     && tmux paste-buffer -t "$pane" -b fleet-inbox-pop -p -d 2>/dev/null \
     || { tmux display-message "paste failed — nothing changed" 2>/dev/null; return 1; }
-  [ "$submit" = 1 ] && tmux send-keys -t "$pane" C-m 2>/dev/null || true
+  if [ "$submit" = 1 ]; then
+    tmux send-keys -t "$pane" C-m 2>/dev/null || true
+  else
+    # PHASE A re-dispatch guard. A submit=0 paste ALWAYS targets the human MAIN pane
+    # (a sub-orch dest is the only submit=1 case) and leaves text the human will submit
+    # manually — under dispatch mode=all that submit would spawn a NEW sub-orch for what
+    # was really a popped/unpopped/archived-repop message. Arm a ONE-SHOT pane marker
+    # the dispatch hook (bin/fleet-dispatch.sh) consumes to force inline pass-through.
+    # Set ONLY after a verified paste; pane-scoped + one-shot ⇒ can't leak across
+    # panes/projects. Covers all three main paste paths (pop, unpop, archive re-pop)
+    # since they share this primitive. Fail-silent.
+    tmux set -p -t "$pane" @fleet_pop_pending 1 2>/dev/null || true
+  fi
   return 0
 }
 
@@ -1854,10 +1921,13 @@ inbox_pop() { # pop [file] — no file = global-oldest FIFO
   if [ "$archived" = 1 ]; then
     orch=$(cmd_main_pane 2>/dev/null); submit=0
   else
-    # ROUTE by sender (§7 front door): a gate message from a live sub-orch routes BACK to
-    # it and auto-submits; everything else goes to the main pane, no auto-submit. Resolve
-    # the destination from the message's `from=` — no new field needed.
-    route=$(inbox_route "$(inbox_field "$f" from)")
+    # ROUTE by sender (§7 front door): a worker message OWNED by a live sub-orch (owner=,
+    # the trusted env-inherited stamp) or a gate from a live sub-orch (from=so-*) routes
+    # BACK to it and auto-submits; everything else goes to the main pane, no auto-submit.
+    # owner= is resolved before the legacy from= — see inbox_route. (submit=1 ⟺ a machine
+    # sub-orch dest; submit=0 ⟺ the human main pane — inbox_paste_to keys the Phase A
+    # re-dispatch guard off that.)
+    route=$(inbox_route "$(inbox_field "$f" from)" "$(inbox_field "$f" owner)")
     orch=$(printf '%s' "$route" | sed -n 's/.*pane=//p')
     case "$route" in *submit=1*) submit=1 ;; esac
   fi
@@ -1880,9 +1950,10 @@ inbox_pop() { # pop [file] — no file = global-oldest FIFO
   local from title base
   from=$(inbox_field "$f" from); title=$(inbox_field "$f" title); base=$(basename "$f")
   # PASTE via the shared primitive (never-clobber bracketed paste; auto-submits only a
-  # machine sub-orch destination). RC-GUARD on the paste: archive (mark read) ONLY after
-  # a verified paste. A failed paste returns here with the message STILL LIVE — never
-  # archive on a failed paste (that would be the silent loss archive-as-truth prevents).
+  # machine sub-orch destination; arms the Phase A re-dispatch guard on a submit=0 main
+  # paste). RC-GUARD on the paste: archive (mark read) ONLY after a verified paste. A
+  # failed paste returns here with the message STILL LIVE — never archive on a failed
+  # paste (that would be the silent loss archive-as-truth prevents).
   inbox_paste_to "$orch" "$f" "$submit" || return 0
   if [ "$archived" = 1 ]; then
     # Already archived (re-pop): no mv. TOUCH-ON-POP so `inbox unpop` (newest-by-pop-time)

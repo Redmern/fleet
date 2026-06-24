@@ -17,6 +17,24 @@
 #    =worker, so this exits immediately and the prompt proceeds to that pane's model.
 [ "${FLEET_ROLE:-}" = main ] || exit 0
 
+# 1b. POP-PENDING SAFETY GUARD (pop-routing Phase A). inbox_pop arms a ONE-SHOT
+#     pane marker (@fleet_pop_pending) right after it pastes an inbox message into
+#     THIS main pane WITHOUT auto-submitting. The classifier physically cannot tell
+#     that pasted text from a typed prompt, so under mode=all the human's submit
+#     would spawn a NEW sub-orch for what was really a popped message. If the marker
+#     is set: CLEAR it (one-shot) and force inline pass-through — the submit reaches
+#     the main pane's own model, never the dispatcher. VISIBLE feedback (systemMessage,
+#     not silent) so a genuine dispatch swallowed by the residual race is never
+#     mistaken for a no-op. Pane-scoped + one-shot ⇒ cannot leak across panes/projects.
+if [ -n "${TMUX_PANE:-}" ]; then
+  _pp="$(tmux show -pqv -t "$TMUX_PANE" @fleet_pop_pending 2>/dev/null)"
+  if [ -n "$_pp" ]; then
+    tmux set -p -t "$TMUX_PANE" -u @fleet_pop_pending 2>/dev/null || true
+    printf '{"systemMessage":"fleet: popped inbox message submitted inline (not re-dispatched)"}\n'
+    exit 0
+  fi
+fi
+
 # Dependencies — degrade to pass-through if anything is missing.
 command -v jq >/dev/null 2>&1 || exit 0
 FLEET_BIN="$(command -v fleet 2>/dev/null)"
