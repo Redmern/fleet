@@ -1494,6 +1494,13 @@ while :; do
       [ "$MODE" = agents ] || continue
       "$FLEET_BIN" inbox pop >/dev/null 2>&1
       load_rows; load_inbox_index force; last_load=$SECONDS ;;
+    u)             # agents view: UNPOP — re-paste the most-recently-popped message back
+                   # into the orchestrator (recover a pop whose draft was lost). Mirror of
+                   # the leader-menu 'unpop'. Pure re-paste: no archive change, but refresh
+                   # to keep the view honest.
+      [ "$MODE" = agents ] || continue
+      "$FLEET_BIN" inbox unpop >/dev/null 2>&1
+      load_rows; load_inbox_index force; last_load=$SECONDS ;;
     c|a)           # msg view: mark all read (archive this scope's live msgs), then back
       [ "$MODE" = inbox ] || continue
       inbox_mark_all; close_inbox_view; last_load=$SECONDS ;;

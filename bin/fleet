@@ -1792,11 +1792,40 @@ inbox_orch_busy() { # <orch-pane> -> echo working|blocked + rc 0 when busy
 # with $() must use the printf-x idiom to keep them.
 inbox_pop_text() { # <file>
   local f="${1:-}" from title disp body
+  [ -e "$f" ] || return 1
   from=$(inbox_field "$f" from); title=$(inbox_field "$f" title); disp=$(inbox_field "$f" dispatch)
+  body=$(inbox_body "$f")
+  # TOCTOU guard: if a gc-rm races between file selection and this read, every field
+  # comes back empty — refuse to assemble "From : " garbage. Print nothing + rc 1 so
+  # the caller (inbox_paste_to) pastes nothing rather than an empty header.
+  [ -n "$from$title$body" ] || return 1
   local head="From $from: $title"
   [ -n "$disp" ] && [ "$disp" != "-" ] && head="$head  ($disp)"
-  body=$(inbox_body "$f")
   printf '%s\n%s\n\n' "$head" "$body"
+}
+
+# PURE PASTE of ONE message into <pane> — extracted from inbox_pop so pop (live, then
+# archives), unpop and archive-pop share one never-clobber paste path. NEVER archives,
+# never mv's, never marks dirty (the caller owns read-state). Bracketed paste (-p)
+# inserts the text literally so no LF in a multi-line body executes; private buffer
+# (-d deletes on paste, paste ring untouched). `submit=1` sends C-m to AUTO-SUBMIT —
+# MACHINE-PANE ONLY (a sub-orch gate pane has no human draft to clobber); the human
+# main pane is always submit=0 (the human reviews and sends). Fail-silent, rc 1 on any
+# failure so the caller can keep the message live (must-fix: never archive a failed paste).
+inbox_paste_to() { # <pane> <file> <submit 0|1>
+  local pane="$1" f="$2" submit="${3:-0}" text
+  [ -n "$pane" ] || { tmux display-message "no destination pane — nothing popped" 2>/dev/null; return 1; }
+  [ -e "$f" ]    || { tmux display-message "inbox: message gone" 2>/dev/null; return 1; }
+  # $() strips trailing newlines, so use the printf-x idiom to keep the trailing D4
+  # separator that makes a batch self-separate when the next pop appends.
+  text="$(inbox_pop_text "$f"; printf x)"; text="${text%x}"
+  # Empty after stripping whitespace ⇒ inbox_pop_text bailed (gc-rm TOCTOU) — paste nothing.
+  [ -n "${text//[$' \t\n']/}" ] || { tmux display-message "inbox: message empty — nothing pasted" 2>/dev/null; return 1; }
+  tmux set-buffer -b fleet-inbox-pop -- "$text" 2>/dev/null \
+    && tmux paste-buffer -t "$pane" -b fleet-inbox-pop -p -d 2>/dev/null \
+    || { tmux display-message "paste failed — nothing changed" 2>/dev/null; return 1; }
+  [ "$submit" = 1 ] && tmux send-keys -t "$pane" C-m 2>/dev/null || true
+  return 0
 }
 
 inbox_pop() { # pop [file] — no file = global-oldest FIFO
@@ -1814,13 +1843,24 @@ inbox_pop() { # pop [file] — no file = global-oldest FIFO
     f=$(ls -1 "$dir"/*.msg 2>/dev/null | sort | head -1)
     [ -n "$f" ] && [ -e "$f" ] || { tmux display-message "inbox empty" 2>/dev/null; return 0; }
   fi
-  # ROUTE by sender (§7 front door): a gate message from a live sub-orch routes BACK to
-  # it and auto-submits; everything else goes to the main pane, no auto-submit. Resolve
-  # the destination from the message's `from=` — no new field needed.
+  # ARCHIVED TARGET ⇒ ONE unified rule: a re-pop of an already-archived file (raw
+  # `pop <archive/x.msg>` or `archive pop <n>`) FORCES the main pane + submit=0 and
+  # SKIPS the mv. This (a) never re-submits a live so-* gate → never double-advances a
+  # parked pipeline, and (b) fixes the mv-onto-self bug (mv archive/x → archive/ fails
+  # "same file" → bogus "archive failed" warning). Live messages route as before.
+  local archived=0
+  case "$f" in *"/archive/"*) archived=1 ;; esac
   local route orch submit=0
-  route=$(inbox_route "$(inbox_field "$f" from)")
-  orch=$(printf '%s' "$route" | sed -n 's/.*pane=//p')
-  case "$route" in *submit=1*) submit=1 ;; esac
+  if [ "$archived" = 1 ]; then
+    orch=$(cmd_main_pane 2>/dev/null); submit=0
+  else
+    # ROUTE by sender (§7 front door): a gate message from a live sub-orch routes BACK to
+    # it and auto-submits; everything else goes to the main pane, no auto-submit. Resolve
+    # the destination from the message's `from=` — no new field needed.
+    route=$(inbox_route "$(inbox_field "$f" from)")
+    orch=$(printf '%s' "$route" | sed -n 's/.*pane=//p')
+    case "$route" in *submit=1*) submit=1 ;; esac
+  fi
   [ -n "$orch" ] || { tmux display-message "no destination pane — nothing popped" 2>/dev/null; return 0; }
   # BUSY-GATE — FIFO (no-arg) only. A blind leader-menu pop must not inject into an
   # orchestrator that is mid-generation or sitting at a permission prompt: that is
@@ -1837,44 +1877,119 @@ inbox_pop() { # pop [file] — no file = global-oldest FIFO
       tmux display-message "orchestrator $st — pop skipped, retry when idle" 2>/dev/null; return 0
     fi
   fi
-  local from title text
-  from=$(inbox_field "$f" from); title=$(inbox_field "$f" title)
-  # Build the paste text via the shared assembler (owns the trailing separator). $()
-  # strips trailing newlines, so use the printf-x idiom to preserve the separator that
-  # makes a batch self-separate when the next pop appends.
-  text="$(inbox_pop_text "$f"; printf x)"; text="${text%x}"
-  # Never-clobber via BRACKETED PASTE. A raw LF from `send-keys -l` acts as Enter in
-  # the target (verified: each line of a multi-line body EXECUTES/submits in a shell),
-  # which would break "the human submits, not us" for any body with a newline — the
-  # blind FIFO pop disproportionately hits long multi-line orphan bodies. paste-buffer
-  # -p wraps the text in bracketed-paste markers so a paste-aware target (the claude
-  # TUI, and modern shells) inserts it as literal input WITHOUT executing any newline
-  # (verified). No C-m is ever sent — the human reviews and submits. Private named
-  # buffer, deleted on paste (-d), so the user's paste ring is untouched.
-  tmux set-buffer -b fleet-inbox-pop -- "$text" 2>/dev/null \
-    && tmux paste-buffer -t "$orch" -b fleet-inbox-pop -p -d 2>/dev/null \
-    || { tmux display-message "paste failed — nothing changed" 2>/dev/null; return 0; }
-  # AUTO-SUBMIT only for a machine sub-orch destination (submit=1): there is no human
-  # draft to clobber, so one keypress both pastes the gate approval and advances the
-  # parked pipeline. The human/main pane keeps the never-submit rule (no C-m).
-  [ "$submit" = 1 ] && tmux send-keys -t "$orch" C-m 2>/dev/null || true
-  # archive-as-truth = mark read. VERIFY the mv: if it fails after a successful paste
-  # the file stays live and the next FIFO pop would re-select + re-paste the SAME
-  # message forever (starving newer ones) — warn instead of silently re-popping.
-  mkdir -p "$dir/archive" 2>/dev/null
-  if mv -f "$f" "$dir/archive/" 2>/dev/null; then
-    inbox_mark_dirty "$dir"
-    tmux display-message "popped → orch: $from — $title" 2>/dev/null
+  local from title base
+  from=$(inbox_field "$f" from); title=$(inbox_field "$f" title); base=$(basename "$f")
+  # PASTE via the shared primitive (never-clobber bracketed paste; auto-submits only a
+  # machine sub-orch destination). RC-GUARD on the paste: archive (mark read) ONLY after
+  # a verified paste. A failed paste returns here with the message STILL LIVE — never
+  # archive on a failed paste (that would be the silent loss archive-as-truth prevents).
+  inbox_paste_to "$orch" "$f" "$submit" || return 0
+  if [ "$archived" = 1 ]; then
+    # Already archived (re-pop): no mv. TOUCH-ON-POP so `inbox unpop` (newest-by-pop-time)
+    # treats this re-pop as the most-recently-popped message.
+    touch "$dir/archive/$base" 2>/dev/null || true
+    tmux display-message "re-popped (archived): $from — $title  ·  u=unpop" 2>/dev/null
   else
-    tmux display-message "popped but archive failed — pop again to retry" 2>/dev/null
+    # archive-as-truth = mark read. VERIFY the mv: if it fails after a successful paste
+    # the file stays live and the next FIFO pop would re-select + re-paste the SAME
+    # message forever (starving newer ones) — warn instead of silently re-popping.
+    mkdir -p "$dir/archive" 2>/dev/null
+    if mv -f "$f" "$dir/archive/" 2>/dev/null; then
+      inbox_mark_dirty "$dir"
+      # TOUCH-ON-POP (user-pop path ONLY — not gc, not inbox_clear): stamp the archived
+      # file's mtime to NOW so `inbox unpop` selects newest-by-POP-time, separating a
+      # popped message from bulk-cleared/gc-evicted ones (which mv without a touch).
+      touch "$dir/archive/$base" 2>/dev/null || true
+      tmux display-message "popped → orch: $from — $title  ·  u=unpop" 2>/dev/null
+    else
+      tmux display-message "popped but archive failed — pop again to retry" 2>/dev/null
+    fi
   fi
 }
 
-cmd_inbox() { # inbox [put|list|read|count|gc|clear|pop] — bare = pager that CONSUMES (archives)
+# UNPOP — re-paste the most-recently-POPPED archived message back into the MAIN pane,
+# the recovery verb for a pop whose draft was cleared/scrolled/never submitted. Pure
+# re-paste: NO mv (the file is already archived = already read), NO submit, NO .dirty —
+# state-idempotent (re-unpopping is a no-op state-wise; it is draft-additive, inserting
+# the text again at the cursor). Fail-silent, rc 0, feedback via display-message.
+inbox_unpop() { # unpop — re-paste newest-popped archived msg into MAIN (no mv, no submit)
+  local dir f orch from title ts
+  dir=$(inbox_dir) || { tmux display-message "inbox: no project root" 2>/dev/null; return 0; }
+  # NEWEST BY POP TIME, not by enqueue id. `inbox_pop` touch'd the file's mtime on pop,
+  # so `ls -t | head -1` is the message most-recently POPPED — never a bulk-cleared
+  # (inbox_clear) or gc-evicted message (those mv WITHOUT a touch, keeping their old
+  # enqueue mtime). Do NOT swap this for the width-invariant `sort | tail -1` (newest
+  # ENQUEUE): that would surface a never-read cleared/gc'd msg as "the thing you just
+  # lost". The pop-time touch is the only signal that separates user-pops from evictions.
+  f=$(ls -t "$dir/archive"/*.msg 2>/dev/null | head -1)
+  [ -n "$f" ] && [ -e "$f" ] || { tmux display-message "inbox: archive empty — nothing to unpop" 2>/dev/null; return 0; }
+  orch=$(cmd_main_pane 2>/dev/null)        # FORCE main — never re-route/re-submit a so-* gate
+  from=$(inbox_field "$f" from); title=$(inbox_field "$f" title); ts=$(inbox_field "$f" ts)
+  inbox_paste_to "$orch" "$f" 0 \
+    && tmux display-message "unpopped → orch: $from — $title  ($ts)" 2>/dev/null
+  return 0
+}
+
+# Ordered archive listing: NEWEST-enqueue first (sort -r over width-invariant ids),
+# stable within one invocation so `archive list`, `archive read <n>` and `archive pop
+# <n>` all index the same order. Pure read.
+archive_files() { ls -1 "$1"/*.msg 2>/dev/null | sort -r; }
+
+# ARCHIVE browse — read/re-pop POPPED (archived) messages. v1 = numbered CLI list
+# (fzf+preview picker deferred). `archive pop <n>` re-pops a chosen OLDER message via
+# the unified archived⇒main,no-submit path (delegates to inbox_pop, which forces main,
+# never submits, never mv's). Pure read except the deliberate re-paste.
+inbox_archive() { # archive [list|read [n]|pop <n>]
+  local sub="${1:-list}"; [ $# -gt 0 ] && shift
+  local dir adir; dir=$(inbox_dir) || { echo "inbox: no project root"; return 0; }
+  adir="$dir/archive"
+  case "$sub" in
+    list|"")
+      [ -d "$adir" ] || { echo "archive empty"; return 0; }
+      local f i=0 from title
+      while IFS= read -r f; do
+        [ -e "$f" ] || continue
+        i=$((i+1)); from=$(inbox_field "$f" from); title=$(inbox_field "$f" title)
+        printf '%3d  %-9s %-24s %s\n' "$i" "[$(inbox_field "$f" sev)]" "$from" "$title"
+      done < <(archive_files "$adir")
+      [ "$i" = 0 ] && echo "archive empty"
+      ;;
+    read)
+      [ -d "$adir" ] || { echo "archive empty"; return 0; }
+      local want="${1:-all}" f i=0 from disp ts title
+      while IFS= read -r f; do
+        [ -e "$f" ] || continue
+        i=$((i+1)); [ "$want" != all ] && [ "$i" != "$want" ] && continue
+        from=$(inbox_field "$f" from); disp=$(inbox_field "$f" dispatch)
+        ts=$(inbox_field "$f" ts); title=$(inbox_field "$f" title)
+        printf '── %3d  [%s] %s%s\n   %s  %s\n\n' "$i" "$(inbox_field "$f" sev)" "$from" \
+          "$([ -n "$disp" ] && [ "$disp" != - ] && printf '  (%s)' "$disp")" "$ts" "$title"
+        inbox_body "$f"; printf '\n'
+      done < <(archive_files "$adir")
+      [ "$i" = 0 ] && echo "archive empty"
+      ;;
+    pop)
+      [ -d "$adir" ] || { echo "archive empty"; return 0; }
+      local n="${1:-}" f i=0 target=""
+      case "$n" in ''|*[!0-9]*) echo "usage: fleet inbox archive pop <n>  (n from 'fleet inbox archive list')"; return 0 ;; esac
+      while IFS= read -r f; do
+        [ -e "$f" ] || continue
+        i=$((i+1)); [ "$i" = "$n" ] && { target="$f"; break; }
+      done < <(archive_files "$adir")
+      [ -n "$target" ] || { echo "archive: no message #$n"; return 0; }
+      inbox_pop "$target"   # unified: archived target ⇒ main pane, never submit, no mv (re-paste)
+      ;;
+    *) die "usage: fleet inbox archive [list|read [n]|pop <n>]" ;;
+  esac
+}
+
+cmd_inbox() { # inbox [put|list|read|count|gc|clear|pop|unpop|archive] — bare = pager that CONSUMES (archives)
   local sub="${1:-}"; [ $# -gt 0 ] && shift
   case "$sub" in
     put)   inbox_put   "$@" ;;
     pop)   inbox_pop   "$@" ;;   # pop [file]: file = that msg, none = global-oldest FIFO
+    unpop) inbox_unpop "$@" ;;   # re-paste the most-recently-popped archived msg (recovery)
+    archive) inbox_archive "$@" ;; # browse popped msgs; archive pop <n> re-pops an older one
     route) inbox_route "$@" ;;   # internal: where a from= routes (dest/submit/pane)
     orch-busy) inbox_orch_busy "$(cmd_main_pane 2>/dev/null)" ;;  # internal: triage's batch gate (rc0+state if busy)
     needs-human) inbox_has_needs_human_from "$@" ;; # internal: reap-guard predicate (rc 0 = block)
@@ -1891,7 +2006,7 @@ cmd_inbox() { # inbox [put|list|read|count|gc|clear|pop] — bare = pager that C
       { inbox_list; echo; inbox_read all; } | $pager
       inbox_clear >/dev/null
       ;;
-    *) die "usage: fleet inbox [put|pop|list|read|count|gc|clear]" ;;
+    *) die "usage: fleet inbox [put|pop|unpop|archive|list|read|count|gc|clear]" ;;
   esac
 }
 
@@ -2747,6 +2862,7 @@ ready|y|Agents|Flag ready|Flag a worktree done/ready for reap (blank = this cwd)
 reap|x|Agents|Reap ready worktrees|Remove every worktree flagged ready (confirm)
 orch-jump|m|Agents|Orchestrator|Jump to the main window's orchestrator pane
 popmsg|p|Agents|Pop oldest message|Pop the oldest queued worker message into the orchestrator
+unpop|u|Agents|Unpop last message|Re-paste the most-recently-popped message back into the orchestrator (recover a lost pop)
 triage|t|Agents|Triage messages|Open the cross-agent message triage view (mark several, pop the set)
 main|M|Agents|Rebuild command center|Re-tile the main window
 save|s|Session|Save project|Save this session as a reusable project alias (fleet up <name>)
@@ -2781,6 +2897,7 @@ action_tmux_command() { # tmux command string run when an action's key is presse
     main)   echo "run-shell '$self main'" ;;
     orch-jump) echo "run-shell '$self orch-jump'" ;;
     popmsg) echo "run-shell '$self inbox pop'" ;;   # plain run-shell, composes with the close-then-dispatch flow
+    unpop)  echo "run-shell '$self inbox unpop'" ;; # mirror popmsg: re-paste the most-recently-popped msg
     triage) echo "run-shell '$self dash-triage'" ;; # focus the dash + inject its triage key (NOT a popup) — same shape as 'new'
     reload) echo "display-menu -b rounded -T '#[align=centre]Reload dashboard?' -x C -y C 'Yes, reload' y \"run-shell '$self main --reload'\" 'Cancel' n ''" ;;
     dispatch)
