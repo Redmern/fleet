@@ -894,7 +894,7 @@ render() {
         local _pgid="${ROW_GID[$((i-1))]:-}" _prole="${ROW_ROLE[$((i-1))]:-1}"
         if [ "$cgid" != "$_pgid" ] || [ -z "$cgid" ]; then
           printf '\033[2m│%s│\033[0m\033[K\n' "$blank"; (( drawn++ ))
-        elif (( crole == 1 )) && (( _prole == 1 )); then  # breathing room between consecutive same-card workers
+        elif (( crole == 1 )); then  # breathing room before each worker: header→worker and worker→worker
           printf '\033[2m│%s│\033[0m\033[K\n' "$blank"; (( drawn++ ))
         fi
       fi
