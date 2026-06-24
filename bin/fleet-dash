@@ -1090,8 +1090,19 @@ render_inbox() {
     else scope="${IFILTER:-?}"; fi
     htitle="MSGS · $scope · $IUNREAD"
   fi
-  printf '\033[2m%s\033[0m\033[K\n' \
-    "$(hrule '╭' '╮' "$inner" "$htitle")"
+  # Q5: tint the triage "N marked" counter green when >0. Done HERE, on the
+  # rendered rule string, NOT inside triage_header (kept pure) and NOT by passing
+  # SGR into hrule — hrule measures the label by byte length (${#lab}), so colour
+  # bytes would corrupt its fill math. We recolour after hrule has fixed the
+  # layout; the outer printf dims the rule, so we close green with \033[0m then
+  # re-open dim (\033[2m) for the trailing ─.
+  local hl; hl=$(hrule '╭' '╮' "$inner" "$htitle")
+  if (( IALL )); then
+    local _nm=0 _k
+    for _k in "${!MARKED[@]}"; do [ -n "${MARKED[$_k]:-}" ] && _nm=$((_nm+1)); done
+    (( _nm > 0 )) && hl=${hl/"$_nm marked"/$'\033[0;32m'"$_nm marked"$'\033[0m\033[2m'}
+  fi
+  printf '\033[2m%s\033[0m\033[K\n' "$hl"
 
   local drawn=0 i
   for (( i=0; i<PAD_Y && drawn<slots; i++ )); do
@@ -1111,46 +1122,69 @@ render_inbox() {
       (( drawn++ ))
     done
   else
-    # archive-as-truth: every listed msg is unread, so the leading '*' is constant.
-    # The 'from' column is shown only in the orphan view (Q4 — identify each dead
-    # sender); in an agent-scoped view 'from' is constant (== IFILTER) so it's dropped.
-    local SEVW=9 FROMW=14 AGEW=5 showfrom=0 base
-    (( IORPHAN || ISYSTEM || IALL )) && showfrom=1   # show 'from' in the cross-sender views (incl. triage)
-    if (( showfrom )); then base=33; else base=18; fi   # see width math below
-    local f id sev from title epoch age sevf
-    local sevtxt fromtxt titletxt agetxt content LW ageshow lblsgr
+    # archive-as-truth: every listed msg is unread, so the leading marker is a
+    # constant dim '·' outside triage (never '*', never empty — REV-1, one marker
+    # COLUMN in every scope so a single format string / single base covers all and
+    # nothing drifts by a column). In triage it's the multi-select marker.
+    # The 'from' column shows only in the cross-sender scopes (orphan/system/triage);
+    # in an agent-scoped view 'from' is constant (== IFILTER) so it's dropped.
+    #
+    # REV-4 divergence notes (recorded, not regressions to fix here):
+    #  - NO_COLOR CLI↔TUI gap: `fleet inbox list` honours NO_COLOR; this TUI never
+    #    has and still doesn't. Pills widen the visible gap for a NO_COLOR user.
+    #  - Sev column ASCII→nerd-glyph: the old '[warn]' was ASCII-legible without a
+    #    Nerd Font; the pill's PILL_L/PILL_R are nerd half-circles. The rest of the
+    #    dash already needs a Nerd Font, but this removes the one ASCII-legible col.
+    #
+    # Width math (REV-2): one base formula for every scope. PW is the sev pill's
+    # display width, G the inter-column gap, MARK the marker glyph col. Layout is
+    #   mark(MARK) sp(1) pill(PW) gap(G) [from(FROMW) gap(G)] title(LW) [gap(G) age(AGEW)]
+    # so base = MARK + 1 + PW + G + (showfrom? FROMW+G) + (ageshow? G+AGEW), and the
+    # invariant base + LW == cw keeps the right rail '│' in a fixed column.
+    local PW=$(( PILL_W + 4 )) G=2 MARK=1 FROMW=14 AGEW=5 showfrom=0
+    (( IORPHAN || ISYSTEM || IALL )) && showfrom=1   # cross-sender views (incl. triage)
+    local gs; gs=$(printf '%*s' "$G" '')             # the G-wide gap string (single source)
+    local FIXED=$(( MARK + 1 + PW + G ))             # marker + space + pill + gap
+    local f id sev from title epoch age
+    local sevtxt fromtxt titletxt agetxt content LW ageshow rowfrom fromc lblsgr
     for (( i=0; i<IN && drawn<slots; i++ )); do
       f="${IROWS[$i]}"; id=$(basename "$f" .msg)
       sev=$(ibx_field "$f" sev); from=$(ibx_field "$f" from); title=$(ibx_field "$f" title)
       epoch="${id%%.*}"; case "$epoch" in *[!0-9]*|'') epoch=$now ;; esac
       age=$(fmt_age $(( now - epoch )))
-      # widths: '*'(1) sp(1) sev(SEVW) sp(1) [from(FROMW) sp(1)] title sp(1) age(AGEW)
-      ageshow=1; LW=$(( cw - base ))
-      (( LW < 1 )) && { ageshow=0; LW=$(( cw - base + AGEW + 1 )); }   # drop age
-      (( LW < 1 )) && LW=0
-      sevf=$(printf '[%s]' "$sev")
-      sevtxt=$(printf '%s%-*.*s\033[0m' "$(sev_color "$sev")" "$SEVW" "$SEVW" "$sevf")
-      # Leading slot: constant '*' in the per-agent views; in triage it is the
-      # multi-select marker — '◉' (bright) when marked, '·' (dim) when not.
-      local mk='*'
-      if (( IALL )); then
-        if [ -n "${MARKED[$f]:-}" ]; then mk=$'\033[1;32m◉\033[0m'; else mk=$'\033[2m·\033[0m'; fi
-      fi
-      # In triage, de-emphasise (dim) system/orchestrator-origin senders so worker
-      # pleas stand out — shown, never filtered (advisor D5/Q5).
+      # Drop ladder (REV-3), mirroring the agents view's discipline: drop age, then
+      # drop the 'from' column, then clamp the title — never starve the title to 0
+      # while a 14-col 'from' survives.
+      ageshow=1; rowfrom=$showfrom; fromc=0; (( rowfrom )) && fromc=$(( FROMW + G ))
+      LW=$(( cw - FIXED - fromc - (G + AGEW) ))
+      (( LW < 1 )) && { ageshow=0; LW=$(( cw - FIXED - fromc )); }              # drop age
+      (( LW < 1 )) && (( rowfrom )) && { rowfrom=0; fromc=0; LW=$(( cw - FIXED )); }  # drop from
+      (( LW < 1 )) && LW=0                                                      # clamp title
+      # Sev pill — same sev_pcol mapping as the agents ✉ pill (fleet-dash:979) so a
+      # blocked inbox row and a red ✉ agent pill are the same red. NOTE (REV-5): sev
+      # strings must stay ≤7 chars (PILL_W) or pill_center clips them silently.
+      sevtxt=$(pill "$sev" "$(sev_pcol "$sev")")
+      # Leading marker (REV-1): triage = '◉' bright-green marked / '·' dim unmarked;
+      # every other scope = a constant dim '·'. One column, never '*', never empty.
+      local mk
+      if (( IALL )) && [ -n "${MARKED[$f]:-}" ]; then mk=$'\033[1;32m◉\033[0m'
+      else mk=$'\033[2m·\033[0m'; fi
+      # 'from': de-emphasise (dim) system/orchestrator-origin senders in triage so
+      # worker pleas stand out — shown, never filtered. Trailing gs = the G gap.
       fromtxt=""
-      if (( showfrom )); then
+      if (( rowfrom )); then
         if (( IALL )) && msg_from_is_system "$from"; then
-          fromtxt=$(printf '\033[2m%-*.*s\033[0m ' "$FROMW" "$FROMW" "$from")
+          fromtxt=$(printf '\033[2m%-*.*s\033[0m%s' "$FROMW" "$FROMW" "$from" "$gs")
         else
-          fromtxt=$(printf '%-*.*s ' "$FROMW" "$FROMW" "$from")
+          fromtxt=$(printf '%-*.*s%s' "$FROMW" "$FROMW" "$from" "$gs")
         fi
       fi
       titletxt=$(fit_left "$title" "$LW")
-      agetxt=""; (( ageshow )) && agetxt=$(printf ' %*s' "$AGEW" "$age")
+      # Q4: dim the age column (leading gs = the G gap, kept outside the dim span).
+      agetxt=""; (( ageshow )) && agetxt=$(printf '%s\033[2m%*s\033[0m' "$gs" "$AGEW" "$age")
       (( i == isel )) && lblsgr='\033[1m' || lblsgr='\033[2m'
-      content=$(printf '%b %s %s%b%s\033[22m%s' \
-        "$mk" "$sevtxt" "$fromtxt" "$lblsgr" "$titletxt" "$agetxt")
+      content=$(printf '%b %s%s%s%b%s\033[22m%s' \
+        "$mk" "$sevtxt" "$gs" "$fromtxt" "$lblsgr" "$titletxt" "$agetxt")
       if (( i == isel )); then
         printf '\033[2m│\033[0m%b▌\033[0m%s%s%s\033[2m│\033[0m\033[K\n' \
           "$markc" "$ins1" "$content" "$ins"
