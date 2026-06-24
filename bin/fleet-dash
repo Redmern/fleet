@@ -891,8 +891,10 @@ render() {
       local cgid="" crole=1 cannot=""
       if (( HAS_CARDS )); then cgid="${ROW_GID[$i]:-}"; crole="${ROW_ROLE[$i]:-1}"; cannot="${ROW_ANNOT[$i]:-}"; fi
       if (( HAS_CARDS )) && (( i > 0 )) && (( drawn < slots )); then   # blank between cards / loose unowned pile
-        local _pgid="${ROW_GID[$((i-1))]:-}"
+        local _pgid="${ROW_GID[$((i-1))]:-}" _prole="${ROW_ROLE[$((i-1))]:-1}"
         if [ "$cgid" != "$_pgid" ] || [ -z "$cgid" ]; then
+          printf '\033[2m│%s│\033[0m\033[K\n' "$blank"; (( drawn++ ))
+        elif (( crole == 1 )) && (( _prole == 1 )); then  # breathing room between consecutive same-card workers
           printf '\033[2m│%s│\033[0m\033[K\n' "$blank"; (( drawn++ ))
         fi
       fi
@@ -901,14 +903,23 @@ render() {
       fi
       if (( HAS_CARDS )) && [ -n "$cgid" ] && (( crole == 0 )); then  # card header == labelled divider
         if (( drawn < slots )); then                         # draw only if it fits; a clipped header is skipped...
-          local dstate="${CARD_STATE[$cgid]:-}" dn=${CARD_NWORK[$cgid]:-0} dwarn=${CARD_WARN[$cgid]:-0} dlabel="$cgid"
-          [ -n "$dstate" ] && dlabel+=" · $dstate"
-          dlabel+=" · $dn worker$([ "$dn" = 1 ] || echo s)"
+          local dn=${CARD_NWORK[$cgid]:-0} dwarn=${CARD_WARN[$cgid]:-0} dlabel="$cgid"
+          dlabel+=" · $dn worker$([ "$dn" = 1 ] || echo s)"  # state now lives in the pill, not the '· state' text
           (( dwarn > 0 )) && dlabel+=" · ⚠$dwarn"
+          # the so-<id> row IS the card header: render ITS OWN live state pill, same
+          # stall/done overrides the worker path applies below.
+          local hstate hsdisp hscol hage
+          hstate=$(field "$i" 1); hage=$(field "$i" 7); hsdisp="$hstate"; hscol=$(state_pcol "$hstate")
+          if [ "$hstate" = working ] && (( ${hage:-0} > STALL_SEC )); then hsdisp="stalled"; hscol=1; fi
+          case "$hstate" in working|blocked) ;; *) [ -n "$(field "$i" 8)" ] && { hsdisp="done"; hscol=5; } ;; esac
+          local hpill; hpill=$(pill "$hsdisp" "$hscol")
+          local hw                                            # hrule width shrinks by the pill so content stays == inner
           if (( i == sel )); then
-            printf '\033[2m│\033[0m%b▌\033[0m\033[2m%s│\033[0m\033[K\n' "$markc" "$(hrule '' '' $(( inner - 1 )) "$dlabel")"
+            hw=$(( inner - 1 - PW )); (( hw < 0 )) && hw=0    # marker(1) + pill(PW) + hrule(hw) == inner
+            printf '\033[2m│\033[0m%b▌\033[0m%b\033[2m%s│\033[0m\033[K\n' "$markc" "$hpill" "$(hrule '' '' "$hw" "$dlabel")"
           else
-            printf '\033[2m│%s│\033[0m\033[K\n' "$(hrule '' '' "$inner" "$dlabel")"
+            hw=$(( inner - PW )); (( hw < 0 )) && hw=0        # pill(PW) + hrule(hw) == inner
+            printf '\033[2m│\033[0m%b\033[2m%s│\033[0m\033[K\n' "$hpill" "$(hrule '' '' "$hw" "$dlabel")"
           fi
           (( drawn++ ))
           if (( dn == 0 )) && (( drawn < slots )); then       # empty card placeholder
@@ -986,6 +997,12 @@ render() {
         done
       fi
     done
+    # Closing rule under the unowned pile: unowned rows always sort last, so the loop
+    # has just emitted them. Mirror the top '╶ unowned ╴' rule with a plain ─ divider
+    # (no label), same inner width — only when a top rule was drawn and a slot remains.
+    if (( HAS_CARDS )) && (( unowned_ruled )) && (( drawn < slots )); then
+      printf '\033[2m│%s│\033[0m\033[K\n' "$(hrule '' '' "$inner")"; (( drawn++ ))
+    fi
     # Synthetic '⌫ orphans' row (combined bucket, trailing position) for unread msgs
     # whose sender matches no live window — reaped/gone agents, or a prior incarnation
     # of a respawned name (pane-suffix mismatch). Selectable at index N; 'e'/Enter
