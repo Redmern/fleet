@@ -67,6 +67,21 @@ question/trivial/feature). Keep it to **one sentence of reasoning**; do not over
 and do not let the emphasis of this section push you toward "feature" when the change is
 plainly a one-liner.
 
+### 3.0.1a Name your window after the feature (rename, THEN spawn)
+
+Once you've classified the instruction and picked a slug, **before spawning any worker**,
+rename your own window + card so they name the feature instead of the bare id:
+
+```
+fleet dispatch rename <id> <short-feature-slug>     # so-<id> → so-<id>-<short-feature-slug>
+```
+
+This is **display-only**: your identity stays the bare `so-<id>` (owner edge, message
+routing, ledger key, locks are all unchanged), so the workers you spawn next still group +
+route under you. It is **advisory** — skip it and your window simply stays `so-<id>` (no
+regression), but a named card is far easier for the human to read in `fleet ls` / the
+dashboard. Do it once, right after you classify.
+
 ### 3.0.2 The three roles (one fleet agent each; breadth lives INSIDE)
 
 A feature decomposes into **exactly three fleet agents, spawned in sequence**, one per

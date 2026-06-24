@@ -199,11 +199,16 @@ owner_of() { # window_id -> owning sub-orch window name (so-<id>), or "" (prints
   fi
   printf '%s' "${OWN_RAW[$wid]}"
 }
-is_suborch_name() { [[ "$1" =~ ^so-[A-Za-z0-9]+$ ]]; }   # the so-<id> window-name shape
-suborch_ledger()  { local id="${1#so-}"; [ -d "$(dash_root)/.fleet/dispatch/$id" ]; }  # genuine sub-orch (vs a worker named so-*)
+# Sub-orch window-name shape: bare so-d<N> OR slugged so-d<N>-<slug> (display name set by
+# `fleet dispatch rename`). The optional suffix group keeps a bare name matching, and the
+# `d[0-9]+` anchor still rejects a worker (d<N>-repo/branch — no so- prefix, has a '/').
+is_suborch_name() { [[ "$1" =~ ^so-d[0-9]+(-[A-Za-z0-9-]+)?$ ]]; }
+# Recover the immutable d<N> dir key from a possibly-slugged name: strip so-, then cut
+# at the FIRST '-' (d<N> never contains a '-', so so-d11-new-project → d11).
+suborch_ledger()  { local id="${1#so-}"; id="${id%%-*}"; [ -d "$(dash_root)/.fleet/dispatch/$id" ]; }
 urgrank()         { case "$1" in blocked) echo 0 ;; idle) echo 1 ;; working) echo 2 ;; *) echo 3 ;; esac; }  # lower floats up
-card_meta_state() { # <so-id> -> ledger 'state' value (running/planning/…), or ""
-  local id="${1#so-}" f; f="$(dash_root)/.fleet/dispatch/$id/meta.tsv"
+card_meta_state() { # <so-d<N>[-slug]> -> ledger 'state' value (running/planning/…), or ""
+  local id="${1#so-}" f; id="${id%%-*}"; f="$(dash_root)/.fleet/dispatch/$id/meta.tsv"
   [ -f "$f" ] && awk -F'\t' '$1=="state"{v=$2} END{print v}' "$f" 2>/dev/null
 }
 unowned_rule() { # <inner-width> -> a '╶ unowned ╴' plain rule of exactly <inner> display chars
@@ -436,11 +441,18 @@ group_rows() {
   (( N == 0 )) && return 0
 
   local i st wn wid r own gid role annot num have_hdr=0
-  local -A IS_HEADER GMINRANK GNUM
+  local -A IS_HEADER GMINRANK GNUM HDR_BY_ID
 
   for (( i=0; i<N; i++ )); do             # pass 1: genuine live sub-orch headers
     wn=$(field "$i" 4)
-    if is_suborch_name "$wn" && suborch_ledger "$wn"; then IS_HEADER[$wn]=1; have_hdr=1; fi
+    if is_suborch_name "$wn" && suborch_ledger "$wn"; then
+      IS_HEADER[$wn]=1; have_hdr=1
+      # bare→full map: a worker's @fleet_owner is the IMMUTABLE bare so-d<N> (frozen env),
+      # but a renamed header is keyed on the full so-d<N>-<slug> live name. Index the
+      # header by its bare so-d<N> so pass 2 can translate a bare owner → the full header.
+      local _bid="${wn#so-}"; _bid="so-${_bid%%-*}"
+      HDR_BY_ID[$_bid]="$wn"
+    fi
   done
   if (( have_hdr == 0 )); then            # no cards -> flat identity (zero-regression)
     for (( i=0; i<N; i++ )); do ROW_GID[i]=""; ROW_ROLE[i]=1; ROW_ANNOT[i]=""; done
@@ -459,8 +471,11 @@ group_rows() {
       # immutable per window, so a cache hit is always correct.
       [ -n "${OWN_RAW[$wid]+x}" ] || OWN_RAW[$wid]=$(owner_of "$wid")
       own="${OWN_RAW[$wid]}"
-      if [ -n "$own" ] && [ -n "${IS_HEADER[$own]:-}" ]; then
-        gid="$own"; role=1
+      # Translate the bare owner so-d<N> → the full (possibly slugged) live header name.
+      local _ofull=""
+      if [ -n "$own" ]; then local _ob="${own#so-}"; _ob="so-${_ob%%-*}"; _ofull="${HDR_BY_ID[$_ob]:-}"; fi
+      if [ -n "$_ofull" ]; then
+        gid="$_ofull"; role=1            # group under the full header name (display = feature)
       elif [ -n "$own" ]; then           # orphan-owner: owner not a live header -> unowned, annotated
         gid=""; role=1
         if suborch_ledger "$own"; then annot="(owner $own out of scope)"; else annot="(owner $own gone)"; fi
@@ -471,7 +486,10 @@ group_rows() {
     g_gid[i]="$gid"; g_role[i]=$role; g_rank[i]=$r; g_annot[i]="$annot"
     if [ -n "$gid" ]; then
       if [ -z "${GMINRANK[$gid]:-}" ] || (( r < GMINRANK[$gid] )); then GMINRANK[$gid]=$r; fi
-      num="${gid#so-}"; num="${num//[^0-9]/}"; GNUM[$gid]=$(( 10#${num:-0} ))
+      # Numeric id for card ordering: strip so-, cut at the first '-' to drop the slug,
+      # drop the d. Do NOT use //[^0-9]/ — a digit-bearing slug (so-d11-ipv6-fix) would
+      # slurp into 1116; prefix-strip yields the true id 11.
+      num="${gid#so-}"; num="${num%%-*}"; num="${num#d}"; GNUM[$gid]=$(( 10#${num:-0} ))
     fi
   done
 
