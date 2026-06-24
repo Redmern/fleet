@@ -177,6 +177,38 @@ harness_has_modes() { # harness -> 0 if it supports a permission-mode cycle
   case "$1" in claude) return 0 ;; *) return 1 ;; esac
 }
 
+# --- orchestrator cards: ownership + classification --------------------------
+# Workers spawned by a sub-orchestrator carry a non-forgeable @fleet_owner window
+# option (=so-<id>), stamped at spawn by cmd_new. The dashboard groups each card's
+# rows under their sub-orch header. owner_of is cached PROCESS-LIFETIME (owner is
+# immutable per window) — NOT cleared per load_rows.
+ROWS=()                                     # live agent rows (8-field, see load_rows)
+declare -a ROW_GID ROW_ROLE ROW_ANNOT       # per-row card group / role(0 hdr,1 wkr) / annotation, display order
+declare -A OWN_RAW                          # window_id -> @fleet_owner (lifetime cache)
+declare -A CARD_NWORK CARD_WARN CARD_STATE  # per-card live-worker count / warn count / ledger state
+HAS_CARDS=0                                 # 1 when >=1 live sub-orch header exists (else byte-identical flat list)
+
+owner_of() { # window_id -> owning sub-orch window name (so-<id>), or "" — cached for the process lifetime
+  local wid="$1"
+  if [ -z "${OWN_RAW[$wid]+x}" ]; then
+    OWN_RAW[$wid]=$(tmux show -wqv -t "$wid" @fleet_owner 2>/dev/null)
+  fi
+  printf '%s' "${OWN_RAW[$wid]}"
+}
+is_suborch_name() { [[ "$1" =~ ^so-[A-Za-z0-9]+$ ]]; }   # the so-<id> window-name shape
+suborch_ledger()  { local id="${1#so-}"; [ -d "$(dash_root)/.fleet/dispatch/$id" ]; }  # genuine sub-orch (vs a worker named so-*)
+urgrank()         { case "$1" in blocked) echo 0 ;; idle) echo 1 ;; working) echo 2 ;; *) echo 3 ;; esac; }  # lower floats up
+card_meta_state() { # <so-id> -> ledger 'state' value (running/planning/…), or ""
+  local id="${1#so-}" f; f="$(dash_root)/.fleet/dispatch/$id/meta.tsv"
+  [ -f "$f" ] && awk -F'\t' '$1=="state"{v=$2} END{print v}' "$f" 2>/dev/null
+}
+unowned_rule() { # <inner-width> -> a '╶ unowned ╴' plain rule of exactly <inner> display chars
+  local w="$1" lab=" unowned " n fill
+  n=$(( w - ${#lab} - 2 )); (( n < 0 )) && n=0
+  fill=""; (( n > 0 )) && fill=$(printf '%.0s─' $(seq 1 "$n"))
+  printf '╶%s╴%s' "$lab" "$fill"
+}
+
 gitfmt() { # "D A B" -> nerd-font glyphs (≤PILL_W cols): ●dirty ↑ahead ↓behind, ✓ clean, - none
   [ -n "$1" ] || { printf -- '-'; return; }
   local d a b; read -r d a b <<<"$1"
@@ -355,6 +387,12 @@ config_live_cached() { # recompute CFG_RAW/CFG_NP at most every 30s
 # --- data --------------------------------------------------------------------
 # ROWS[] entries: state \t label \t window_id \t window_name \t since \t pane_id \t age
 load_rows() {
+  # stash the selected agent's window_id BEFORE rebuilding so sel can FOLLOW it
+  # across the regroup/reload (else a 1s refresh re-ranks a card and the next
+  # 'd'/'m' hits the wrong agent — data loss, not cosmetic).
+  local prev_wid=""
+  (( ${#ROWS[@]} > 0 )) && (( sel < ${#ROWS[@]} )) && prev_wid=$(field "$sel" 3)
+
   ROWS=()
   local line state label sess win wname since pane age order
   while IFS=$'\t' read -r state label sess win wname since pane age ready; do
@@ -367,12 +405,101 @@ load_rows() {
                 $1=="blocked"{o=0} $1=="idle"{o=1} $1=="working"{o=2} $1!~/blocked|idle|working/{o=3}
                 {print o"\t"$0}' | sort -n | cut -f2-)
   N=${#ROWS[@]}
+
+  group_rows                              # reorder ROWS into per-card display order (fail-silent)
+
+  if [ -n "$prev_wid" ]; then             # restore selection onto the same window_id
+    local j
+    for (( j=0; j<N; j++ )); do [ "$(field "$j" 3)" = "$prev_wid" ] && { sel=$j; break; }; done
+  fi
+
   # selectable rows = live agents + the synthetic orphans/system rows (if any). The
   # *_ROW globals are kept fresh by the last load_inbox_index, so sel can rest on them.
   local tot=$(( N + ORPHAN_ROW + SYSTEM_ROW ))
   (( tot == 0 )) && sel=0
   (( sel >= tot )) && sel=$(( tot - 1 ))
   (( sel < 0 )) && sel=0
+}
+
+# Reorder ROWS[] into contiguous per-card display order and fill the parallel
+# ROW_GID/ROW_ROLE/ROW_ANNOT + CARD_* arrays. Cards are ordered by MAX-SEVERITY-
+# WITHIN the card (blocked floats up), tie-broken by NUMERIC dispatch id; the
+# unowned bucket sorts last. Within a card: header first, then workers by urgency
+# rank then name. Fail-silent: with no live sub-orch header it is a pure identity
+# (byte-identical flat list, HAS_CARDS=0); it never half-rewrites ROWS[].
+group_rows() {
+  ROW_GID=(); ROW_ROLE=(); ROW_ANNOT=(); CARD_NWORK=(); CARD_WARN=(); CARD_STATE=(); HAS_CARDS=0
+  (( N == 0 )) && return 0
+
+  local i st wn wid r own gid role annot num have_hdr=0
+  local -A IS_HEADER GMINRANK GNUM
+
+  for (( i=0; i<N; i++ )); do             # pass 1: genuine live sub-orch headers
+    wn=$(field "$i" 4)
+    if is_suborch_name "$wn" && suborch_ledger "$wn"; then IS_HEADER[$wn]=1; have_hdr=1; fi
+  done
+  if (( have_hdr == 0 )); then            # no cards -> flat identity (zero-regression)
+    for (( i=0; i<N; i++ )); do ROW_GID[i]=""; ROW_ROLE[i]=1; ROW_ANNOT[i]=""; done
+    return 0
+  fi
+  HAS_CARDS=1
+
+  local -a g_gid g_role g_rank g_annot
+  for (( i=0; i<N; i++ )); do             # pass 2: classify + accumulate per-card min rank / numeric id
+    st=$(field "$i" 1); wn=$(field "$i" 4); wid=$(field "$i" 3); r=$(urgrank "$st"); annot=""
+    if [ -n "${IS_HEADER[$wn]:-}" ]; then
+      gid="$wn"; role=0
+    else
+      own=$(owner_of "$wid")
+      if [ -n "$own" ] && [ -n "${IS_HEADER[$own]:-}" ]; then
+        gid="$own"; role=1
+      elif [ -n "$own" ]; then           # orphan-owner: owner not a live header -> unowned, annotated
+        gid=""; role=1
+        if suborch_ledger "$own"; then annot="(owner $own out of scope)"; else annot="(owner $own gone)"; fi
+      else
+        gid=""; role=1
+      fi
+    fi
+    g_gid[i]="$gid"; g_role[i]=$role; g_rank[i]=$r; g_annot[i]="$annot"
+    if [ -n "$gid" ]; then
+      if [ -z "${GMINRANK[$gid]:-}" ] || (( r < GMINRANK[$gid] )); then GMINRANK[$gid]=$r; fi
+      num="${gid#so-}"; num="${num//[^0-9]/}"; GNUM[$gid]=$(( 10#${num:-0} ))
+    fi
+  done
+
+  local -A GIDX; local gi=0 g                # order cards: (min-rank ASC, numeric id ASC); unowned last
+  while IFS= read -r g; do [ -n "$g" ] && { GIDX[$g]=$gi; gi=$(( gi + 1 )); }; done < <(
+    for g in "${!GMINRANK[@]}"; do printf '%d\t%d\t%s\n' "${GMINRANK[$g]}" "${GNUM[$g]:-0}" "$g"; done \
+      | sort -t$'\t' -k1,1n -k2,2n | cut -f3)
+  local unowned_idx=$gi
+
+  local -a OLDROWS=("${ROWS[@]}") SEQ      # decorate -> stable sort -> display-order original indices
+  mapfile -t SEQ < <(
+    for (( i=0; i<N; i++ )); do
+      gid="${g_gid[i]}"; local gidx wkey
+      if [ -n "$gid" ]; then gidx=${GIDX[$gid]}; else gidx=$unowned_idx; fi
+      if [ -n "$gid" ] && (( g_role[i] == 0 )); then wkey="0"                       # header first
+      elif [ -n "$gid" ]; then wkey=$(printf '1:%02d:%s' "${g_rank[i]}" "$(field "$i" 4)")   # worker: rank, name
+      else wkey=$(printf '%09d' "$i"); fi                                            # unowned: keep flat order
+      printf '%d\t%d\t%s\t%d\n' "$gidx" "${g_role[i]}" "$wkey" "$i"
+    done | sort -t$'\t' -k1,1n -k2,2n -k3,3 -k4,4n | cut -f4)
+
+  ROWS=(); local oi
+  for oi in "${SEQ[@]}"; do
+    ROWS+=("${OLDROWS[$oi]}"); ROW_GID+=("${g_gid[$oi]}"); ROW_ROLE+=("${g_role[$oi]}"); ROW_ANNOT+=("${g_annot[$oi]}")
+  done
+
+  local k g2 st2 ag2                       # per-card aggregates for the divider label
+  for (( k=0; k<N; k++ )); do
+    g2="${ROW_GID[k]}"; { [ -n "$g2" ] && (( ROW_ROLE[k] == 1 )); } || continue
+    CARD_NWORK[$g2]=$(( ${CARD_NWORK[$g2]:-0} + 1 ))
+    st2=$(field "$k" 1); ag2=$(field "$k" 7)
+    if [ "$st2" = blocked ] || { [ "$st2" = working ] && (( ${ag2:-0} > STALL_SEC )); }; then
+      CARD_WARN[$g2]=$(( ${CARD_WARN[$g2]:-0} + 1 ))
+    fi
+  done
+  for g2 in "${!IS_HEADER[@]}"; do CARD_STATE[$g2]=$(card_meta_state "$g2"); done
+  return 0
 }
 
 field() { printf '%s' "${ROWS[$1]}" | cut -f"$2"; }  # field <rowidx> <col>
@@ -673,10 +800,10 @@ hrule() { # hrule <left-corner> <right-corner> <inner-width> [label]
     (( avail < 0 )) && avail=0
     (( ${#lab} > avail )) && lab="${lab:0:avail}"
     local n=$(( avail - ${#lab} )); (( n < 0 )) && n=0
-    fill=$(printf '%.0s─' $(seq 1 "$n"))
+    fill=""; (( n > 0 )) && fill=$(printf '%.0s─' $(seq 1 "$n"))   # n==0: no stray ─ (printf emits the format once on 0 args)
     printf '%s─%s%s%s' "$l" "$lab" "$fill" "$r"
   else
-    fill=$(printf '%.0s─' $(seq 1 "$w"))
+    fill=""; (( w > 0 )) && fill=$(printf '%.0s─' $(seq 1 "$w"))
     printf '%s%s%s' "$l" "$fill" "$r"
   fi
 }
@@ -750,12 +877,51 @@ render() {
     local gap; gap=$(printf '%*s' "$G" '')
     local state label pane mode g gt content lblsgr LW git_show mode_show cost_show
     local age sdisp scol cost
+    local unowned_ruled=0
     for (( i=0; i<N && drawn<slots; i++ )); do
+      # --- orchestrator-card chrome: loose-between spacing, dividers, unowned --
+      local cgid="" crole=1 cannot=""
+      if (( HAS_CARDS )); then cgid="${ROW_GID[$i]:-}"; crole="${ROW_ROLE[$i]:-1}"; cannot="${ROW_ANNOT[$i]:-}"; fi
+      if (( HAS_CARDS )) && (( i > 0 )) && (( drawn < slots )); then   # blank between cards / loose unowned pile
+        local _pgid="${ROW_GID[$((i-1))]:-}"
+        if [ "$cgid" != "$_pgid" ] || [ -z "$cgid" ]; then
+          printf '\033[2m│%s│\033[0m\033[K\n' "$blank"; (( drawn++ ))
+        fi
+      fi
+      if (( HAS_CARDS )) && [ -z "$cgid" ] && (( unowned_ruled == 0 )) && (( drawn < slots )); then  # '╶ unowned ╴' rule, once
+        printf '\033[2m│%s│\033[0m\033[K\n' "$(unowned_rule "$inner")"; (( drawn++ )); unowned_ruled=1
+      fi
+      if (( HAS_CARDS )) && [ -n "$cgid" ] && (( crole == 0 )) && (( drawn < slots )); then  # card header == labelled divider
+        local dstate="${CARD_STATE[$cgid]:-}" dn=${CARD_NWORK[$cgid]:-0} dwarn=${CARD_WARN[$cgid]:-0} dlabel="$cgid"
+        [ -n "$dstate" ] && dlabel+=" · $dstate"
+        dlabel+=" · $dn worker$([ "$dn" = 1 ] || echo s)"
+        (( dwarn > 0 )) && dlabel+=" · ⚠$dwarn"
+        if (( i == sel )); then
+          printf '\033[2m│\033[0m%b▌\033[0m\033[2m%s│\033[0m\033[K\n' "$markc" "$(hrule '' '' $(( inner - 1 )) "$dlabel")"
+        else
+          printf '\033[2m│%s│\033[0m\033[K\n' "$(hrule '' '' "$inner" "$dlabel")"
+        fi
+        (( drawn++ ))
+        if (( dn == 0 )) && (( drawn < slots )); then         # empty card placeholder
+          printf '\033[2m│\033[0m%s%-*s%s\033[2m│\033[0m\033[K\n' "$ins" "$cw" "  (no workers yet)" "$ins"; (( drawn++ ))
+        fi
+        continue
+      fi
       state=$(field "$i" 1); label=$(field "$i" 2); pane=$(field "$i" 6); age=$(field "$i" 7)
       # show the agent/task name (window name) ahead of the repo/folder so rows
       # sharing a repo are distinguishable: "<task>  <repo/folder>".
       local wname; wname=$(field "$i" 4)
       [ -n "$wname" ] && [ "$wname" != "$label" ] && label="$wname  $label"
+      if (( HAS_CARDS )); then
+        if [ -n "$cgid" ] && (( crole == 1 )); then        # owned worker: 2-space indent + tree glyph (└─ last, ├─ otherwise)
+          local _last=1
+          (( i < N-1 )) && [ "${ROW_GID[$((i+1))]:-}" = "$cgid" ] && _last=0
+          local _gl="├─"; (( _last )) && _gl="└─"
+          label="  $_gl $label"
+        elif [ -z "$cgid" ] && [ -n "$cannot" ]; then       # orphan-owner folded into the unowned bucket
+          label="$label  $cannot"
+        fi
+      fi
       g=$(git_cached "$pane"); gt=$(gitfmt "$g")
       # mode pill only for harnesses with a runtime permission-mode cycle (claude)
       local hmode np
@@ -801,10 +967,12 @@ render() {
         printf '\033[2m│\033[0m%s%b%s\033[2m│\033[0m\033[K\n' "$ins" "$content" "$ins"
       fi
       (( drawn++ ))
-      local gi                                  # vertical gap between agents
-      for (( gi=0; gi<ROW_GAP && i<N-1 && drawn<slots; gi++ )); do
-        printf '\033[2m│%s│\033[0m\033[K\n' "$blank"; (( drawn++ ))
-      done
+      if (( ! HAS_CARDS )); then                # flat list: blank between agents (card mode spaces at loop top)
+        local gi                                # vertical gap between agents
+        for (( gi=0; gi<ROW_GAP && i<N-1 && drawn<slots; gi++ )); do
+          printf '\033[2m│%s│\033[0m\033[K\n' "$blank"; (( drawn++ ))
+        done
+      fi
     done
     # Synthetic '⌫ orphans' row (combined bucket, trailing position) for unread msgs
     # whose sender matches no live window — reaped/gone agents, or a prior incarnation
