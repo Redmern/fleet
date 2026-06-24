@@ -159,6 +159,15 @@ agents = json.loads(sys.argv[1]).get("agents", [])
 # restart reassigned pane ids; the stamped pane matches no live agent) from a
 # genuinely-different live occupant of a shared cwd.
 live_panes = {a.get("pane_id", "") for a in agents}
+# Live occupants per cwd. Several agents share one cwd in two cases: a reused
+# per-branch worktree (single occupant in practice) or the shared project root
+# (scratch agents + the orchestrator + sub-orchs all live there). Used below to
+# stop a dead-writer-pane marker from bleeding onto siblings of a multi-occupant
+# cwd, while keeping the legit single-occupant stale-pane restore case.
+cwd_occupants = {}
+for a in agents:
+    _c = (a.get("cwd") or "").rstrip("/")
+    cwd_occupants[_c] = cwd_occupants.get(_c, 0) + 1
 for a in agents:
     cwd = (a.get("cwd") or "").rstrip("/")
     label = "/".join(cwd.split("/")[-2:]) if cwd else a.get("window_name", "?")
@@ -184,11 +193,19 @@ for a in agents:
         # inherits nothing. Unstamped (legacy) markers — and stamps whose pane
         # matches no live agent (a stale pane from a tmux server restart; the
         # done worker was respawned with a fresh pane) — fall back to the legacy
-        # cwd behavior so a restored done worker keeps its pill. This is safe
-        # because cmd_new clears the marker on worktree reuse, so a stale-pane
-        # marker can't survive into a new occupant of the same cwd.
-        if marker_pane and marker_pane != a.get("pane_id", "") and marker_pane in live_panes:
-            ready = ""
+        # cwd behavior so a restored done worker keeps its pill.
+        if marker_pane and marker_pane != a.get("pane_id", ""):
+            if marker_pane in live_panes:
+                # Writer is a different *live* occupant — never inherit.
+                ready = ""
+            elif cwd_occupants.get(cwd, 0) > 1:
+                # Belt-and-braces: the writer pane is stale (dead), but this cwd
+                # has 2+ live occupants — the shared project root, where a
+                # scratch agent's `fleet ready` once bled onto main/claude/
+                # sub-orchs after it died. A dead-pane marker must NOT flag the
+                # siblings. The single-occupant reused-worktree restore case
+                # (count == 1) still falls through and keeps its pill.
+                ready = ""
     print("\t".join([a.get("state","?"), label, a.get("session",""),
                      a.get("window_id",""), a.get("window_name",""),
                      f"{age//60}m{age%60:02d}s", a.get("pane_id",""), str(age), ready]))
@@ -2313,6 +2330,22 @@ cmd_ready() { # ready [<agent>] [-m "reason"] [--clear]
   fi
   [ -n "$dir" ] || die "could not resolve a worktree directory"
   local root; root=$(git -C "$dir" rev-parse --show-toplevel 2>/dev/null) || root="$dir"
+  # Scratch-ready bleed guard (self-path only). A scratch/repo-less/orchestrator
+  # agent lives at the project root, not in a per-branch worktree. Writing the
+  # marker there drops it into the SHARED root/.fleet/ready, which then falsely
+  # flags every other root-cwd agent (main, claude, sub-orchs) as done once the
+  # writer pane dies. Only the self-path (no <target>) can hit this: a worker in
+  # its own worktree resolves a real worktree root; the orchestrator flagging
+  # another agent by <target> targets that agent's worktree. --clear still runs
+  # (lets a stray root marker be cleaned up). Compare realpaths, fail-silent.
+  if [ -z "$target" ] && [ "$clear" != 1 ]; then
+    local proot; proot=$(fleet_root 2>/dev/null)
+    if [ -n "$proot" ] \
+       && [ "$(realpath "$root" 2>/dev/null || echo "$root")" = "$(realpath "$proot" 2>/dev/null || echo "$proot")" ]; then
+      echo "fleet ready: no worktree here (scratch/root agent) — nothing to mark for reaping"
+      return 0
+    fi
+  fi
   local marker="$root/.fleet/ready"
   if [ "$clear" = 1 ]; then
     rm -f "$marker" 2>/dev/null; echo "cleared ready flag: $root"; return 0
