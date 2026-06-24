@@ -188,7 +188,11 @@ declare -A OWN_RAW                          # window_id -> @fleet_owner (lifetim
 declare -A CARD_NWORK CARD_WARN CARD_STATE  # per-card live-worker count / warn count / ledger state
 HAS_CARDS=0                                 # 1 when >=1 live sub-orch header exists (else byte-identical flat list)
 
-owner_of() { # window_id -> owning sub-orch window name (so-<id>), or "" — cached for the process lifetime
+owner_of() { # window_id -> owning sub-orch window name (so-<id>), or "" (prints to stdout)
+  # OWN_RAW is the process-lifetime cache; the EFFECTIVE memoisation happens in
+  # group_rows (which calls this via $() so a write here would be lost in the
+  # subshell). Direct callers still get a correct value; group_rows guarantees the
+  # tmux query runs at most once per window_id for the whole process.
   local wid="$1"
   if [ -z "${OWN_RAW[$wid]+x}" ]; then
     OWN_RAW[$wid]=$(tmux show -wqv -t "$wid" @fleet_owner 2>/dev/null)
@@ -450,7 +454,11 @@ group_rows() {
     if [ -n "${IS_HEADER[$wn]:-}" ]; then
       gid="$wn"; role=0
     else
-      own=$(owner_of "$wid")
+      # memoise into the parent's OWN_RAW (owner_of's own write is in a $() subshell;
+      # caching HERE makes it process-lifetime — no re-query per refresh). owner is
+      # immutable per window, so a cache hit is always correct.
+      [ -n "${OWN_RAW[$wid]+x}" ] || OWN_RAW[$wid]=$(owner_of "$wid")
+      own="${OWN_RAW[$wid]}"
       if [ -n "$own" ] && [ -n "${IS_HEADER[$own]:-}" ]; then
         gid="$own"; role=1
       elif [ -n "$own" ]; then           # orphan-owner: owner not a live header -> unowned, annotated
@@ -891,21 +899,23 @@ render() {
       if (( HAS_CARDS )) && [ -z "$cgid" ] && (( unowned_ruled == 0 )) && (( drawn < slots )); then  # '╶ unowned ╴' rule, once
         printf '\033[2m│%s│\033[0m\033[K\n' "$(unowned_rule "$inner")"; (( drawn++ )); unowned_ruled=1
       fi
-      if (( HAS_CARDS )) && [ -n "$cgid" ] && (( crole == 0 )) && (( drawn < slots )); then  # card header == labelled divider
-        local dstate="${CARD_STATE[$cgid]:-}" dn=${CARD_NWORK[$cgid]:-0} dwarn=${CARD_WARN[$cgid]:-0} dlabel="$cgid"
-        [ -n "$dstate" ] && dlabel+=" · $dstate"
-        dlabel+=" · $dn worker$([ "$dn" = 1 ] || echo s)"
-        (( dwarn > 0 )) && dlabel+=" · ⚠$dwarn"
-        if (( i == sel )); then
-          printf '\033[2m│\033[0m%b▌\033[0m\033[2m%s│\033[0m\033[K\n' "$markc" "$(hrule '' '' $(( inner - 1 )) "$dlabel")"
-        else
-          printf '\033[2m│%s│\033[0m\033[K\n' "$(hrule '' '' "$inner" "$dlabel")"
+      if (( HAS_CARDS )) && [ -n "$cgid" ] && (( crole == 0 )); then  # card header == labelled divider
+        if (( drawn < slots )); then                         # draw only if it fits; a clipped header is skipped...
+          local dstate="${CARD_STATE[$cgid]:-}" dn=${CARD_NWORK[$cgid]:-0} dwarn=${CARD_WARN[$cgid]:-0} dlabel="$cgid"
+          [ -n "$dstate" ] && dlabel+=" · $dstate"
+          dlabel+=" · $dn worker$([ "$dn" = 1 ] || echo s)"
+          (( dwarn > 0 )) && dlabel+=" · ⚠$dwarn"
+          if (( i == sel )); then
+            printf '\033[2m│\033[0m%b▌\033[0m\033[2m%s│\033[0m\033[K\n' "$markc" "$(hrule '' '' $(( inner - 1 )) "$dlabel")"
+          else
+            printf '\033[2m│%s│\033[0m\033[K\n' "$(hrule '' '' "$inner" "$dlabel")"
+          fi
+          (( drawn++ ))
+          if (( dn == 0 )) && (( drawn < slots )); then       # empty card placeholder
+            printf '\033[2m│\033[0m%s%-*s%s\033[2m│\033[0m\033[K\n' "$ins" "$cw" "  (no workers yet)" "$ins"; (( drawn++ ))
+          fi
         fi
-        (( drawn++ ))
-        if (( dn == 0 )) && (( drawn < slots )); then         # empty card placeholder
-          printf '\033[2m│\033[0m%s%-*s%s\033[2m│\033[0m\033[K\n' "$ins" "$cw" "  (no workers yet)" "$ins"; (( drawn++ ))
-        fi
-        continue
+        continue                                             # ...never fall through to the worker-row printer
       fi
       state=$(field "$i" 1); label=$(field "$i" 2); pane=$(field "$i" 6); age=$(field "$i" 7)
       # show the agent/task name (window name) ahead of the repo/folder so rows
@@ -960,13 +970,15 @@ render() {
         cost=$(cost_cached "$pane")
         content+=$(printf "%s\033[2m%-*.*s\033[0m" "$gap" "$CF" "$CF" "$cost")
       fi
-      if (( i == sel )); then   # focus-coloured marker bar marks the selection
-        printf '\033[2m│\033[0m%b▌\033[0m%s%b%s\033[2m│\033[0m\033[K\n' \
-          "$markc" "$ins1" "$content" "$ins"
-      else
-        printf '\033[2m│\033[0m%s%b%s\033[2m│\033[0m\033[K\n' "$ins" "$content" "$ins"
+      if (( drawn < slots )); then   # guard the row print: pre-row card chrome may have just consumed the last slot
+        if (( i == sel )); then   # focus-coloured marker bar marks the selection
+          printf '\033[2m│\033[0m%b▌\033[0m%s%b%s\033[2m│\033[0m\033[K\n' \
+            "$markc" "$ins1" "$content" "$ins"
+        else
+          printf '\033[2m│\033[0m%s%b%s\033[2m│\033[0m\033[K\n' "$ins" "$content" "$ins"
+        fi
+        (( drawn++ ))
       fi
-      (( drawn++ ))
       if (( ! HAS_CARDS )); then                # flat list: blank between agents (card mode spaces at loop top)
         local gi                                # vertical gap between agents
         for (( gi=0; gi<ROW_GAP && i<N-1 && drawn<slots; gi++ )); do

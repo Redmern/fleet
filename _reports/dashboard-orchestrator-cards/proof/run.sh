@@ -5,7 +5,7 @@
 set -u
 DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 
-TESTS=(test_grouping.sh test_width.sh test_owner_real.sh)
+TESTS=(test_grouping.sh test_width.sh test_owner_real.sh test_clip.sh test_owner_cache.sh)
 declare -A RC
 fail_any=0
 
