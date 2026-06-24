@@ -2952,18 +2952,27 @@ sessions_rows() {
   printf '%s' "$rows"
 }
 
+SESSIONS_MAX_ROWS=10   # cap of session rows shown at once; >cap scroll inside fzf
+
 cmd_sessions() {
   # --measure: print ONLY what fzf shows (the col2+ visible text), for the
-  # fit-to-content popup sizer (popup_fit_content). No fzf launched here. Two
-  # extra placeholder lines stand in for fzf's chrome (the prompt line + the
-  # info/count line of the default layout) so the fitted popup is tall enough to
-  # show every session without scrolling. Width is set by the data rows (these
-  # placeholders are short), height by total line count. SGR is stripped by the
-  # sizer, so the ANSI in the rows is harmless.
+  # fit-to-content popup sizer (popup_fit_content). No fzf launched here.
+  #
+  # Height: emit at most SESSIONS_MAX_ROWS data rows (the visible window) + two
+  # chrome placeholder lines for fzf's prompt + info/count lines, so the fitted
+  # popup is exactly tall enough to show min(N,cap) sessions; any beyond the cap
+  # scroll inside fzf. Capping HERE keeps the sizer and the interactive picker in
+  # lockstep — the popup is sized for the window fzf will actually render.
+  #
+  # The two chrome lines MUST be non-blank: popup_fit_content captures this via
+  # `$(...)`, which strips trailing newlines — a blank final line is eaten, the
+  # popup comes up one row short, and the list is clipped (the historical
+  # "only one session visible" bug). Width is set by the wide data rows, so the
+  # short chrome lines never affect it; SGR is stripped by the sizer.
   if [ "${1:-}" = "--measure" ]; then
     local rows; rows=$(sessions_rows) || { printf '%s\n' "$rows"; return 0; }
-    printf '%s\n' "$rows" | cut -f2-
-    printf 'fleet session> \n\n'   # +2 lines: fzf prompt + info chrome
+    printf '%s\n' "$rows" | cut -f2- | head -n "$SESSIONS_MAX_ROWS"
+    printf 'fleet session>\n  --\n'   # +2 NON-BLANK chrome lines: fzf prompt + info
     return 0
   fi
   local rows; rows=$(sessions_rows) || { printf '%s\n' "$rows"; return 0; }
@@ -2972,9 +2981,14 @@ cmd_sessions() {
     printf '%s\n' "$rows" | cut -f2-
     return 0
   fi
+  # --layout=reverse: prompt+list at the top, rows read top-down. The popup is
+  # sized (by --measure above) to a min(N,cap)+chrome window, so --height=100%
+  # fills it and fzf scrolls when sessions exceed the cap. --border=none avoids a
+  # second border inside the rounded popup.
   local choice
   choice=$(printf '%s\n' "$rows" | fzf --ansi --delimiter='\t' --with-nth=2 \
-            --no-sort --prompt='fleet session> ' --height=100% --border=none) || return 0
+            --no-sort --layout=reverse --prompt='fleet session> ' \
+            --height=100% --border=none) || return 0
   local chosen; chosen=$(printf '%s' "$choice" | cut -f1)
   [ -n "$chosen" ] && tmux switch-client -t "$chosen" 2>/dev/null
 }
