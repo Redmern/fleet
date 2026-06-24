@@ -1700,31 +1700,108 @@ inbox_put() { # put [--from X] [-d dN] [--sev info|warn|blocked] [--key K] -t "t
           notify-send -a fleet -u "$urg" "Inbox: $from" "$title" 2>/dev/null || true
         fi ;;
     esac
-    echo "inbox: queued $id [$sev] — $title"
+    if inbox_color_on; then   # tint only the [sev] token, same tty gate (Q3)
+      printf 'inbox: queued %s %s[%s]%s — %s\n' "$id" "$(sev_color "$sev")" "$sev" "$(printf '\033[0m')" "$title"
+    else
+      echo "inbox: queued $id [$sev] — $title"
+    fi
   else
     rm -f "$tmp" 2>/dev/null; echo "inbox: could not write entry" >&2; return 1
   fi
 }
 
+# ---- inbox display styling (CLI peeks only; never the .msg, never machine paths) ----
+# These color ONLY the inbox_list/inbox_read DISPLAY printfs. The on-disk .msg
+# header and every machine consumer (inbox_field/inbox_body/inbox_pop_text/the
+# reap-guard/dash parsers) keep reading plain text — nothing here touches them.
+#
+# sev_color is a BYTE-FOR-BYTE copy of fleet-dash:sev_color — keep the two in sync
+# (same mirrored-across-both discipline as inbox_from_is_system). Raw SGR, no tput
+# (matches the dash convention). Always captured via col=$(sev_color …) so the
+# escape lands as real bytes, never the literal six chars.
+sev_color() { case "$1" in blocked) printf '\033[31m' ;; warn) printf '\033[33m' ;; *) printf '\033[2m' ;; esac; }
+
+# fmt_age: seconds -> compact 5s/3m/2h/4d. Mirrored from fleet-dash:fmt_age — keep
+# in sync. The msg-id filename carries the epoch (id = epoch.nanos.pane), so the
+# list shows a relative age column with no extra stat.
+fmt_age() {
+  local s="${1:-0}"; (( s < 0 )) && s=0
+  if   (( s < 60 ));    then printf '%ds' "$s"
+  elif (( s < 3600 ));  then printf '%dm' "$(( s / 60 ))"
+  elif (( s < 86400 )); then printf '%dh' "$(( s / 3600 ))"
+  else printf '%dd' "$(( s / 86400 ))"; fi
+}
+
+# Color decision for the inbox CLI peeks. rc 0 = emit color. Precedence: NO_COLOR
+# wins, a hard off (https://no-color.org); THEN the FLEET_INBOX_COLOR override
+# (auto|always|never); else auto = stdout is a tty. The consume pager path sets
+# the override to 'always' (its stdout is the PIPE into `less -R`, not a tty) or
+# 'never' (cat), so color reaches less -R yet never a pipe/redirect/cat sink.
+inbox_color_on() {
+  [ -n "${NO_COLOR:-}" ] && return 1
+  case "${FLEET_INBOX_COLOR:-auto}" in
+    always|1|yes) return 0 ;;
+    never|0|no)   return 1 ;;
+    *)            [ -t 1 ] ;;
+  esac
+}
+
 inbox_list() { # NON-DESTRUCTIVE peek: titles newest-first. Every live msg is unread
-  local dir f id sev from title any=0
+  local dir f id sev from title epoch age any=0 now
+  # must-fix #2 (set -u): init EVERY style var unconditionally before the color test.
+  local C=0 reset="" dim="" sevtxt="" fromtxt="" titletxt="" agetxt="" sevf=""
+  local SEVW=9 FROMW=14 AGEW=5 COLS LW fixed
   dir=$(inbox_dir) || { echo "inbox: no project root"; return 0; }
   [ -d "$dir" ] || { echo "inbox empty"; return 0; }
+  inbox_color_on && C=1
+  if [ "$C" = 1 ]; then reset=$'\033[0m'; dim=$'\033[2m'; fi
+  now=$(date +%s 2>/dev/null) || now=0
+  COLS="${COLUMNS:-80}"; case "$COLS" in *[!0-9]*|'') COLS=80 ;; esac
+  fixed=$((5 + SEVW + FROMW + AGEW)); LW=$((COLS - fixed)); [ "$LW" -lt 8 ] && LW=8
   while IFS= read -r f; do
     [ -e "$f" ] || continue
     any=1
+    id=$(basename "$f" .msg); epoch="${id%%.*}"; case "$epoch" in *[!0-9]*|'') epoch=$now ;; esac
+    age=$(fmt_age $(( now - epoch )))
     sev=$(inbox_field "$f" sev); from=$(inbox_field "$f" from); title=$(inbox_field "$f" title)
-    printf '%s %-9s %-24s %s\n' '*' "[$sev]" "$from" "$title"
+    sevf="[$sev]"
+    # pad INSIDE the color span (dash width trick) so ANSI bytes never enter the
+    # %-*s width count; reset before the next token — no dangling SGR (must-fix #3).
+    if [ "$C" = 1 ]; then
+      sevtxt=$(printf '%s%-*.*s%s' "$(sev_color "$sev")" "$SEVW" "$SEVW" "$sevf" "$reset")
+    else
+      sevtxt=$(printf '%-*.*s' "$SEVW" "$SEVW" "$sevf")
+    fi
+    # dim ONLY system/orchestrator senders (mirror inbox_from_is_system); worker
+    # senders keep default weight so a real plea stands out.
+    if [ "$C" = 1 ] && inbox_from_is_system "$from"; then
+      fromtxt=$(printf '%s%-*.*s%s' "$dim" "$FROMW" "$FROMW" "$from" "$reset")
+    else
+      fromtxt=$(printf '%-*.*s' "$FROMW" "$FROMW" "$from")
+    fi
+    titletxt=$(printf '%-*.*s' "$LW" "$LW" "$title")   # default weight (the payload)
+    if [ "$C" = 1 ]; then
+      agetxt=$(printf '%s%*s%s' "$dim" "$AGEW" "$age" "$reset")
+    else
+      agetxt=$(printf '%*s' "$AGEW" "$age")
+    fi
+    printf '* %s %s %s %s\n' "$sevtxt" "$fromtxt" "$titletxt" "$agetxt"
   done < <(ls -1 "$dir"/*.msg 2>/dev/null | sort -r)
-  [ "$any" = 1 ] || echo "inbox empty"
+  if [ "$any" != 1 ]; then
+    if [ "$C" = 1 ]; then printf '%sinbox empty%s\n' "$dim" "$reset"; else echo "inbox empty"; fi
+  fi
 }
 
 inbox_read() { # [id|all] — show full bodies newest-first (pure display, no archive)
   local want="${1:-all}" dir f id files sev from disp ts title
+  # must-fix #2 (set -u): init EVERY style var unconditionally before the color test.
+  local C=0 reset="" dim="" bold="" sevc="" disptag=""
   dir=$(inbox_dir) || { echo "inbox: no project root"; return 0; }
   [ -d "$dir" ] || { echo "inbox empty"; return 0; }
   files=$(ls -1 "$dir"/*.msg 2>/dev/null | sort -r)
   [ -n "$files" ] || { echo "inbox empty"; return 0; }
+  inbox_color_on && C=1
+  if [ "$C" = 1 ]; then reset=$'\033[0m'; dim=$'\033[2m'; bold=$'\033[1m'; fi
   while IFS= read -r f; do
     [ -e "$f" ] || continue
     id=$(basename "$f" .msg)
@@ -1732,9 +1809,15 @@ inbox_read() { # [id|all] — show full bodies newest-first (pure display, no ar
     sev=$(inbox_field "$f" sev);   from=$(inbox_field "$f" from)
     disp=$(inbox_field "$f" dispatch); ts=$(inbox_field "$f" ts)
     title=$(inbox_field "$f" title)
-    printf '── [%s] %s%s\n' "$sev" "$from" "$([ -n "$disp" ] && [ "$disp" != - ] && printf '  (%s)' "$disp")"
-    printf '   %s  %s\n\n' "$ts" "$title"
-    inbox_body "$f"; printf '\n'
+    [ "$C" = 1 ] && sevc=$(sev_color "$sev") || sevc=""
+    disptag=""
+    [ -n "$disp" ] && [ "$disp" != - ] && disptag=$(printf '%s  (%s)%s' "$dim" "$disp" "$reset")
+    # header 1: dim ── rule, sev-colored [sev], default-weight from, dim (disp).
+    # Every span closes with reset on the same line — no dangling SGR (must-fix #3).
+    printf '%s──%s %s[%s]%s %s%s\n' "$dim" "$reset" "$sevc" "$sev" "$reset" "$from" "$disptag"
+    # header 2: dim ts, then the ONE bright anchor — bold title (reset before body).
+    printf '   %s%s%s  %s%s%s\n\n' "$dim" "$ts" "$reset" "$bold" "$title" "$reset"
+    inbox_body "$f"; printf '\n'   # body VERBATIM — never re-colored (may hold its own escapes)
   done <<< "$files"
 }
 
@@ -2073,7 +2156,13 @@ cmd_inbox() { # inbox [put|list|read|count|gc|clear|pop|unpop|archive] — bare 
       # bare pager = consume: display every live msg, THEN archive them all (POP's
       # CLI sibling). list/read stay the non-destructive peeks.
       local pager=cat
-      [ -t 1 ] && command -v less >/dev/null 2>&1 && pager="less -R"
+      # must-fix #4: plain `local FLEET_INBOX_COLOR=…` (NOT the sh -c form). The
+      # left of the pipe is a fork that inherits this function's locals (dynamic
+      # scope), so inbox_list/inbox_read see the override even though their stdout
+      # is the pipe, not a tty. Color ONLY when the final sink is a tty + less -R;
+      # 'never' when piped to cat so a `fleet inbox | cat`/redirect stays clean.
+      local FLEET_INBOX_COLOR=never
+      [ -t 1 ] && command -v less >/dev/null 2>&1 && { pager="less -R"; FLEET_INBOX_COLOR=always; }
       { inbox_list; echo; inbox_read all; } | $pager
       inbox_clear >/dev/null
       ;;
