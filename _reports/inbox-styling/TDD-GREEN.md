@@ -91,3 +91,46 @@ body verbatim, every span closed with `ESC[0m`:
 
 When piped / redirected / under `NO_COLOR` / not a tty: the exact same lines
 print with **zero** escapes (proven by B1/B2/B3/E1/NC1/NC2/C2).
+
+---
+
+# Iteration 2 — post-NEEDS-WORK loop (test-debate verdict)
+
+`_reports/inbox-styling/TEST-VERDICT.md` returned **NEEDS-WORK**: 2 real gaps on
+the common path. Fixed test-first (RED-first on 86fc0eb, then minimal fix on the
+existing code — no rewrite).
+
+## New proof assertions (kept all 16 + the prior loop's set; now 23 total)
+
+- **W-WIDTH** (BLOCKER 1) — on a wide pty (`stty cols 200`), a >47-char title is
+  NOT truncated. **RED on 86fc0eb** (`COLS="${COLUMNS:-80}"`; `$COLUMNS` unset in
+  the child → pinned 80 on every terminal).
+- **W-NOCOLOR** (fold-in) — `NO_COLOR=''` (set but empty) on a tty → no color.
+  **RED on 86fc0eb** (`[ -n "${NO_COLOR:-}" ]` treats empty as unset).
+- **W-AGE / W-WARN / W-INFO / W-BOLD / W-SYSDIM** — regression guards for the
+  visual payload the original proof never asserted (age token, warn=`\033[33m`,
+  info=`\033[2m`, bold read-title, system-sender dimmed while worker is not).
+  These already passed on 86fc0eb — green from the start, now locked in.
+
+RED-first confirmed on 86fc0eb: `21 passed, 2 failed — RED: W-WIDTH W-NOCOLOR`;
+`PROOF_EXPECT_RED=1` exit 0 (failing set == `W-WIDTH W-NOCOLOR`).
+
+## Fix in `bin/fleet` (minimal, built on the existing code)
+
+| Location | Change |
+|---|---|
+| `inbox_list` COLS | `COLS="${COLUMNS:-$(tput cols 2>/dev/null \|\| echo 80)}"` (fail-silent, mirrors the dash); existing invalid/`<8` guards kept |
+| `inbox_color_on` | first line `[ -n "${NO_COLOR+x}" ]` — honor NO_COLOR present at ANY value (incl. empty) |
+| `inbox_read` | after `inbox_body`, `[ "$C" = 1 ] && printf '%s' "$reset"` — contain a misbehaving body's dangling SGR (body still VERBATIM; completes must-fix #3) |
+| `inbox_list` title | one-line comment: `%-*.*s` is byte-width (unicode title misalignment = documented known limitation, no wcwidth machinery — per verdict) |
+
+## Full green run (post-fix)
+
+    PASS  D5 / SYN
+    PASS  A1 A2 B1 B2 B3 E1 E2 NC1 NC2 AL1 DIST
+    PASS  W-WIDTH W-AGE W-WARN W-INFO W-BOLD W-SYSDIM W-NOCOLOR
+    PASS  C1 C2 C3
+    == 23 passed, 0 failed   (exit 0)
+
+`bash -n bin/fleet` clean; `fleet doctor` green (22 ok, 0 fail, exit 0).
+Not merged/pushed (--no-self-merge).

@@ -49,6 +49,9 @@ trap cleanup EXIT
 # ---- assertion bookkeeping ---------------------------------------------------
 ESC="$(printf '\033')"
 REDSEQ="$(printf '\033[31m')"
+YELSEQ="$(printf '\033[33m')"   # warn
+DIMSEQ="$(printf '\033[2m')"    # info / dim / system-sender
+BOLDSEQ="$(printf '\033[1m')"   # read-title anchor
 FAILS=0; PASSES=0
 RED_NAMES=""   # assertions that failed
 # ok/no <name> <description>: print result, track bare NAME (not the prose) so the
@@ -60,16 +63,41 @@ chk(){ if [ "$3" = 0 ]; then ok "$1" "$2"; else no "$1" "$2"; fi; }
 
 has_esc(){ printf '%s' "$1" | grep -q "$ESC"; }          # rc0 = contains ESC
 has_red(){ printf '%s' "$1" | grep -qF "$REDSEQ"; }      # rc0 = contains \033[31m
+has_seq(){ printf '%s' "$1" | grep -qF "$2"; }           # rc0 = contains literal seq $2
 live_count(){ ls -1 "$INBOX"/*.msg 2>/dev/null | wc -l | tr -d ' '; }
 
 # run a fleet command inside a real pty so [ -t 1 ] is TRUE; env is inherited
 # from the exported FLEET_ROOT/FLEET_SESSION (must-fix #5).
 tty_run(){ script -qec "$*" /dev/null 2>/dev/null; }
+# WIDE pty: resize to 200 cols inside the pty before running, so a width-aware
+# inbox_list reads the REAL terminal width (not a pinned 80). Proves BLOCKER 1.
+wide_tty_run(){ script -qec "stty cols 200 2>/dev/null; $*" /dev/null 2>/dev/null; }
+
+# A >47-char title (LW at 80 cols = 80-5-9-14-5 = 47) with a unique tail marker so
+# truncation is detectable: marker present == not truncated == real width was read.
+LONGTITLE="LONGTITLE_$(printf 'x%.0s' $(seq 1 50))_ENDMARKER"
 
 seed(){
   "$FLEET" inbox put --from tester-a --sev info    -t 'info ping'    -m 'info body line' >/dev/null 2>&1
   "$FLEET" inbox put --from tester-b --sev warn     -t 'warn ping'    -m 'warn body line' >/dev/null 2>&1
   "$FLEET" inbox put --from tester-c --sev blocked  -t 'blocked ping' -m 'blocked body line' >/dev/null 2>&1
+}
+
+# Extra seeds for the visual/width guards (BLOCKER 2): a system sender (from=main →
+# inbox_from_is_system) beside a worker sender, a long title, and a backdated msg-id.
+seed_extra(){
+  "$FLEET" inbox put --from main     --sev info -t 'system note' -m 'sys body' >/dev/null 2>&1
+  "$FLEET" inbox put --from worker-z --sev warn -t 'worker note' -m 'wk body'  >/dev/null 2>&1
+  "$FLEET" inbox put --from tester-w --sev info -t "$LONGTITLE"  -m 'long body' >/dev/null 2>&1
+  # Backdated id (epoch = now-7200 = "2h") crafted on disk — inbox_put can't backdate
+  # the id (= epoch.nanos.pane), and the age column derives from it.
+  local now epoch id; now=$(date +%s); epoch=$((now-7200)); id="$epoch.000000000.proof"
+  mkdir -p "$INBOX" 2>/dev/null
+  {
+    printf 'id=%s\n' "$id"; printf 'from=%s\n' aged-sender; printf 'dispatch=-\n'
+    printf 'ts=%s\n' backdated; printf 'sev=%s\n' info; printf 'title=%s\n' 'aged msg'
+    printf -- '--\n'; printf 'aged body\n'
+  } > "$INBOX/$id.msg" 2>/dev/null
 }
 
 # =============================================================================
@@ -153,6 +181,47 @@ if has_esc "$ALWAYS_PIPE" && ! has_esc "$NC_ALWAYS_PIPE"; then dist=0; else dist
 chk DIST "[distinction] always→ANSI, NO_COLOR+always→no ANSI" "$dist"
 
 # =============================================================================
+# (W) NEEDS-WORK loop — visual-payload + real-width guards (BLOCKER 1 & 2)
+# =============================================================================
+seed_extra
+
+# W-WIDTH (BLOCKER 1): on a WIDE pty a >47-char title is NOT truncated → the marker
+# survives. RED on 86fc0eb (COLS pinned to ${COLUMNS:-80}=80, COLUMNS unset in the
+# child). GREEN once COLS reads the real terminal (tput cols).
+WIDE_LIST="$(wide_tty_run "$FLEET inbox list")"
+chk W-WIDTH "[TTY-wide] long title not truncated (real terminal width)" \
+  "$(has_seq "$WIDE_LIST" 'ENDMARKER' && echo 0 || echo 1)"
+
+# W-AGE: a backdated msg-id renders an age token ('2h') in inbox list on a tty.
+TTY_LIST_X="$(tty_run "$FLEET inbox list")"
+chk W-AGE "[TTY] backdated msg renders age token '2h'" \
+  "$(has_seq "$TTY_LIST_X" '2h' && echo 0 || echo 1)"
+
+# W-WARN / W-INFO: sev tokens carry the right SGR (yellow / dim) on a tty.
+chk W-WARN "[TTY] warn [warn] token carries \\033[33m" \
+  "$(has_seq "$TTY_LIST_X" "${YELSEQ}[warn]" && echo 0 || echo 1)"
+chk W-INFO "[TTY] info [info] token carries \\033[2m" \
+  "$(has_seq "$TTY_LIST_X" "${DIMSEQ}[info]" && echo 0 || echo 1)"
+
+# W-BOLD: inbox read title is the bold anchor on a tty.
+TTY_READ_X="$(tty_run "$FLEET inbox read all")"
+chk W-BOLD "[TTY] inbox read title carries \\033[1m (bold anchor)" \
+  "$(has_seq "$TTY_READ_X" "$BOLDSEQ" && echo 0 || echo 1)"
+
+# W-SYSDIM: system sender (from=main) is dimmed; a worker sender is NOT. Exercises
+# the inbox_from_is_system branch the original proof never seeded.
+SYS_DIM="$(has_seq "$TTY_LIST_X" "${DIMSEQ}main" && echo y || echo n)"
+WORKER_DIM="$(has_seq "$TTY_LIST_X" "${DIMSEQ}worker-z" && echo y || echo n)"
+chk W-SYSDIM "[TTY] system sender dimmed, worker sender not (sys=$SYS_DIM worker=$WORKER_DIM)" \
+  "$([ "$SYS_DIM" = y ] && [ "$WORKER_DIM" = n ] && echo 0 || echo 1)"
+
+# W-NOCOLOR: NO_COLOR set but EMPTY → still no color on a tty (no-color.org: present
+# regardless of value). RED on 86fc0eb ([ -n "${NO_COLOR:-}" ] treats ''==unset).
+NC_EMPTY="$(NO_COLOR= tty_run "$FLEET inbox list")"
+chk W-NOCOLOR "[TTY+NO_COLOR=''] empty-but-set NO_COLOR suppresses color" \
+  "$(has_esc "$NC_EMPTY" && echo 1 || echo 0)"
+
+# =============================================================================
 # (c) consume path: clean output AND archives every live msg
 # =============================================================================
 BEFORE="$(live_count)"
@@ -172,9 +241,15 @@ echo
 echo "== $PASSES passed, $FAILS failed"
 [ -n "$RED_NAMES" ] && echo "== RED:$RED_NAMES"
 
-# Expected-RED gate: during Phase 3a (unstyled tree) the ONLY assertions allowed
-# to fail are the color ones; everything else must already be green.
-EXPECTED_RED="A1 A2 AL1 DIST"
+# Expected-RED gate. PROOF_EXPECT_RED=1 certifies the RED-first state of an
+# iteration: it exits 0 only when the failing set equals EXPECTED_RED exactly.
+#   Phase 3a (unstyled tree):       EXPECTED_RED="A1 A2 AL1 DIST"
+#   NEEDS-WORK loop (styled tree, pre-fix 86fc0eb): only the two genuine gaps —
+#     W-WIDTH (COLS pinned to 80) and W-NOCOLOR (empty NO_COLOR ignored). The other
+#     new visual guards (W-AGE/W-WARN/W-INFO/W-BOLD/W-SYSDIM) already pass on the
+#     styled tree — they are regression guards, green from the start.
+# After the fix, the DEFAULT run (no PROOF_EXPECT_RED) is all-green.
+EXPECTED_RED="${PROOF_EXPECT_RED_SET:-W-WIDTH W-NOCOLOR}"
 if [ "${PROOF_EXPECT_RED:-0}" = 1 ]; then
   want="$(printf '%s\n' $EXPECTED_RED | sort)"
   got="$(printf '%s\n' $RED_NAMES | sort)"

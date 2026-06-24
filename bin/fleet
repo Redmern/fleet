@@ -1738,7 +1738,7 @@ fmt_age() {
 # the override to 'always' (its stdout is the PIPE into `less -R`, not a tty) or
 # 'never' (cat), so color reaches less -R yet never a pipe/redirect/cat sink.
 inbox_color_on() {
-  [ -n "${NO_COLOR:-}" ] && return 1
+  [ -n "${NO_COLOR+x}" ] && return 1   # no-color.org: honor it PRESENT, any value (incl. empty)
   case "${FLEET_INBOX_COLOR:-auto}" in
     always|1|yes) return 0 ;;
     never|0|no)   return 1 ;;
@@ -1756,7 +1756,10 @@ inbox_list() { # NON-DESTRUCTIVE peek: titles newest-first. Every live msg is un
   inbox_color_on && C=1
   if [ "$C" = 1 ]; then reset=$'\033[0m'; dim=$'\033[2m'; fi
   now=$(date +%s 2>/dev/null) || now=0
-  COLS="${COLUMNS:-80}"; case "$COLS" in *[!0-9]*|'') COLS=80 ;; esac
+  # Real terminal width, mirroring the dash (which reads tput cols / stty size).
+  # $COLUMNS is a bash var NOT exported to this child process, so fall back to
+  # `tput cols` (fail-silent → 80) instead of pinning every terminal to 80.
+  COLS="${COLUMNS:-$(tput cols 2>/dev/null || echo 80)}"; case "$COLS" in *[!0-9]*|'') COLS=80 ;; esac
   fixed=$((5 + SEVW + FROMW + AGEW)); LW=$((COLS - fixed)); [ "$LW" -lt 8 ] && LW=8
   while IFS= read -r f; do
     [ -e "$f" ] || continue
@@ -1779,7 +1782,10 @@ inbox_list() { # NON-DESTRUCTIVE peek: titles newest-first. Every live msg is un
     else
       fromtxt=$(printf '%-*.*s' "$FROMW" "$FROMW" "$from")
     fi
-    titletxt=$(printf '%-*.*s' "$LW" "$LW" "$title")   # default weight (the payload)
+    # default weight (the payload). KNOWN LIMITATION: %-*.*s counts BYTES, so a
+    # multibyte/wide-glyph title shifts the age column; matching the dash, we accept
+    # byte-width here rather than carry wcwidth machinery into bash.
+    titletxt=$(printf '%-*.*s' "$LW" "$LW" "$title")
     if [ "$C" = 1 ]; then
       agetxt=$(printf '%s%*s%s' "$dim" "$AGEW" "$age" "$reset")
     else
@@ -1817,7 +1823,9 @@ inbox_read() { # [id|all] — show full bodies newest-first (pure display, no ar
     printf '%s──%s %s[%s]%s %s%s\n' "$dim" "$reset" "$sevc" "$sev" "$reset" "$from" "$disptag"
     # header 2: dim ts, then the ONE bright anchor — bold title (reset before body).
     printf '   %s%s%s  %s%s%s\n\n' "$dim" "$ts" "$reset" "$bold" "$title" "$reset"
-    inbox_body "$f"; printf '\n'   # body VERBATIM — never re-colored (may hold its own escapes)
+    inbox_body "$f"                # body VERBATIM — never re-colored (may hold its own escapes)
+    [ "$C" = 1 ] && printf '%s' "$reset"   # contain a misbehaving body's dangling SGR (must-fix #3)
+    printf '\n'
   done <<< "$files"
 }
 
