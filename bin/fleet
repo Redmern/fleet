@@ -438,6 +438,22 @@ cmd_new_project() { # interactive TTY wizard: create a new project dir + bare re
   mkdir -p "$pdir" 2>/dev/null || { echo "fleet: cannot create $pdir" >&2; return 0; }
   [ -w "$pdir" ] || { echo "fleet: $pdir is not writable" >&2; return 0; }
 
+  # Project name is the dir basename (sanitized) and keys projects/<name>.yml.
+  # Validate it BEFORE seeding any repos so a doomed project leaves no half-built
+  # tree. Refuse: an empty/whitespace-only name, the reserved sentinel
+  # (__fleet_new__ would forge a picker row that re-launches the wizard), and a
+  # name clash (two dirs sharing a basename must not clobber the first pointer).
+  local name; name=$(basename "$pdir" | tr -cd 'a-zA-Z0-9_-')
+  if [ -z "$name" ] || [ "$name" = "__fleet_new__" ]; then
+    echo "fleet: '$name' is not a usable project name — pick another directory" >&2
+    return 0
+  fi
+  local yml="$CONF_DIR/projects/$name.yml"
+  if [ -e "$yml" ]; then
+    echo "fleet: project $name already exists — pick another directory/name" >&2
+    return 0
+  fi
+
   local repo created=0
   while :; do
     read -e -p "add repository (name, empty to finish): " repo || break
@@ -450,11 +466,10 @@ cmd_new_project() { # interactive TTY wizard: create a new project dir + bare re
   done
 
   # Write the project yml inline (filename is the key cmd_up reads; name: is
-  # cosmetic). Contract $HOME to ~ for portability, matching cmd_save.
-  local name; name=$(basename "$pdir" | tr -cd 'a-zA-Z0-9_-')
-  [ -n "$name" ] || name="project"
+  # cosmetic). Name was validated + clash-checked above. Contract $HOME to ~ for
+  # portability, matching cmd_save.
   mkdir -p "$CONF_DIR/projects" 2>/dev/null || true
-  local yml="$CONF_DIR/projects/$name.yml" rootc="${pdir/#$HOME/\~}"
+  local rootc="${pdir/#$HOME/\~}"
   printf 'name: %s\nroot: %s\n' "$name" "$rootc" > "$yml" 2>/dev/null \
     || echo "fleet: could not write $yml" >&2
   echo "created project '$name' -> $rootc ($created repo(s))"
