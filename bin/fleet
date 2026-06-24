@@ -125,6 +125,27 @@ resolve_repo() { # resolve_repo <root> <name> → path
   return 1
 }
 
+new_bare_repo() { # new_bare_repo <root> <repo> — create a SEEDED bare container
+  # Builds the on-disk shape of fleet's real bare repos: <root>/<repo>/.git is a
+  # bare repo with refs/heads/main pointing at an empty root commit and HEAD
+  # symbolic-ref'd to it. The seed is load-bearing — without a real `main` ref the
+  # first `fleet new` dies on `git worktree add ... main` → "invalid reference: main".
+  # Fail-silent: any step failing backs out and returns non-zero.
+  local root="$1" repo="$2"
+  local gitdir="$root/$repo/.git"
+  mkdir -p "$root/$repo" 2>/dev/null || return 1
+  git init --bare "$gitdir" >/dev/null 2>&1 || return 1
+  local tree commit
+  tree=$(git --git-dir="$gitdir" hash-object -t tree /dev/null 2>/dev/null) || { rm -rf "$root/$repo" 2>/dev/null; return 1; }
+  commit=$(GIT_AUTHOR_NAME=fleet GIT_AUTHOR_EMAIL=fleet@localhost \
+           GIT_COMMITTER_NAME=fleet GIT_COMMITTER_EMAIL=fleet@localhost \
+           git --git-dir="$gitdir" commit-tree "$tree" -m "init $repo" 2>/dev/null) \
+    || { rm -rf "$root/$repo" 2>/dev/null; return 1; }
+  git --git-dir="$gitdir" update-ref refs/heads/main "$commit" 2>/dev/null || { rm -rf "$root/$repo" 2>/dev/null; return 1; }
+  git --git-dir="$gitdir" symbolic-ref HEAD refs/heads/main 2>/dev/null || { rm -rf "$root/$repo" 2>/dev/null; return 1; }
+  return 0
+}
+
 agent_label() { # last two path components
   local p="$1"; p="${p%/}"
   local b="${p##*/}" parent="${p%/*}"
@@ -373,29 +394,91 @@ cmd_pick_project() { # fzf picker over saved projects -> fleet up <name> (bare `
   command -v fzf >/dev/null || { print_usage; return 0; }
   local dir="$CONF_DIR/projects" ymls=()
   [ -d "$dir" ] && ymls=("$dir"/*.yml)
-  # zero saved projects: friendly hint + usage, never an empty fzf.
-  if [ ${#ymls[@]} -eq 0 ] || [ ! -e "${ymls[0]}" ]; then
-    echo "no saved projects yet — run 'fleet save <name>' inside a session"
-    echo
-    print_usage
-    return 0
-  fi
+  # Sentinel row first (yellow), present even with zero saved projects, so the
+  # picker is never empty and "create new project" is always reachable.
   local rows="" f nm root
-  for f in "${ymls[@]}"; do
-    [ -f "$f" ] || continue
-    nm=$(basename "$f" .yml)
-    root=$(awk -F': *' '$1=="root"{print $2; exit}' "$f")
-    if tmux has-session -t "=$nm" 2>/dev/null; then
-      rows+=$(printf '%s\t\033[32m●\033[0m %-18s %s  \033[32m(running)\033[0m' "$nm" "$nm" "$root")$'\n'
-    else
-      rows+=$(printf '%s\t  %-18s %s' "$nm" "$nm" "$root")$'\n'
-    fi
-  done
+  rows+=$(printf '%s\t\033[33m＋ create new project\033[0m' '__fleet_new__')$'\n'
+  if [ ${#ymls[@]} -gt 0 ] && [ -e "${ymls[0]}" ]; then
+    for f in "${ymls[@]}"; do
+      [ -f "$f" ] || continue
+      nm=$(basename "$f" .yml)
+      root=$(awk -F': *' '$1=="root"{print $2; exit}' "$f")
+      if tmux has-session -t "=$nm" 2>/dev/null; then
+        rows+=$(printf '%s\t\033[32m●\033[0m %-18s %s  \033[32m(running)\033[0m' "$nm" "$nm" "$root")$'\n'
+      else
+        rows+=$(printf '%s\t  %-18s %s' "$nm" "$nm" "$root")$'\n'
+      fi
+    done
+  fi
   local choice
   choice=$(printf '%s' "$rows" | fzf --ansi --delimiter='\t' --with-nth=2 \
             --no-sort --prompt='project> ' --height=100% --border=rounded) || return 0
   [ -n "$choice" ] || return 0
-  cmd_up "$(printf '%s' "$choice" | cut -f1)"
+  local field1; field1=$(printf '%s' "$choice" | cut -f1)
+  if [ "$field1" = "__fleet_new__" ]; then cmd_new_project; else cmd_up "$field1"; fi
+}
+
+cmd_new_project() { # interactive TTY wizard: create a new project dir + bare repos, then boot it
+  # Prompts (via read -e) for a project dir and an add-repo loop, seeds each repo
+  # with new_bare_repo, writes projects/<name>.yml inline (NOT cmd_save, which is
+  # coupled to a live @fleet_root), then boots via cmd_up. Fail-silent: a bad/
+  # unwritable path or a cancelled prompt backs out cleanly without erroring.
+  # Non-interactive callers (piped stdin/stdout, e.g. the proof harness) create
+  # the project but skip the tmux boot.
+  local pdir
+  read -e -p "project directory: " pdir || return 0
+  [ -n "$pdir" ] || { echo "fleet: cancelled (no directory)"; return 0; }
+  pdir="${pdir/#\~/$HOME}"
+  pdir=$(readlink -m "$pdir" 2>/dev/null || echo "$pdir")
+  if [ -e "$pdir" ] && [ -n "$(ls -A "$pdir" 2>/dev/null)" ]; then
+    local ans
+    read -e -p "directory exists and is non-empty — use it anyway? [y/N] " ans || return 0
+    case "$ans" in y|Y|yes|YES) ;; *) echo "fleet: cancelled"; return 0 ;; esac
+  fi
+  mkdir -p "$pdir" 2>/dev/null || { echo "fleet: cannot create $pdir" >&2; return 0; }
+  [ -w "$pdir" ] || { echo "fleet: $pdir is not writable" >&2; return 0; }
+
+  # Project name is the dir basename (sanitized) and keys projects/<name>.yml.
+  # Validate it BEFORE seeding any repos so a doomed project leaves no half-built
+  # tree. Refuse: an empty/whitespace-only name, the reserved sentinel
+  # (__fleet_new__ would forge a picker row that re-launches the wizard), and a
+  # name clash (two dirs sharing a basename must not clobber the first pointer).
+  local name; name=$(basename "$pdir" | tr -cd 'a-zA-Z0-9_-')
+  if [ -z "$name" ] || [ "$name" = "__fleet_new__" ]; then
+    echo "fleet: '$name' is not a usable project name — pick another directory" >&2
+    return 0
+  fi
+  local yml="$CONF_DIR/projects/$name.yml"
+  if [ -e "$yml" ]; then
+    echo "fleet: project $name already exists — pick another directory/name" >&2
+    return 0
+  fi
+
+  local repo created=0
+  while :; do
+    read -e -p "add repository (name, empty to finish): " repo || break
+    [ -n "$repo" ] || break
+    repo=$(printf '%s' "$repo" | tr -cd 'a-zA-Z0-9_.-')
+    if [ -z "$repo" ]; then echo "  invalid name, skipped"; continue; fi
+    [ -e "$pdir/$repo" ] && { echo "  '$repo' already exists, skipped"; continue; }
+    if new_bare_repo "$pdir" "$repo"; then echo "  created repo '$repo'"; created=$((created+1));
+    else echo "  failed to create '$repo'"; fi
+  done
+
+  # Write the project yml inline (filename is the key cmd_up reads; name: is
+  # cosmetic). Name was validated + clash-checked above. Contract $HOME to ~ for
+  # portability, matching cmd_save.
+  mkdir -p "$CONF_DIR/projects" 2>/dev/null || true
+  local rootc="${pdir/#$HOME/\~}"
+  printf 'name: %s\nroot: %s\n' "$name" "$rootc" > "$yml" 2>/dev/null \
+    || echo "fleet: could not write $yml" >&2
+  echo "created project '$name' -> $rootc ($created repo(s))"
+
+  if [ -t 0 ] && [ -t 1 ]; then
+    cmd_up "$name"
+  else
+    echo "  (non-interactive: skipped boot — run 'fleet up $name')"
+  fi
 }
 
 # ---- repos / branches (used by the dashboard new-agent form) ------------------
@@ -4076,6 +4159,7 @@ case "${1:-}" in
   up)      shift; cmd_up "$@" ;;
   save)    shift; cmd_save "$@" ;;
   new)     shift; cmd_new "$@" ;;
+  new-project) shift; cmd_new_project "$@" ;;
   ls)      shift; cmd_ls "$@" ;;
   agents)  shift; agents_tsv "$@" ;;   # raw TSV, consumed by fleet-dash
   repos)    shift; cmd_repos "$@" ;;     # repo names, for the new-agent form
