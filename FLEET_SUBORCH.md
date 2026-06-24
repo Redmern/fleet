@@ -161,8 +161,14 @@ spawn each role:
 
 ```
 research → gate1-wait → impl → test → gate2-wait → done
-# e.g.  meta_set .fleet/dispatch/<id>/meta.tsv role-phase impl
+# upsert the cursor by appending a tab-separated line (last-wins, like §6's state write):
+printf 'role-phase\t%s\n' impl >> .fleet/dispatch/<id>/meta.tsv
 ```
+
+`meta_get`/`meta_set` are **internal `bin/fleet` functions, not CLI verbs** — you cannot
+call them from your shell. The ledger is a plain tab-separated file; write it directly. A
+plain append is safe because `meta_get` reads **last-wins** and `fleet reconcile` compacts
+stacked keys before reading state.
 
 On respawn, read `role-phase` (fast path) **and cross-check the artifacts on disk** as the
 truth (`_reports/<slug>/SYNTHESIS.md` present ⇒ research done; `TEST-VERDICT.md` present ⇒
