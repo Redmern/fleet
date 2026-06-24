@@ -534,11 +534,15 @@ scratch_wname() { # <sess> <label> -> a window name not already open in the sess
   printf '%s' "$name"
 }
 
-persist_agent() { # session dir repo branch bare base harness [self_merge]
+persist_agent() { # session dir repo branch bare base harness [self_merge] [wname] [owner]
   local sess="$1" f; f=$(agents_file "$sess"); mkdir -p "$(dirname "$f")" 2>/dev/null
   [ -f "$f" ] && { awk -F'\t' -v d="$2" '$1!=d' "$f" >"$f.tmp" 2>/dev/null && mv "$f.tmp" "$f"; }
-  # Trailing self_merge field is optional: legacy 6-field lines read back as "0".
-  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$2" "$3" "$4" "$5" "$6" "${7:-claude}" "${8:-0}" >>"$f"
+  # Trailing fields are optional, read back empty on legacy lines: self_merge (col 7,
+  # legacy 6-field → "0"), wname (col 8) and owner (col 9). wname is the FINAL window
+  # name as cmd_new chose it (carries the d<N>- prefix for a sub-orch-owned worker);
+  # owner is the bare so-d<N> @fleet_owner stamp. cmd_restore matches by wname and
+  # re-applies owner so a d<N>-prefixed worker round-trips instead of duplicate/orphan.
+  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$2" "$3" "$4" "$5" "$6" "${7:-claude}" "${8:-0}" "${9:-}" "${10:-}" >>"$f"
 }
 
 cmd_forget() { # forget <dir> — drop a saved agent (called by the dashboard on teardown)
@@ -702,13 +706,17 @@ cmd_restore() { # respawn saved agents whose windows are gone
   # match by window name (<repo>/<branchdir>, as cmd_new names them) — precise,
   # unlike pane cwd which the dashboard/other panes can share.
   local openwins; openwins=$(tmux list-windows -t "$sess" -F '#{window_name}' 2>/dev/null)
-  local dir repo branch bare base harness n=0
+  local dir repo branch bare base harness self_merge wname owner n=0
   # Translate field-separating TABs to US (\037) so `read` with a NON-whitespace
   # IFS preserves EMPTY columns (e.g. an empty base, col 5). `IFS=$'\t' read`
   # collapses tab runs and drops empties, shifting every later field one left.
-  while IFS=$'\037' read -r dir repo branch bare base harness self_merge; do
+  while IFS=$'\037' read -r dir repo branch bare base harness self_merge wname owner; do
     [ -n "$dir" ] && [ -n "$repo" ] && [ -n "$branch" ] || continue
-    printf '%s\n' "$openwins" | grep -qxF "$repo/${branch//\//_}" && continue   # already running
+    # Match by the PERSISTED final window name (carries a d<N>- prefix for a
+    # sub-orch-owned worker); fall back to the legacy reconstruction for pre-upgrade
+    # 7-field lines. Without this a d<N>-prefixed window never matches → duplicate respawn.
+    local matchname="${wname:-$repo/${branch//\//_}}"
+    printf '%s\n' "$openwins" | grep -qxF "$matchname" && continue   # already running
     local args=("$repo" "$branch")
     [ "$bare" = 1 ] && args+=(--bare)
     [ -n "$base" ] && args+=(--base "$base")
@@ -716,8 +724,15 @@ cmd_restore() { # respawn saved agents whose windows are gone
     # Re-apply the EXACT persisted grant explicitly (default is now 1, and a
     # project marker could flip it) so a restored agent keeps what it had.
     if [ "$self_merge" = 1 ]; then args+=(--self-merge); else args+=(--no-self-merge); fi
-    echo "restoring $repo/$branch..."
-    cmd_new "${args[@]}" >/dev/null 2>&1 && n=$((n+1))
+    echo "restoring $matchname..."
+    # Re-export the saved bare owner so cmd_new re-derives the d<N>- window prefix AND
+    # re-stamps @fleet_owner — restore runs in main with no FLEET_SUBORCH_ID, so without
+    # this the worker comes back un-prefixed AND un-owned (orphaned out of its card).
+    if [ -n "$owner" ]; then
+      FLEET_SUBORCH_ID="$owner" cmd_new "${args[@]}" >/dev/null 2>&1 && n=$((n+1))
+    else
+      cmd_new "${args[@]}" >/dev/null 2>&1 && n=$((n+1))
+    fi
   done < <(tr '\t' '\037' <"$f")
   echo "restored $n agent(s)"
 }
@@ -832,6 +847,21 @@ cmd_new() {
       local _excl="$_common/info/exclude"
       grep -qxF '/.fleet/' "$_excl" 2>/dev/null || printf '/.fleet/\n' >>"$_excl" 2>/dev/null || true
     fi
+  fi
+
+  # OWNER + WORKER-PREFIX (Phase B / d<N> naming). A worker spawned BY a sub-orch
+  # inherits FLEET_SUBORCH_ID in its env and is NOT the sub-orch itself
+  # (FLEET_NEW_SUBORCH_ID, set only when resolve_or_spawn_suborch spawns the sub-orch,
+  # is unset here) — same gate the @fleet_owner stamp uses below. FLEET_SUBORCH_ID is
+  # the IMMUTABLE bare so-d<N> (frozen in env; `dispatch rename` never mutates it), so:
+  #   * _owner stays the bare so-d<N> — the stable identity every consumer keys on;
+  #   * the window NAME gains a visible d<N>- prefix so workers group under their
+  #     sub-orch in the window list (display-only — owner/routing are unaffected).
+  local _owner=""
+  if [ -n "${FLEET_SUBORCH_ID:-}" ] && [ -z "${FLEET_NEW_SUBORCH_ID:-}" ]; then
+    _owner="$FLEET_SUBORCH_ID"
+    local _did="${FLEET_SUBORCH_ID#so-}"; _did="${_did%%-*}"   # so-d11[-slug] -> d11
+    case "$_did" in d[0-9]*) wname="$_did-$wname" ;; esac       # d11-<repo>/<branchdir>
   fi
 
   local hbin
@@ -965,7 +995,7 @@ cmd_new() {
     tmux select-window -t "$win_id" 2>/dev/null || true
   fi
   # scratch agents are repo-less + ephemeral — nothing to restore, so don't persist.
-  [ "$scratch" = 1 ] || persist_agent "$sess" "$dir" "$(basename "$repo_base")" "$branch" "$bare" "$base" "$H_NAME" "$self_merge"
+  [ "$scratch" = 1 ] || persist_agent "$sess" "$dir" "$(basename "$repo_base")" "$branch" "$bare" "$base" "$H_NAME" "$self_merge" "$wname" "$_owner"
   sync_main_tiles "$sess" 2>/dev/null || true
 }
 
@@ -1005,6 +1035,22 @@ window_pane_for() { # <wname> -> pane_id, or rc 1
   while IFS=$'\t' read -r s w pane; do
     { [ "$s" = "$sess" ] || [ "$s" = "${sess}_hidden" ]; } || continue
     [ "$w" = "$wname" ] && { printf '%s' "$pane"; return 0; }
+  done < <(tmux list-panes -a -F $'#{session_name}\t#{window_name}\t#{pane_id}' 2>/dev/null)
+  return 1
+}
+
+# Like window_pane_for, but PREFIX-TOLERANT for a sub-orch owner. The @fleet_owner stamp
+# is the IMMUTABLE bare so-d<N> (frozen env), while the live window may have been renamed
+# to so-d<N>-<slug> by `dispatch rename` (display-only). Match a window whose name == owner
+# OR starts with "owner-" — the trailing dash is load-bearing: it stops so-d1 matching
+# so-d11 (so-d11 does not start with "so-d1-"). Hidden-session-aware like window_pane_for.
+suborch_pane_for() { # <owner-bare-name> -> pane_id, or rc 1
+  local owner="${1:-}" sess s w pane
+  [ -n "$owner" ] || return 1
+  sess=$(session_name 2>/dev/null) || return 1; [ -n "$sess" ] || return 1
+  while IFS=$'\t' read -r s w pane; do
+    { [ "$s" = "$sess" ] || [ "$s" = "${sess}_hidden" ]; } || continue
+    case "$w" in "$owner"|"$owner"-*) printf '%s' "$pane"; return 0 ;; esac
   done < <(tmux list-panes -a -F $'#{session_name}\t#{window_name}\t#{pane_id}' 2>/dev/null)
   return 1
 }
@@ -1308,7 +1354,10 @@ suborch_live() { # <dispatch-dir> <sess> <wname>
 resolve_or_spawn_suborch() { # <sess> <wname> <id> <root>
   local sess="$1" wname="$2" id="$3" root="$4" led="$root/.fleet/dispatch"
   local d="$led/$id"
-  acquire_lock "$led/.spawnlock-$wname" || return 1
+  # Lock on the IMMUTABLE id, not the window name: the name gains a -<slug> on
+  # `dispatch rename`, and an id-keyed lock stays stable across that rename so the
+  # rename verb's check-and-adopt can take the SAME lock and never race a reconcile spawn.
+  acquire_lock "$led/.spawnlock-$id" || return 1
   if suborch_live "$d" "$sess" "$wname"; then
     : # already up, harness alive — idempotent no-op (replay/reconcile-safe)
   else
@@ -1328,7 +1377,7 @@ DISPATCH ID: $id"
     local wid; wid=$(cat "$widf" 2>/dev/null); rm -f "$widf" 2>/dev/null
     [ -n "$wid" ] && meta_set "$d" window_id "$wid"
   fi
-  release_lock "$led/.spawnlock-$wname"
+  release_lock "$led/.spawnlock-$id"
 }
 
 # ---- dispatch MODE (the dispatch-everything front door classifier) ------------
@@ -1379,15 +1428,16 @@ cmd_dispatch_classify() {
 
 # `fleet dispatch <id>` — deterministic spawn, no LLM. Also fans out to the
 # enable/disable/status/mode verbs (the opt-in hook installer + front-door mode).
-cmd_dispatch() { # dispatch <id> | enable | disable | status | mode [sigil|all|off]
+cmd_dispatch() { # dispatch <id> | enable | disable | status | rename <id> <slug> | mode [sigil|all|off]
   case "${1:-}" in
     enable)  shift; dispatch_enable  "$@"; return $? ;;
     disable) shift; dispatch_disable "$@"; return $? ;;
     status)  shift; dispatch_status  "$@"; return $? ;;
+    rename)  shift; cmd_dispatch_rename "$@"; return $? ;;
     mode)    shift; if [ $# -eq 0 ]; then dispatch_mode_get; echo; return 0; else dispatch_mode_set "$1"; return $?; fi ;;
   esac
   local id="${1:-}"
-  [ -n "$id" ] || die "usage: fleet dispatch <id> | enable | disable | status"
+  [ -n "$id" ] || die "usage: fleet dispatch <id> | enable | disable | status | rename <id> <slug>"
   local sess root led wname
   sess=$(session_name) || die "not inside tmux"
   root=$(fleet_root)   || die "not inside tmux"
@@ -1398,6 +1448,29 @@ cmd_dispatch() { # dispatch <id> | enable | disable | status | mode [sigil|all|o
   meta_set "$led" window "$wname"
   meta_set "$led" state planning
   echo "dispatched $id → $wname"
+}
+
+# `fleet dispatch rename <id> <slug text...>` — the sub-orch renames its OWN window +
+# card from the bare so-<id> to so-<id>-<slug> AFTER it classifies, BEFORE it spawns any
+# worker. DISPLAY-ONLY: the owner identity stays the bare so-<id> (frozen in the pane's
+# env; rename-window never mutates pane env), so there is NO @fleet_owner re-stamp — the
+# workers this sub-orch spawns next still group + route under the bare id. Runs under the
+# SAME per-id spawn lock so a rename can't race a reconcile spawn. Empty slug ⇒ no-op
+# (stays so-<id>, today's behaviour) → advisory, never a regression if skipped.
+cmd_dispatch_rename() {
+  local id="${1:-}"; [ -n "$id" ] && [ $# -gt 0 ] && shift || die "usage: fleet dispatch rename <id> <slug text...>"
+  local text="$*"
+  local root led d; root=$(fleet_root) || die "not inside tmux"
+  led="$root/.fleet/dispatch"; d="$led/$id"
+  [ -d "$d" ] || die "no such dispatch $id"
+  local slug; slug=$(suborch_slug "$text")
+  [ -n "$slug" ] || { echo "rename $id: empty slug — keeping so-$id"; return 0; }
+  acquire_lock "$led/.spawnlock-$id" || return 1
+  local wid new; wid=$(meta_get "$d" window_id); new="so-$id-$slug"
+  [ -n "$wid" ] && tmux rename-window -t "$wid" "$new" 2>/dev/null || true
+  meta_set "$d" window "$new"   # forward name resolution for gate_waiting/reconcile/reap-skip
+  release_lock "$led/.spawnlock-$id"
+  echo "renamed $id → $new"
 }
 
 # `fleet dispatch-alloc` (internal, called by the hook): allocate an id, create its
@@ -1528,7 +1601,11 @@ gate_waiting() {
   for d in "$led"/d*/; do
     [ -d "$d" ] || continue
     id=$(basename "$d"); st=$(meta_get "$d" state)
-    case "$st" in gate1-wait|gate2-wait) printf 'so-%s\n' "$id" ;; esac
+    # Emit the LIVE window name (meta window, slugged by `dispatch rename`), fallback
+    # bare so-$id — so the reap-skip match (cmd_reap, by live window name) hits a renamed
+    # parked sub-orch instead of tearing it down and orphaning its gate message.
+    local wn; wn=$(meta_get "$d" window); [ -n "$wn" ] || wn="so-$id"
+    case "$st" in gate1-wait|gate2-wait) printf '%s\n' "$wn" ;; esac
   done
 }
 
@@ -1547,8 +1624,12 @@ cmd_reconcile() {
     meta_compact "$d"   # collapse legacy stacked meta.tsv before reading state
     state=$(meta_get "$d" state)
     case "$state" in done|failed|cancelled) continue ;; esac
-    if ! suborch_live "$d" "$sess" "so-$id"; then
-      resolve_or_spawn_suborch "$sess" "so-$id" "$id" "$root"
+    # Resolve the LIVE window name (slugged by `dispatch rename`), fallback bare so-$id —
+    # so the name-search liveness fallback (suborch_find_wid, used when no window_id was
+    # captured) finds a renamed window instead of false-dead → double-spawn.
+    local wn; wn=$(meta_get "$d" window); [ -n "$wn" ] || wn="so-$id"
+    if ! suborch_live "$d" "$sess" "$wn"; then
+      resolve_or_spawn_suborch "$sess" "$wn" "$id" "$root"
     fi
   done
 }
@@ -1561,6 +1642,23 @@ cmd_slug() {
   s=$(printf '%s' "$s" | tr '[:upper:]' '[:lower:]' \
       | sed 's/[^a-z0-9]\+/-/g; s/^-\+//; s/-\+$//')
   printf '%s\n' "${s:-task}"
+}
+
+# `suborch_slug <text...>` — the DISPLAY slug appended to a sub-orch's so-d<N> window/card
+# on `dispatch rename`. Kebab core (lower, [^a-z0-9]+→-, trimmed) then a length cap (≤28
+# chars; the so-d<N>- prefix is excluded from the cap) with a trailing partial word
+# dropped. Output is [a-z0-9-] only → safe to interpolate into tmux rename-window/printf.
+# Unlike cmd_slug there is NO "task" fallback: empty/all-punctuation input ⇒ "" so the
+# rename verb leaves the bare so-d<N> name untouched.
+suborch_slug() {
+  local s; s=$(printf '%s' "$*" | tr '[:upper:]' '[:lower:]' \
+      | sed 's/[^a-z0-9]\+/-/g; s/^-\+//; s/-\+$//')
+  if [ "${#s}" -gt 28 ]; then
+    s="${s:0:28}"
+    case "$s" in *-*) s="${s%-*}" ;; esac   # drop the partial trailing word the cut left
+  fi
+  s="${s%-}"                                 # never a trailing '-'
+  printf '%s' "$s"
 }
 
 # Strict POSITIVE-whitelist input classifier (§6.1a). Emits an in-band-eligible
@@ -2012,7 +2110,10 @@ inbox_route() { # route <from> [owner]
   # auto-submit (revive != resume: never auto-submit into a respawned amnesiac orch).
   case "$owner" in
     so-*)
-      sp=$(window_pane_for "$owner" 2>/dev/null)
+      # PREFIX-TOLERANT: owner is the bare so-d<N>, but the live window may now be
+      # so-d<N>-<slug> after `dispatch rename`. suborch_pane_for matches either, so a
+      # worker owned by the bare id still auto-submits back to the renamed sub-orch.
+      sp=$(suborch_pane_for "$owner" 2>/dev/null)
       [ -n "$sp" ] && { printf 'dest=suborch submit=1 pane=%s\n' "$sp"; return 0; }
       ;;
   esac
