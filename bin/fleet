@@ -1985,7 +1985,15 @@ inbox_paste_to() { # <pane> <file> <submit 0|1>
     && tmux paste-buffer -t "$pane" -b fleet-inbox-pop -p -d 2>/dev/null \
     || { tmux display-message "paste failed — nothing changed" 2>/dev/null; return 1; }
   if [ "$submit" = 1 ]; then
-    tmux send-keys -t "$pane" C-m 2>/dev/null || true
+    # AUTO-SUBMIT must land AFTER the bracketed-paste block flushes into the TUI. Firing
+    # C-m in THIS same send-keys flush races the paste — the Enter is swallowed mid-paste
+    # and the message pastes but never submits (the whole bug this guards). Fix: DECOUPLE
+    # the Enter onto tmux's own deferred event loop via a backgrounded run-shell, so it
+    # fires only after the current paste settles — no blocking sleep (fleet stays sleepless
+    # + fail-silent). The decoupling alone is what fixes it (empirically reliable even at a
+    # ~0s delay); the small default delay is load headroom, overridable via the env knob.
+    tmux run-shell -b -d "${FLEET_POP_SUBMIT_DELAY:-0.4}" \
+      "tmux send-keys -t $pane Enter" 2>/dev/null || true
   else
     # PHASE A re-dispatch guard. A submit=0 paste ALWAYS targets the human MAIN pane
     # (a sub-orch dest is the only submit=1 case) and leaves text the human will submit
