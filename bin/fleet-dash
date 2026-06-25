@@ -863,7 +863,15 @@ render() {
   # title carries the cross-agent unread summary (replaces the removed status badge):
   # '✉<total>' and, when any are warn/blocked, '⚠<count>'. Rendered only when >0 so
   # it costs zero width when everything is read.
-  local title="FLEET · $SESS · $N agent$([ "$N" = 1 ] || echo s)"
+  # dispatch-mode (secondary surface): cheap guarded read of .fleet/dispatch-mode,
+  # mode-only (no hook marker — that lives on the status-bar pill). Fail-silent:
+  # missing/garbage -> 'sigil'. Auto-updates within the ~1s refresh.
+  local dm=''; [ -r "$(dash_root)/.fleet/dispatch-mode" ] && dm=$(<"$(dash_root)/.fleet/dispatch-mode") 2>/dev/null
+  # canonical trim (MUST match dispatch_mode_get / fleetd .strip()): surrounding
+  # whitespace + \r, so a hand-edited/CRLF valid word agrees across all readers.
+  dm="${dm#"${dm%%[![:space:]]*}"}"; dm="${dm%"${dm##*[![:space:]]}"}"
+  case "$dm" in all|off|sigil) ;; *) dm=sigil ;; esac
+  local title="FLEET · $SESS · $N agent$([ "$N" = 1 ] || echo s) · d:$dm"
   (( IBX_TOTAL > 0 )) && { title+=" · ✉$IBX_TOTAL"; (( IBX_WARN > 0 )) && title+=" ⚠$IBX_WARN"; }
   printf '\033[2m%s\033[0m\033[K\n' \
     "$(hrule '╭' '╮' "$inner" "$title")"
