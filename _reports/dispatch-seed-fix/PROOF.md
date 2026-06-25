@@ -111,3 +111,48 @@ GATE 1 = BUILD: **PASS**. All three co-shipping items + cleanup land; the sub-or
 spawns with the manual available and reads manual+instruction before acting (decisive);
 over-cap fails loudly; hidden session recreates; normal spawns unaffected. Throwaway
 session torn down; live `pc` untouched.
+
+---
+
+## Follow-up — env-prefix scoping tidy (post-test, non-blocking finding)
+
+Both testers PASS=DONE; one convergent non-blocking finding: in
+`resolve_or_spawn_suborch` the item-1 pointer comment was inserted **between** the
+`FLEET_*=…` line-continuations and `cmd_new`, severing the `\` continuation. The
+`FLEET_NEW_WID_FILE/FLEET_SESSION/FLEET_ROOT/FLEET_NEW_SUBORCH_ID` assignments
+degraded from a **command-scoped prefix** into leaked un-exported **globals** — benign
+today but fragile inside `cmd_reconcile`'s per-dispatch loop (where a leaked global is
+exactly where cross-dispatch bleed could hide).
+
+**FIX:** moved the pointer comment (plus an explicit NB) **above** the assignment
+block so the `FLEET_*=…` continuations flow straight into `cmd_new` with no intervening
+comment. Values/behaviour unchanged — scoping only. `bash -n bin/fleet` → SYNTAX OK.
+
+### RE-VERIFY 1 — vars no longer leak (scoping) — PASS
+Minimal harness reproducing both forms (`fake_cmd` prints the prefix vars; the caller
+prints them again after the call):
+```
+OLD (severed by comment):
+  in fake_cmd: SESSION='sess1' SUB='so-d1'
+  after OLD call, in scope: SESSION='sess1' SUB='so-d1'      <- LEAK: persist after call
+NEW (comment moved above):
+  in fake_cmd: SESSION='sess2' SUB='so-d2'
+  after NEW call, in scope: SESSION='sess1' SUB='so-d1'      <- sess2/so-d2 GONE: command-scoped
+```
+The severed form's vars survive the call (global leak); the fixed form's own values
+(`sess2`/`so-d2`) do not survive — they were scoped to the single `cmd_new` invocation.
+
+### RE-VERIFY 2 — real so-dN still spawns + reads the manual — PASS
+Fresh throwaway session `seedproof2`; `fleet dispatch d1`:
+```
+spawned so-d1 (claude) in window @158
+dispatched d1 → so-d1
+pinned window_id: '@158'   ;  pane: %161 claude
+```
+Sub-orch booted from the pointer, `Read 2 files`, and wrote:
+```
+MANUAL_FIRST_HEADING=Fleet — ephemeral sub-orchestrator manual
+INSTRUCTION_ID=d1
+```
+Manual+instruction read before acting; no behaviour change from the scoping tidy.
+Throwaway session torn down; live `pc` untouched.
