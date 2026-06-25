@@ -1166,6 +1166,10 @@ render_inbox() {
     local f id sev from title epoch age
     local sevtxt fromtxt titletxt agetxt content LW ageshow rowfrom fromc lblsgr
     for (( i=0; i<IN && drawn<slots; i++ )); do
+      # breathing room between messages (matches the dashboard's between-row spacing):
+      # a blank line before every row except the first, budget-permitting.
+      (( i > 0 )) && (( drawn < slots )) && { printf '\033[2m│%s│\033[0m\033[K\n' "$blank"; (( drawn++ )); }
+      (( drawn < slots )) || break
       f="${IROWS[$i]}"; id=$(basename "$f" .msg)
       sev=$(ibx_field "$f" sev); from=$(ibx_field "$f" from); title=$(ibx_field "$f" title)
       epoch="${id%%.*}"; case "$epoch" in *[!0-9]*|'') epoch=$now ;; esac
