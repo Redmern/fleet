@@ -1420,7 +1420,41 @@ dispatch_mode_set() {
   local f; f=$(dispatch_mode_file 2>/dev/null) || { echo "dispatch mode: no project root" >&2; return 1; }
   mkdir -p "$(dirname "$f")" 2>/dev/null
   printf '%s\n' "$m" > "$f" 2>/dev/null || { echo "dispatch mode: could not write $f" >&2; return 1; }
+  dispatch_pill_apply        # live-stamp the per-session status pill on every flip
   echo "dispatch mode: $m"
+}
+
+# Compact, colored status pill for the active dispatch mode (+ hook marker).
+# Pure string builder, fail-silent: bad/missing root -> 'sigil' pill, hook off.
+# Color is embedded so the global status-left format stays trivial; tmux
+# re-expands #[...] inside the expanded option value. (Mirrored, deliberately,
+# by fleetd's dispatch_pill() — keep the two in sync.)
+dispatch_pill() {
+  local m dwired droot dset
+  m=$(dispatch_mode_get 2>/dev/null); m="${m:-sigil}"
+  dwired=off
+  droot=$(fleet_root 2>/dev/null) && dset="$droot/.claude/settings.json" \
+    && [ -f "$dset" ] && grep -q fleet-dispatch "$dset" 2>/dev/null && dwired=on
+  local label col
+  case "$m" in
+    all)   label=ALL; col='fg=yellow,bold' ;;
+    off)   label=off; col='fg=colour244' ;;     # dim grey
+    *)     label=sig; col='fg=cyan' ;;          # sigil (default)
+  esac
+  # mode sigil/all is moot if the hook isn't wired -> loud red ! suffix
+  local mark=''
+  { [ "$m" = sigil ] || [ "$m" = all ]; } && [ "$dwired" = off ] && mark='#[fg=red,bold]!'
+  printf '#[%s]d:%s%s#[default]' "$col" "$label" "$mark"
+}
+
+# Stamp the per-session @fleet_dispatch option to the current pill and redraw the
+# status bar. Per-session (mirrors @fleet_root) so a global status-left format
+# renders each session's OWN mode -> no cross-session leak. Optional $1 = target
+# session (used to seed a session being set up); defaults to the current one.
+dispatch_pill_apply() {
+  local s; s="${1:-$(session_name 2>/dev/null)}"; [ -n "$s" ] || return 0
+  tmux set -t "$s" @fleet_dispatch "$(FLEET_SESSION="$s" dispatch_pill)" 2>/dev/null || true
+  tmux refresh-client -S 2>/dev/null || true
 }
 
 # `fleet dispatch-classify` — the single dispatch decision oracle, shared by the hook
@@ -2461,6 +2495,7 @@ with open(path, "w") as f:
     json.dump(s, f, indent=2); f.write("\n")
 print(f"  wired dispatch hook: {path}")
 PY
+  dispatch_pill_apply        # hook now wired -> clear any '!' marker on the pill
   echo "dispatch ENABLED for $root"
   echo "  hook:     $hookdst"
   echo "  settings: $settings"
@@ -2486,6 +2521,7 @@ with open(path, "w") as f:
     json.dump(s, f, indent=2); f.write("\n")
 print(f"  unwired dispatch hook: {path}")
 PY
+  dispatch_pill_apply        # hook now unwired -> show '!' marker on sigil/all
   echo "dispatch DISABLED for $root"
 }
 
@@ -3278,8 +3314,23 @@ inject_status_format() { # append agent glyph to window-status formats.
       *'#S'*) local inj="#{?@fleet_root,$ship ,}#S"; newfmt=${newfmt/'#S'/$inj} ;;
       *) ;;                                          # no #S token — fail-silent
     esac
+    # Dispatch-mode pill: inject a per-session-gated token right after the #S
+    # session-name token (same per-session trick as the ship — the #{?...} test
+    # evaluates per session, so each fleet session shows its OWN mode through the
+    # one global status-left). Gated on the data option @fleet_dispatch so a
+    # session that hasn't had the pill stamped yet simply renders nothing.
+    local dtok='#{?@fleet_dispatch, #{@fleet_dispatch},}'
+    case "$newfmt" in
+      *'@fleet_dispatch'*) ;;                                  # already injected
+      *'#S'*) newfmt=${newfmt/'#S'/#S$dtok} ;;                 # just right of the pill
+      *) ;;                                                    # no #S -> fail-silent
+    esac
     [ "$newfmt" != "$fmt" ] && tmux set -g status-left "$newfmt"
   fi
+  # Seed the per-session pill value so it shows immediately (and self-heals after
+  # a theme wipe). $1 = the session being set up (fleet up passes it).
+  local _s="${1:-}"; [ -n "$_s" ] || _s=$(session_name 2>/dev/null)
+  [ -n "$_s" ] && tmux set -t "$_s" @fleet_dispatch "$(FLEET_SESSION="$_s" dispatch_pill 2>/dev/null)" 2>/dev/null || true
 }
 
 # ---- keybinds -----------------------------------------------------------------

@@ -37,6 +37,30 @@ IDLE_FLAP_GUARD = 2.0
 SYNTH_STALE_AFTER = 45
 
 
+def dispatch_pill(root):
+    # Precomputed colored status pill for a project's dispatch mode (+ hook
+    # marker). Mirror of bin/fleet's dispatch_pill() — KEEP THE TWO IN SYNC.
+    # Fail-silent: missing/garbage mode file -> 'sigil'; missing settings -> off.
+    mode = "sigil"
+    try:
+        with open(os.path.join(root, ".fleet", "dispatch-mode")) as f:
+            m = f.read().strip()
+        if m in ("all", "off", "sigil"):
+            mode = m
+    except Exception:
+        pass
+    dwired = False
+    try:
+        with open(os.path.join(root, ".claude", "settings.json")) as f:
+            dwired = "fleet-dispatch" in f.read()
+    except Exception:
+        pass
+    label, col = {"all": ("ALL", "fg=yellow,bold"),
+                  "off": ("off", "fg=colour244")}.get(mode, ("sig", "fg=cyan"))
+    mark = "#[fg=red,bold]!" if mode in ("sigil", "all") and not dwired else ""
+    return "#[%s]d:%s%s#[default]" % (col, label, mark)
+
+
 def tmux(*args):
     try:
         out = subprocess.run(
@@ -247,8 +271,27 @@ class Fleet:
             new = left.replace("#{?@fleet_root,\U000f0b79 ,}", "")  # drop legacy prepend
             if ship not in new and "#S" in new:
                 new = new.replace("#S", "#{?@fleet_root," + ship + " ,}#S", 1)
+            # Dispatch-mode pill token: inject right after #S, gated per-session
+            # on @fleet_dispatch (mirror of inject_status_format in `bin/fleet`).
+            if "@fleet_dispatch" not in new and "#S" in new:
+                new = new.replace("#S", "#S#{?@fleet_dispatch, #{@fleet_dispatch},}", 1)
             if new != left:
                 tmux("set", "-g", "status-left", new)
+        self.heal_dispatch_pills()
+
+    def heal_dispatch_pills(self):
+        # Re-stamp each fleet session's @fleet_dispatch pill from its mode file so
+        # a hand-edited .fleet/dispatch-mode (or a wiped option) converges on the
+        # ~60s sweep. Per-session @fleet_root carries the project root.
+        out = tmux("list-sessions", "-F", "#{session_name}\t#{@fleet_root}")
+        if not out:
+            return
+        for line in out.splitlines():
+            parts = line.split("\t")
+            if len(parts) != 2 or not parts[1]:
+                continue
+            sess, root = parts
+            tmux("set", "-t", sess, "@fleet_dispatch", dispatch_pill(root))
 
     # ---- queries -----------------------------------------------------------
 
