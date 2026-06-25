@@ -1412,6 +1412,12 @@ THEN handle DISPATCH ID: $id — read your instruction at .fleet/dispatch/$id/in
 dispatch_mode_file() { local r; r=$(fleet_root 2>/dev/null) || return 1; printf '%s/.fleet/dispatch-mode' "$r"; }
 dispatch_mode_get() { # echo the active mode word (default sigil)
   local f m; f=$(dispatch_mode_file 2>/dev/null) && m=$(cat "$f" 2>/dev/null)
+  # Canonical normalisation (MUST match fleetd's str.strip() and the dash read):
+  # a hand-edited / dos-fileformat mode file may carry surrounding whitespace or a
+  # CRLF — strip leading+trailing whitespace incl \r so a VALID word still matches
+  # (else ' all'/'all\r' would silently fall through to sigil and the pill would
+  # disagree with the fleetd sweep). Fail-silent: anything else -> sigil.
+  m="${m#"${m%%[![:space:]]*}"}"; m="${m%"${m##*[![:space:]]}"}"
   case "$m" in all|off|sigil) printf '%s' "$m" ;; *) printf 'sigil' ;; esac
 }
 dispatch_mode_set() {

@@ -867,6 +867,9 @@ render() {
   # mode-only (no hook marker — that lives on the status-bar pill). Fail-silent:
   # missing/garbage -> 'sigil'. Auto-updates within the ~1s refresh.
   local dm=''; [ -r "$(dash_root)/.fleet/dispatch-mode" ] && dm=$(<"$(dash_root)/.fleet/dispatch-mode") 2>/dev/null
+  # canonical trim (MUST match dispatch_mode_get / fleetd .strip()): surrounding
+  # whitespace + \r, so a hand-edited/CRLF valid word agrees across all readers.
+  dm="${dm#"${dm%%[![:space:]]*}"}"; dm="${dm%"${dm##*[![:space:]]}"}"
   case "$dm" in all|off|sigil) ;; *) dm=sigil ;; esac
   local title="FLEET · $SESS · $N agent$([ "$N" = 1 ] || echo s) · d:$dm"
   (( IBX_TOTAL > 0 )) && { title+=" · ✉$IBX_TOTAL"; (( IBX_WARN > 0 )) && title+=" ⚠$IBX_WARN"; }
