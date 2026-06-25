@@ -1344,6 +1344,13 @@ suborch_find_wid() { # <sess> <wname> -> window_id
   printf '%s' "$wid"
 }
 
+# Is a pane's foreground command a live agent harness (not a dead shell)? The single
+# source of truth for "harness running here", shared by suborch_live and
+# suborch_has_live_workers so the two can never drift.
+is_harness_cmd() { # <pane_current_command>
+  case "$1" in claude|node|*claude*|nvim) return 0 ;; *) return 1 ;; esac
+}
+
 # Liveness = window exists AND its foreground proc is the harness (not a dead shell).
 # Resolve by the window_id recorded in the ledger at spawn (session-independent: a
 # scratch sub-orch lives in <sess>_hidden, so a "$sess:$wname" pane lookup never
@@ -1358,7 +1365,26 @@ suborch_live() { # <dispatch-dir> <sess> <wname>
          2>/dev/null | head -1) || return 1
   [ -n "$pane" ] || return 1
   cmd=${pane#* }
-  case "$cmd" in claude|node|*claude*|nvim) return 0 ;; *) return 1 ;; esac
+  is_harness_cmd "$cmd"
+}
+
+# Does this sub-orch still own any LIVE worker? A worker spawned by so-<id> carries
+# the immutable @fleet_owner=so-<id> window option (stamped at spawn). True iff any
+# window across the visible + parked <sess>_hidden sessions is owned by so-<id> AND
+# has a harness in the foreground. This is the false-positive guard for the reconcile
+# respawn cap: a genuine pipeline that merely lost its sub-orch pane (workers still
+# running) must be RE-ANIMATED, never abandoned as `failed`. Idle-but-unfinished
+# workers count as live (err toward keeping the pipeline alive).
+suborch_has_live_workers() { # <id> <sess>
+  local id="$1" sess="$2" s o cmd
+  local owner="so-$id"   # separate decl: `local id=.. owner="so-$id"` trips set -u (id unbound mid-decl)
+  for s in "$sess" "${sess}_hidden"; do
+    while read -r o cmd; do
+      [ "$o" = "$owner" ] || continue
+      is_harness_cmd "$cmd" && return 0
+    done < <(tmux list-panes -t "=$s" -F '#{@fleet_owner} #{pane_current_command}' 2>/dev/null)
+  done
+  return 1
 }
 
 # Resolve-or-spawn the sub-orch for an id, under a stale-reaped spawn lock. Spawning
@@ -1491,16 +1517,17 @@ cmd_dispatch_classify() {
 
 # `fleet dispatch <id>` — deterministic spawn, no LLM. Also fans out to the
 # enable/disable/status/mode verbs (the opt-in hook installer + front-door mode).
-cmd_dispatch() { # dispatch <id> | enable | disable | status | rename <id> <slug> | mode [sigil|all|off]
+cmd_dispatch() { # dispatch <id> | enable | disable | status | rename <id> <slug> | mode [sigil|all|off] | done|fail|cancel <id>
   case "${1:-}" in
     enable)  shift; dispatch_enable  "$@"; return $? ;;
     disable) shift; dispatch_disable "$@"; return $? ;;
     status)  shift; dispatch_status  "$@"; return $? ;;
     rename)  shift; cmd_dispatch_rename "$@"; return $? ;;
     mode)    shift; if [ $# -eq 0 ]; then dispatch_mode_get; echo; return 0; else dispatch_mode_set "$1"; return $?; fi ;;
+    done|fail|failed|cancel|cancelled) cmd_dispatch_finish "$@"; return $? ;;
   esac
   local id="${1:-}"
-  [ -n "$id" ] || die "usage: fleet dispatch <id> | enable | disable | status | rename <id> <slug>"
+  [ -n "$id" ] || die "usage: fleet dispatch <id> | enable | disable | status | rename <id> <slug> | done|fail|cancel <id>"
   local sess root led wname
   sess=$(session_name) || die "not inside tmux"
   root=$(fleet_root)   || die "not inside tmux"
@@ -1511,6 +1538,30 @@ cmd_dispatch() { # dispatch <id> | enable | disable | status | rename <id> <slug
   meta_set "$led" window "$wname"
   meta_set "$led" state planning
   echo "dispatched $id → $wname"
+}
+
+# `fleet dispatch done|fail|cancel <id>` — the TERMINAL verb (Layer 1 of the zombie
+# fix). The conclusion of a sub-orch's lifetime becomes a reliable command, not model
+# discipline: it writes a terminal `state` that `cmd_reconcile`'s skip predicate already
+# honours, so a finished/abandoned pipeline is never resurrected as a zombie. Explicit
+# operator intent ⇒ last-wins/idempotent (re-marking done→fail is allowed). `die`s loud
+# on a bad verb / missing id (a foreground CLI, like gate_park). The AUTOMATIC dashboard
+# teardown path is STICKY instead (it refuses to downgrade a clean `done`) — that guard
+# lives at the call site (fleet-dash confirm_teardown), not here.
+cmd_dispatch_finish() { # done|fail|cancel <id>
+  local verb="${1:-}" id="${2:-}" st
+  case "$verb" in
+    done)              st=done ;;
+    fail|failed)       st=failed ;;
+    cancel|cancelled)  st=cancelled ;;
+    *) die "usage: fleet dispatch done|fail|cancel <id>" ;;
+  esac
+  [ -n "$id" ] || die "usage: fleet dispatch $verb <id>"
+  local r; r=$(fleet_root 2>/dev/null) || die "no project root"
+  local d="$r/.fleet/dispatch/$id"
+  [ -d "$d" ] || die "no such dispatch $id"
+  meta_set "$d" state "$st"
+  echo "dispatch $id → $st"
 }
 
 # `fleet dispatch rename <id> <slug text...>` — the sub-orch renames its OWN window +
@@ -1692,6 +1743,25 @@ cmd_reconcile() {
     # captured) finds a renamed window instead of false-dead → double-spawn.
     local wn; wn=$(meta_get "$d" window); [ -n "$wn" ] || wn="so-$id"
     if ! suborch_live "$d" "$sess" "$wn"; then
+      # Layer 3 — respawn cap / generation guard. Without this, a sub-orch that
+      # crashed BEFORE writing a terminal state (Layer 1) and was never torn down via
+      # the dashboard (Layer 2) is respawned on EVERY prompt forever — the zombie. Cap
+      # the unattended respawns: after FLEET_RECONCILE_CAP (default 1) re-animations
+      # with no live workers left, give up and mark `failed`.
+      local n; n=$(meta_get "$d" respawns); case "$n" in ''|*[!0-9]*) n=0 ;; esac
+      # Only abandon when (a) we are over the cap, (b) tmux is demonstrably responsive
+      # — else a transient blip (or a server restart mid-reconcile) makes every liveness
+      # probe false-dead and would mass-fail live pipelines; reconcile exists to RESTORE
+      # them — and (c) this sub-orch owns no live worker (a real pipeline that merely lost
+      # its orchestrator pane must be re-animated, never killed).
+      if [ "$n" -ge "${FLEET_RECONCILE_CAP:-1}" ] \
+         && tmux info >/dev/null 2>&1 \
+         && ! suborch_has_live_workers "$id" "$sess"; then
+        meta_set "$d" state failed
+        append_dashboard_alert "reconcile: abandoned $id (state=failed) after $n respawn(s) — dead window, no live workers"
+        continue
+      fi
+      meta_set "$d" respawns "$((n+1))"
       resolve_or_spawn_suborch "$sess" "$wn" "$id" "$root"
     fi
   done
@@ -4310,6 +4380,7 @@ fleet — agent fleet manager (tmux + nvim + Claude Code)
   fleet mode <a>         cycle an agent's Claude permission mode (Shift+Tab)
   fleet dispatch <id>    spawn the ephemeral sub-orchestrator for a ledger id (zero LLM)
   fleet dispatch enable  OPT-IN: wire the UserPromptSubmit dispatch hook (enable|disable|status)
+  fleet dispatch done    mark a sub-orch ledger terminal (done|fail|cancel <id>) so reconcile won't respawn it
   fleet reconcile        sweep + re-animate stranded dispatches (dead sub-orch windows)
   fleet notify <p> "m"   safe-deliver a message to a pane (in-band iff proven safe, else out-of-band)
   fleet restamp          re-propagate the edited FLEET.md guide into bootstrapped CLAUDE.md/AGENTS.md

@@ -1626,9 +1626,25 @@ confirm_teardown() {
       j) (( mi<n-1 ))&&((mi++)) ;;
       $'\n'|$'\r')
         [ -n "$win" ] || return
+        # Layer 2 of the zombie fix: if this row is a sub-orch, closing its window ==
+        # its pipeline is concluded, so mark the dispatch ledger terminal — otherwise
+        # `fleet reconcile` resurrects it on the next prompt. STICKY: never downgrade a
+        # ledger that already reached a clean terminal state (a human tearing down a
+        # *finished* so-d<N> must keep its `done`, not be flipped to `cancelled`). The
+        # window NAME (not the path-derived $label) carries the so-d<N> identity; $win
+        # is a window id, so resolve the name through it.
+        local _wn _did=""
+        _wn=$(tmux display -p -t "$win" '#{window_name}' 2>/dev/null)
+        if is_suborch_name "$_wn"; then
+          case "$(card_meta_state "$_wn")" in
+            done|failed|cancelled) ;;                  # already terminal — leave it
+            *) _did="${_wn#so-}"; _did="${_did%%-*}" ;;
+          esac
+        fi
         case "${acts[mi]}" in
           cancel) return ;;
           close) tmux kill-window -t "$win" 2>/dev/null
+                 [ -n "$_did" ] && "$FLEET_BIN" dispatch cancel "$_did" 2>/dev/null || true
                  "$FLEET_BIN" forget "$dir" 2>/dev/null
                  status="closed $label"; return ;;
           remove|force)
@@ -1637,6 +1653,7 @@ confirm_teardown() {
             # main working tree (or bare container) to run `worktree remove` from
             main=$(git -C "$dir" worktree list --porcelain 2>/dev/null | awk '/^worktree /{print $2; exit}')
             tmux kill-window -t "$win" 2>/dev/null
+            [ -n "$_did" ] && "$FLEET_BIN" dispatch cancel "$_did" 2>/dev/null || true
             "$FLEET_BIN" forget "$dir" 2>/dev/null
             if git -C "${main:-$dir}" worktree remove $force "$dir" 2>/dev/null; then
               status="removed worktree: $label"

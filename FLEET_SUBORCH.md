@@ -252,12 +252,9 @@ fleet ls | grep -F "<repo>/${branch//\//_}"      # already a live/known worker?
 
 - Arm watches on **your own** pane so routine wake-pings land here, never in the main
   pane: `fleet watch <worker>... -m "<what to do next>"`, then end your turn.
-- Keep the ledger current as you go:
-
-  ```
-  fleet ... ; # update state: planning → running(k) → done|failed
-  ```
-  Write `meta.tsv` state transitions and a human-readable `STATUS.md`:
+- Keep the ledger current as you go: the lifecycle is `planning → running(k) →
+  done|failed`. The **terminal** transition is the verb — `fleet dispatch done|fail <id>`
+  (§6) — never a hand-edit. Intermediate progress + a human-readable `STATUS.md`:
 
   ```
   # in .fleet/dispatch/<id>/STATUS.md — what's spawned, what's pending, blockers
@@ -305,16 +302,22 @@ clobber) — but address the inbox directly; that is the contract.
 Your lifetime = `max(your own workers finishing, any depends-on target you watch)`. Do
 **not** exit-then-respawn. While alive you spawn + watch workers, honour deps, self-
 reconcile, and write status. Exit **only** once every worker you own and every dep you
-watch is `done` / `failed` / handed off. Mark your own dispatch `done` (or `failed`) in
-`meta.tsv` before exiting:
+watch is `done` / `failed` / handed off. Mark your own dispatch terminal with the
+**terminal verb** before exiting — do NOT hand-edit `meta.tsv` (the verb is the reliable,
+race-free path; a forgotten hand-edit is what stranded zombies in the first place):
 
 ```
-# update .fleet/dispatch/<id>/meta.tsv: state<TAB>done
+fleet dispatch done <id>      # clean completion
+fleet dispatch fail <id>      # gave up / unrecoverable
 ```
 
 A crashed sub-orch with unfinished state and a dead window is re-animated by
-`fleet reconcile` (run opportunistically by the next dispatch, or manually) — so a
-clean exit on completion is the only correct way to stop.
+`fleet reconcile` (run opportunistically by the next dispatch, or manually) — so calling
+`fleet dispatch done|fail <id>` on completion is the only correct way to stop. Two
+backstops cover a crash that never reaches the verb: tearing the window down in the
+dashboard auto-marks the ledger `cancelled` (never downgrading a clean `done`), and after
+`FLEET_RECONCILE_CAP` (default 1) unattended respawns with no live workers, reconcile
+marks the ledger `failed` and logs a dashboard alert — so nothing loops forever.
 
 ## 7. GATED MODE — stop at a gate, wait for the human's POP
 
