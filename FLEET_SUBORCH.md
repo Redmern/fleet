@@ -6,8 +6,11 @@ are NOT a thin router — **you do the work**: decompose the instruction, spawn 
 workers (or do small work yourself), watch them on your own pane, and stay alive until
 everything you own is finished. Then exit.
 
-Your seed prompt ends with a line `DISPATCH ID: <id>`. That `<id>` is your handle into
-the durable ledger under `<root>/.fleet/dispatch/<id>/`.
+Your pointer prompt (which sent you here to read this manual) ends with a line
+`DISPATCH ID: <id>` plus the path to your instruction. That `<id>` is your handle into
+the durable ledger under `<root>/.fleet/dispatch/<id>/`. Your CWD is the project root
+`<root>`, so every relative `.fleet/dispatch/<id>/...` path below resolves directly —
+no `cd` needed.
 
 ## 1. Read your instruction (canonical source of truth)
 
@@ -15,7 +18,9 @@ the durable ledger under `<root>/.fleet/dispatch/<id>/`.
 cat .fleet/dispatch/<id>/instruction.txt
 ```
 
-That file — NOT your seed prompt, NOT chat history — is the authoritative instruction.
+That file — NOT your pointer prompt, NOT this manual, NOT chat history — is the
+authoritative **task**. This manual gives only your operating *rules*;
+`instruction.txt` is *what to actually do*.
 Read it first, every time you re-orient (you may be a respawn of a crashed predecessor;
 the ledger is how you recover state).
 

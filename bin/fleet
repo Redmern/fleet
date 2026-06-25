@@ -949,6 +949,21 @@ cmd_new() {
       nvim . --cmd "lua pcall(dofile, '$FLEET_DIR/nvim/fleet.lua')" --listen "$nsock")
     tmux set -w -t "$win_id" @fleet_nvim_sock "$nsock"
   fi
+  # LOUD FAILURE on empty win_id. An empty id means tmux created NO window — e.g.
+  # an over-cap seed prompt overflowed MAX_IMSGSIZE so new-window/new-session died
+  # with "command too long" (rc=1) and 2>/dev/null ate it. Historically we fell
+  # through and printed "spawned … in window " with a blank id, leaving the dispatch
+  # layer to respawn forever. A real spawn failure must be VISIBLE + debuggable, so
+  # error to STDERR and return non-zero. Stay fail-silent ONLY for genuine
+  # tmux-missing (the documented degrade-to-subset path) — a successful spawn always
+  # yields a non-empty id, so normal worker/scratch/nvim spawns are unaffected.
+  if [ -z "$win_id" ]; then
+    if command -v tmux >/dev/null 2>&1; then
+      echo "fleet new: spawn FAILED for '$wname' — tmux returned no window id (over-cap seed prompt? look for 'command too long'). NOT spawned." >&2
+      return 1
+    fi
+    return 0   # tmux absent: degrade silently, as elsewhere
+  fi
   tmux set -w -t "$win_id" @fleet_harness "$H_NAME"
   # Hand the freshly-spawned window_id back to a caller that asked for it (the
   # dispatch layer: resolve_or_spawn_suborch records it in the ledger so the
@@ -1315,8 +1330,6 @@ record_pane_role() { # <root> <pane_id> <role>
   printf '%s\n' "$3" > "$1/.fleet/roles/$2" 2>/dev/null || true
 }
 
-suborch_seed() { cat "$FLEET_DIR/FLEET_SUBORCH.md" 2>/dev/null; }
-
 # Find a sub-orch window's id by NAME across both the visible session and its
 # detached "<sess>_hidden" sibling (C-v2 parks scratch panes — and thus sub-orchs
 # spawned via `cmd_new --scratch` — in the hidden session). Used only as a fallback
@@ -1372,8 +1385,15 @@ resolve_or_spawn_suborch() { # <sess> <wname> <id> <root>
     # and EXCLUDES this pane from owner-stamping (a sub-orch is not its own worker).
     FLEET_NEW_WID_FILE="$widf" FLEET_SESSION="$sess" FLEET_ROOT="$root" \
     FLEET_NEW_SUBORCH_ID="$wname" \
-      cmd_new --scratch "$wname" -p "$(suborch_seed)
-DISPATCH ID: $id"
+      # Compact IMPERATIVE pointer (not the ~20KB manual inlined): a small seed
+      # avoids overflowing tmux's MAX_IMSGSIZE (16384) — the inlined manual would
+      # blow the cap, the new-window cmd would fail with "command too long" (rc=1,
+      # swallowed by 2>/dev/null), and the sub-orch would never spawn. The pointer
+      # makes reading the manual the sub-orch's FIRST action; CWD=project root keeps
+      # the relative .fleet/dispatch/<id>/... refs valid. Ends with the dispatch id.
+      cmd_new --scratch "$wname" -p "You are a fleet dispatch sub-orchestrator (so-$id). Your project root is your CWD ($root).
+FIRST, read and follow your operating manual: $FLEET_DIR/FLEET_SUBORCH.md
+THEN handle DISPATCH ID: $id — read your instruction at .fleet/dispatch/$id/instruction.txt"
     local wid; wid=$(cat "$widf" 2>/dev/null); rm -f "$widf" 2>/dev/null
     [ -n "$wid" ] && meta_set "$d" window_id "$wid"
   fi
