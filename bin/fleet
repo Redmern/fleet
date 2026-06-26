@@ -1476,7 +1476,11 @@ dispatch_pill() {
   # mode sigil/all is moot if the hook isn't wired -> loud red ! suffix
   local mark=''
   { [ "$m" = sigil ] || [ "$m" = all ]; } && [ "$dwired" = off ] && mark='#[fg=red,bold]!'
-  printf '#[%s]d:%s%s#[default]' "$col" "$label" "$mark"
+  # Reset fg+bold but NOT bg: this pill renders INSIDE the accent-filled
+  # session-name pill, so a full #[default] would drop the accent bg for the
+  # trailing space before the right round cap — a transparent gap that detaches
+  # the cap from the pill. Keep bg so the accent fill carries to the cap.
+  printf '#[%s]d:%s%s#[fg=default,nobold]' "$col" "$label" "$mark"
 }
 
 # Stamp the per-session @fleet_dispatch option to the current pill and redraw the

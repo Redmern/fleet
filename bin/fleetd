@@ -58,7 +58,10 @@ def dispatch_pill(root):
     label, col = {"all": ("ALL", "fg=yellow,bold"),
                   "off": ("off", "fg=colour244")}.get(mode, ("sig", "fg=cyan"))
     mark = "#[fg=red,bold]!" if mode in ("sigil", "all") and not dwired else ""
-    return "#[%s]d:%s%s#[default]" % (col, label, mark)
+    # Reset fg+bold but NOT bg: rendered inside the accent-filled session-name
+    # pill, a full #[default] drops the accent bg for the trailing space before
+    # the right round cap (detaches the cap). Keep bg so the fill reaches the cap.
+    return "#[%s]d:%s%s#[fg=default,nobold]" % (col, label, mark)
 
 
 def tmux(*args):
