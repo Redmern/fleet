@@ -3025,6 +3025,96 @@ cmd_mode() {
     && echo "cycled mode via send-keys (focus-dependent for nvim agents)"
 }
 
+# ---- hide / unhide -------------------------------------------------------------
+
+# Ensure the detached parking session "<sess>_hidden" exists so a window can be
+# moved into it. tmux cannot create an EMPTY session, so spin a throwaway _hold
+# placeholder window (plain sh, no @agent_state → never flickers into the dash),
+# mirror @fleet_root, and ECHO the placeholder's window id for the caller to kill
+# AFTER its move-window. Prints "" when the session already existed. Factored out
+# of the dash 'h' handler so dash + CLI share one creation path.
+# LOAD-BEARING: the caller MUST guard `kill-window` on a non-empty id — under a
+# concurrent create the loser's new-session fails, the id is EMPTY, and
+# `kill-window -t ""` would fall through to (and kill) the current window.
+ensure_hidden_session() { # <sess>  -> echoes placeholder window id (or "")
+  local sess="$1" hidden="${1}_hidden" ph=""
+  if ! tmux has-session -t "=$hidden" 2>/dev/null; then
+    ph=$(tmux new-session -d -P -F '#{window_id}' -s "$hidden" -n _hold sh 2>/dev/null)
+    # set-option on a SESSION target rejects the "=" exact-match prefix; a session
+    # name has no glob chars so plain "$hidden" is exact anyway.
+    tmux set -t "$hidden" @fleet_root "$(tmux show -t "$sess" -v @fleet_root 2>/dev/null)" 2>/dev/null
+  fi
+  printf '%s' "$ph"
+}
+
+# Resolve <target> to a SINGLE agent TSV line, restricted by an awk session
+# filter. Ranks exact window_id > exact window name > exact label > substring;
+# refuses a tie (rc 1). Mirrors cmd_send's precise matcher; the window_id tier
+# lets the dashboard pass a raw @id for an unambiguous hit. Echoes the line; rc 1
+# on miss or ambiguity.
+_resolve_agent() { # <awk-session-filter> <target>  -> echoes matched line
+  local filt="$1" target="$2" all t1 t2 t3 t4 pick n
+  all=$(agents_tsv | awk -F'\t' "$filt")
+  t1=$(printf '%s\n' "$all" | awk -F'\t' -v t="$target" '$4==t')                  # exact window id
+  t2=$(printf '%s\n' "$all" | awk -F'\t' -v t="$target" '$5==t')                  # exact window name
+  t3=$(printf '%s\n' "$all" | awk -F'\t' -v t="$target" '$2==t')                  # exact label
+  t4=$(printf '%s\n' "$all" | awk -F'\t' -v t="$target" 'index($5,t)||index($2,t)') # substring
+  if   [ -n "$t1" ]; then pick="$t1"
+  elif [ -n "$t2" ]; then pick="$t2"
+  elif [ -n "$t3" ]; then pick="$t3"
+  else pick="$t4"; fi
+  n=$(printf '%s\n' "$pick" | grep -c .)
+  [ "$n" -eq 1 ] || return 1
+  printf '%s' "$pick"
+}
+
+cmd_hide() { # hide <agent> — park ANY agent (scratch/bare/worktree, never main) off the bar
+  local target="${1:-}"
+  [ -n "$target" ] || die "usage: fleet hide <agent>"
+  local sess; sess=$(session_name 2>/dev/null)
+  [ -n "$sess" ] || die "fleet hide: cannot resolve this session — run inside a fleet pane"
+  # Resolve among the VISIBLE agents of this session (a parked agent is already hidden).
+  local line
+  line=$(_resolve_agent "\$3==\"$sess\"" "$target") \
+    || die "no unambiguous agent matching '$target' in this session (try: fleet ls)"
+  local win wname pane
+  win=$(printf '%s'   "$line" | cut -f4)
+  wname=$(printf '%s' "$line" | cut -f5)
+  pane=$(printf '%s'  "$line" | cut -f7)
+  # MAIN-GUARD: hiding the orchestrator would brick the command center. Hard-refuse
+  # by name AND authoritative role (belt-and-braces, like cmd_mode).
+  if [ "$wname" = main ] || is_main_pane "$pane"; then
+    echo "fleet hide: refusing to hide the orchestrator (main)" >&2
+    return 1
+  fi
+  local ph; ph=$(ensure_hidden_session "$sess")
+  tmux move-window -s "$win" -t "=${sess}_hidden:" 2>/dev/null
+  tmux set -w -t "$win" @fleet_hidden 2 2>/dev/null   # 2 = USER-hidden (still alerts on block)
+  # Route the placeholder kill through the brake (d20 invariant: EVERY cleanup kill
+  # is braked). The [ -n "$ph" ] guard stays belt-and-suspenders; safe_kill_window
+  # also refuses an empty/main/last target.
+  [ -n "$ph" ] && safe_kill_window "$ph"
+  echo "hid $wname"
+}
+
+cmd_unhide() { # unhide <agent> — surface a parked agent back onto the visible bar
+  local target="${1:-}"
+  [ -n "$target" ] || die "usage: fleet unhide <agent>"
+  local sess; sess=$(session_name 2>/dev/null)
+  [ -n "$sess" ] || die "fleet unhide: cannot resolve this session — run inside a fleet pane"
+  # Search BOTH the visible session and its parked <sess>_hidden sibling.
+  local line
+  line=$(_resolve_agent "\$3==\"$sess\" || \$3==\"${sess}_hidden\"" "$target") \
+    || die "no unambiguous agent matching '$target' in this session (try: fleet ls)"
+  local win wname
+  win=$(printf '%s'   "$line" | cut -f4)
+  wname=$(printf '%s' "$line" | cut -f5)
+  tmux move-window -s "$win" -t "$sess:" 2>/dev/null   # pull onto the bar + make navigable
+  tmux set -w -t "$win" @fleet_hidden 0 2>/dev/null     # surfaced: re-enable notifications
+  tmux select-window -t "$win" 2>/dev/null
+  echo "surfaced $wname"
+}
+
 # ---- main window / command center ---------------------------------------------
 
 main_window_id() { # find existing main window in session
@@ -4493,6 +4583,8 @@ case "${1:-}" in
   browser) shift; cmd_browser "$@" ;;      # drive a real Chromium against the dev app
   devport) shift; cmd_devport "$@" ;;      # write/show the .fleet/devport marker
   mode)    shift; cmd_mode "$@" ;;
+  hide)    shift; cmd_hide "$@" ;;          # park any agent (not main) off the bar
+  unhide)  shift; cmd_unhide "$@" ;;        # surface a parked agent back onto the bar
   dispatch)      shift; cmd_dispatch "$@" ;;        # <id> spawn, or enable|disable|status|mode
   dispatch-alloc) shift; cmd_dispatch_alloc "$@" ;; # internal: alloc id + ledger dir (hook)
   dispatch-classify) shift; cmd_dispatch_classify "$@" ;; # internal: front-door classifier (hook)

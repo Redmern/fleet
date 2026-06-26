@@ -403,14 +403,18 @@ load_rows() {
   (( ${#ROWS[@]} > 0 )) && (( sel < ${#ROWS[@]} )) && prev_wid=$(field "$sel" 3)
 
   ROWS=()
-  local line state label sess win wname since pane age order
+  HIDDEN_N=0                               # parked-agent count, threaded into the title
+  local line state label sess win wname since pane age order hid
   while IFS=$'\t' read -r state label sess win wname since pane age ready; do
     [ -n "$pane" ] || continue
     [ "$sess" = "$SESS" ] || [ "$sess" = "${SESS}_hidden" ] || continue   # this project + its parked scratch
     [ "$wname" = "main" ] && continue     # skip the orchestrator itself (fast-path name)
     # …and by ROLE, so a drifted "main" window can't surface as a selectable/closable row.
     [ "$(tmux show -w -t "$win" -v @fleet_role 2>/dev/null)" = main ] && continue
-    ROWS+=("$state"$'\t'"$label"$'\t'"$win"$'\t'"$wname"$'\t'"$since"$'\t'"$pane"$'\t'"${age:-0}"$'\t'"$ready")
+    # A window parked in <sess>_hidden is hidden (authoritative — physical
+    # location beats a possibly-stale @fleet_hidden marker). Field 9 of ROWS[].
+    hid=0; [ "$sess" = "${SESS}_hidden" ] && { hid=1; HIDDEN_N=$((HIDDEN_N+1)); }
+    ROWS+=("$state"$'\t'"$label"$'\t'"$win"$'\t'"$wname"$'\t'"$since"$'\t'"$pane"$'\t'"${age:-0}"$'\t'"$ready"$'\t'"$hid")
   done < <("$FLEET_BIN" agents 2>/dev/null | sort -t$'\t' -k1,1 \
             | awk -F'\t' '
                 $1=="blocked"{o=0} $1=="idle"{o=1} $1=="working"{o=2} $1!~/blocked|idle|working/{o=3}
@@ -874,6 +878,7 @@ render() {
   dm="${dm#"${dm%%[![:space:]]*}"}"; dm="${dm%"${dm##*[![:space:]]}"}"
   case "$dm" in all|off|sigil) ;; *) dm=sigil ;; esac
   local title="FLEET · $SESS · $N agent$([ "$N" = 1 ] || echo s) · d:$dm"
+  (( ${HIDDEN_N:-0} > 0 )) && title+=" · ${HIDDEN_N} hidden"
   (( IBX_TOTAL > 0 )) && { title+=" · ✉$IBX_TOTAL"; (( IBX_WARN > 0 )) && title+=" ⚠$IBX_WARN"; }
   printf '\033[2m%s\033[0m\033[K\n' \
     "$(hrule '╭' '╮' "$inner" "$title")"
@@ -971,6 +976,10 @@ render() {
           label="$label  $cannot"
         fi
       fi
+      # parked agents (field 9) carry a plain " (hidden)" tag so a hidden worker is
+      # visually distinct from a live one — the surrounding label sgr (dim when
+      # unselected) styles it; keep it plain text so fit_left's width math holds.
+      [ "$(field "$i" 9)" = 1 ] && label="$label (hidden)"
       g=$(git_cached "$pane"); gt=$(gitfmt "$g")
       # mode pill only for harnesses with a runtime permission-mode cycle (claude)
       local hmode np
@@ -1812,35 +1821,18 @@ while :; do
     J)             # inbox: jump to the message's source agent (no-op in agents view)
       [ "$MODE" = inbox ] || continue
       inbox_jump; load_inbox; last_load=$SECONDS ;;
-    h)             # hide the selected scratch agent back off the bar (into <sess>_hidden)
+    h)             # hide the selected agent off the bar (into <sess>_hidden); refuses main
       [ "$MODE" = inbox ] && continue
       (( N == 0 )) && continue
       (( sel >= N )) && { status="orphans row — press e for messages"; continue; }
-      win=$(field "$sel" 3); wname=$(field "$sel" 4)
-      # Gate on the @fleet_hidden marker so ONLY scratch agents are hideable —
-      # worker windows must never be yanked off the bar. (Unset on workers; 0/1 on
-      # scratch depending on surfaced/parked.)
-      if [ -z "$(tmux show -w -t "$win" -v @fleet_hidden 2>/dev/null)" ]; then
-        status="$wname is not a scratch agent"; continue
-      fi
-      hidden="${SESS}_hidden"; ph=""
-      if ! tmux has-session -t "=$hidden" 2>/dev/null; then
-        # tmux cannot create an EMPTY session: spin a throwaway placeholder window,
-        # move the scratch window in, then drop the placeholder. _hold is a plain
-        # sh with no @agent_state, so it never flickers into the dashboard.
-        ph=$(tmux new-session -d -P -F '#{window_id}' -s "$hidden" -n _hold sh 2>/dev/null)
-        # set-option on a SESSION rejects the "=" prefix (unlike move-window/etc.),
-        # so plain "$hidden" — exact anyway, no glob chars in a session name.
-        tmux set -t "$hidden" @fleet_root "$(tmux show -t "$SESS" -v @fleet_root 2>/dev/null)" 2>/dev/null
-      fi
-      tmux move-window -s "$win" -t "=$hidden:" 2>/dev/null
-      tmux set -w -t "$win" @fleet_hidden 1 2>/dev/null
-      # Under a concurrent 'h' the loser's new-session fails and $ph is EMPTY;
-      # `kill-window -t ""` would fall through to the CURRENT window and kill a
-      # live scratch agent. The brake refuses an empty target (and main/last) for
-      # us — the historical [ -n "$ph" ] guard is now belt-and-suspenders.
-      [ -n "$ph" ] && "$FLEET_BIN" safe-kill-window "$ph" 2>/dev/null
-      status="hid $wname"; load_rows; last_load=$SECONDS ;;
+      win=$(field "$sel" 3)
+      # Delegate to `fleet hide` so dash + CLI share ONE hide path: the main-guard,
+      # the user-hidden marker (@fleet_hidden 2), and the LOAD-BEARING concurrent-
+      # create placeholder kill all live once in cmd_hide/ensure_hidden_session.
+      # Pass the exact window id (resolver's top tier) for an unambiguous match;
+      # surface cmd_hide's one-line status (success on stdout, refusal on stderr).
+      status=$("$FLEET_BIN" hide "$win" 2>&1 | tail -1)
+      load_rows; last_load=$SECONDS ;;
     m)             # permission-mode pick-list for the selected agent (sets status)
       [ "$MODE" = inbox ] && continue
       (( N == 0 )) && continue
