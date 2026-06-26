@@ -170,6 +170,35 @@ is_main_pane() { # <pane_id>
   [ "$role" = main ]
 }
 
+# The one brake in front of EVERY cleanup window-kill (reap, dashboard Close/hide).
+# Takes a WINDOW id/target and REFUSES (no-op, nonzero) when killing it could tear
+# down the command center or a whole session. tmux destroys a session the instant
+# its last window dies, so an unguarded kill-window that lands on `main` — because
+# the name drifted, or reap mis-resolved the window by a shared cwd — takes the
+# entire fleet down. The brake refuses three things:
+#   • an empty target (would fall through to the *current* window);
+#   • any window whose pane is the orchestrator, by is_main_pane (the rename-proof
+#     role-registry signal, NOT the bare "main" name) — resolves window→panes
+#     itself so callers keep passing a window id;
+#   • the session's LAST window (killing it destroys the session).
+# Fail-silent default is REFUSE (the inverse of fleet's usual `|| true`): a false
+# refuse is a leftover window the user closes by hand; a false kill is catastrophic.
+safe_kill_window() { # <window-id-or-target>
+  local win="${1:-}"
+  [ -n "$win" ] || return 1                       # never kill the empty/current-window target
+  local p
+  while IFS= read -r p; do
+    [ -n "$p" ] && is_main_pane "$p" && return 1   # main brake: orchestrator window — refuse
+  done < <(tmux list-panes -t "$win" -F '#{pane_id}' 2>/dev/null)
+  local wsess cnt
+  wsess=$(tmux display -p -t "$win" '#{session_name}' 2>/dev/null)
+  if [ -n "$wsess" ]; then
+    cnt=$(tmux list-windows -t "$wsess" -F x 2>/dev/null | grep -c x)
+    [ "${cnt:-0}" -le 1 ] && return 1              # last-window brake: would destroy the session
+  fi
+  tmux kill-window -t "$win" 2>/dev/null
+}
+
 agents_tsv() { # state<TAB>label<TAB>session<TAB>window_id<TAB>window_name<TAB>since<TAB>pane_id
   local json
   if json=$(rpc fleet.list); then
@@ -240,7 +269,10 @@ PY
     tmux list-panes -a -F $'#{?@agent_state,#{@agent_state}\t#{pane_current_path}\t#{session_name}\t#{window_id}\t#{window_name}\t-\t#{pane_id},}' 2>/dev/null \
       | sed '/^$/d' \
       | while IFS=$'\t' read -r st path sess wid wname since pane; do
+          # Drop the orchestrator by ROLE, not just the bare name — a drifted "main"
+          # window must still be recognized (is_main_pane reads the role registry).
           [ "$wname" = main ] && continue
+          is_main_pane "$pane" && continue
           printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$st" "$(agent_label "$path")" "$sess" "$wid" "$wname" "$since" "$pane"
         done
   fi
@@ -2721,7 +2753,18 @@ cmd_reap() { # reap [<target>] [--force] — remove worktrees flagged ready
     [ -n "$dir" ] || continue
     [ -e "$dir/.fleet/ready" ] || continue       # only flagged worktrees
     local lbl="${repo:-?}/${branch:-?}"
-    [ -n "$target" ] && ! printf '%s' "$lbl $dir" | grep -qF -- "$target" && continue
+    # Match <target> against the agent's repo/branch LABEL only — never the $dir,
+    # whose project path drags in tokens like `main`/`proj`/`/` that made the old
+    # `grep -qF "$lbl $dir"` substring match over-reap EVERY flagged worktree.
+    # Accept an exact label, a bare branch, or a bare repo; anything else skips.
+    if [ -n "$target" ]; then
+      case "$lbl" in
+        "$target") ;;          # exact repo/branch
+        */"$target") ;;        # branch only
+        "$target"/*) ;;        # repo only
+        *) continue ;;
+      esac
+    fi
     any=1
     if [ ! -d "$dir" ]; then
       cmd_forget "$dir"; echo "drop   $lbl: dir gone (stale)"; continue
@@ -2770,9 +2813,18 @@ cmd_reap() { # reap [<target>] [--force] — remove worktrees flagged ready
         echo "skip   $lbl: sub-orch parked at a gate — pop its message first (use --force)"; continue
       fi
     fi
-    local win; win=$(tmux list-panes -a -F '#{pane_current_path}'$'\t''#{window_id}' 2>/dev/null \
-                      | awk -F'\t' -v d="$dir" '$1==d{print $2; exit}')
-    [ -n "$win" ] && tmux kill-window -t "$win" 2>/dev/null
+    # Resolve the window to kill from the worktree's cwd, but SKIP any pane that
+    # is the command center (is_main_pane) — so a cwd-collision (main parked in a
+    # reaped worktree dir) falls through to the real worker window instead of
+    # resolving onto main. The brake (safe_kill_window) is the backstop: it refuses
+    # main / the last window / an empty target regardless.
+    local win="" _rp _rpath _rwid
+    while IFS=$'\t' read -r _rp _rpath _rwid; do
+      [ "$_rpath" = "$dir" ] || continue
+      is_main_pane "$_rp" && continue
+      win="$_rwid"; break
+    done < <(tmux list-panes -a -F '#{pane_id}'$'\t''#{pane_current_path}'$'\t''#{window_id}' 2>/dev/null)
+    safe_kill_window "$win"
     cmd_forget "$dir"
     # Archive a non-empty scratch-docs dir out to <root>/.fleet/notes/archive/ so
     # the worker's research/plan markdown survives the reap. Fully fail-silent —
@@ -3079,6 +3131,7 @@ cmd_main() {
     tmux set -w -t "$win" automatic-rename off 2>/dev/null || true
     tag_orch_window "$win"
     record_pane_role "$root" "$(tmux list-panes -t "$win" -F '#{pane_id}' 2>/dev/null | head -1)" main
+    tmux set -w -t "$win" @fleet_role main 2>/dev/null || true   # role on the window option too, so fleetd/python filter main without a file read
     tmux set -t "$sess" @fleet_orch_harness "$harness"
     tmux move-window -t "$sess" -s "$win" 2>/dev/null || true
   fi
@@ -3873,6 +3926,7 @@ cmd_up() {
       tmux kill-window -t "$name:_boot" 2>/dev/null || true
       tag_orch_window "$_mainwin"
       record_pane_role "$root" "$(tmux list-panes -t "$_mainwin" -F '#{pane_id}' 2>/dev/null | head -1)" main
+      tmux set -w -t "$_mainwin" @fleet_role main 2>/dev/null || true   # role on the window option too (fleetd/python filter)
       tmux set -t "$name" @fleet_orch_harness "$orch"
     fi
   fi
@@ -4451,6 +4505,7 @@ case "${1:-}" in
   main)       shift; cmd_main "$@" ;;
   orch-jump)  shift; cmd_orch_jump "$@" ;;            # internal: prefix-key jump to orchestrator pane
   main-pane)  shift; cmd_main_pane "$@" ;;            # internal: orchestrator pane id (dash pop target)
+  safe-kill-window) shift; safe_kill_window "$@" ;;   # internal: brake — refuse to kill main/last/empty (dash routes kills here)
   dash-new)   shift; cmd_dash_new "$@" ;;             # internal: leader 'new' -> dash's own form
   dash-triage) shift; cmd_dash_triage "$@" ;;         # internal: leader 'triage' -> dash's cross-agent triage view
   apply-keybinds) shift; apply_keybinds ;;            # internal: re-apply runtime keybinds live

@@ -306,12 +306,12 @@ class Fleet:
             "list-panes", "-a", "-F",
             "#{pane_id}\t#{window_id}\t#{session_name}\t#{window_name}"
             "\t#{pane_current_path}\t#{pane_active}\t#{@fleet_harness}"
-            "\t#{window_activity}",
+            "\t#{window_activity}\t#{@fleet_role}",
         ) or ""
         meta = {}
         for line in out.splitlines():
             parts = line.split("\t")
-            if len(parts) == 8:
+            if len(parts) == 9:
                 meta[parts[0]] = parts[1:]
         agents = []
         covered = set()  # window_ids that already have a real reported pane
@@ -321,6 +321,12 @@ class Fleet:
                 continue
             m = meta.get(pane)
             window_id, session, window_name, path = (m[0], m[1], m[2], m[3]) if m else ("", "", "", "")
+            # Exclude the orchestrator by ROLE (@fleet_role main) or name — a drifted
+            # "main" name must still be hidden so it can't surface as a reapable row.
+            if window_name == "main" or (m and m[7] == "main"):
+                if window_id:
+                    covered.add(window_id)   # still mark covered so the synth pass skips it too
+                continue
             if window_id:
                 covered.add(window_id)
             agents.append(
@@ -343,17 +349,17 @@ class Fleet:
         now = time.time()
         synth = {}  # window_id -> chosen meta row
         for pane, m in meta.items():
-            window_id, session, window_name, path, pane_active, harness, activity = m
+            window_id, session, window_name, path, pane_active, harness, activity, role = m
             if not harness or not window_id or window_id in covered:
                 continue
-            if window_name == "main":
+            if window_name == "main" or role == "main":   # exclude orchestrator by role or name
                 continue
             prev = synth.get(window_id)
             # prefer the active pane as the window's representative agent pane
             if prev is None or (pane_active == "1" and prev[5] != "1"):
                 synth[window_id] = (pane,) + tuple(m)
         for window_id, row in synth.items():
-            pane, _wid, session, window_name, path, _pa, harness, activity = row
+            pane, _wid, session, window_name, path, _pa, harness, activity, _role = row
             try:
                 since = float(activity)
             except (TypeError, ValueError):
