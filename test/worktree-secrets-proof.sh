@@ -238,6 +238,58 @@ echo "== worktree-secrets-proof: honest same-uid v1 =="
   printf '%s' "$doc" | grep -qiE 'db-url' && pass "$c" "doctor checks referenced entry" || fail "$c" "entry not checked"
 ) ; [ $? = 0 ] || true
 
+# --- Scenario 9: dest matches a git-TRACKED file (loop-2 GAP 1) ---------------
+# A repo that SHIPS a placeholder config the user overrides locally is a legit
+# common case — injection must NOT refuse it, but the local secret value must be
+# uncommittable. info/exclude is powerless for tracked paths, so the fix flags the
+# dest skip-worktree. Assert: value present locally, `git status` clean / not
+# committable / not stageable, audit ok.
+( c=9
+  new_box myapp
+  printf 'PLACEHOLDER\n' > "$WT/.env"                 # repo ships a tracked placeholder
+  git -C "$WT" add .env
+  git -C "$WT" -c user.email=t@t -c user.name=t commit -q -m 'ship placeholder .env'
+  printf 'REAL_SECRET_VALUE' > "$SECRETS/.env"        # injected local override
+  out=$(inject myapp 2>&1); rc=$?
+  [ "$rc" = 0 ] && pass "$c" "exit 0" || fail "$c" "exit $rc ($out)"
+  got=$(cat "$WT/.env" 2>/dev/null)
+  [ "$got" = REAL_SECRET_VALUE ] && pass "$c" "local secret value present" || fail "$c" "content='$got'"
+  if git -C "$WT" status --porcelain 2>/dev/null | grep -qF '.env'; then
+    fail "$c" "tracked secret shows as committable in git status"
+  else pass "$c" "git status clean — tracked secret not committable"; fi
+  git -C "$WT" add .env 2>/dev/null || true
+  if git -C "$WT" diff --cached --name-only 2>/dev/null | grep -qF '.env'; then
+    fail "$c" "tracked secret got staged"
+  else pass "$c" "tracked secret cannot be staged"; fi
+  grep -qE '	ok$' "$AUDIT" 2>/dev/null && pass "$c" "audit outcome=ok for tracked dest" || fail "$c" "audit not ok"
+) ; [ $? = 0 ] || true
+
+# --- Scenario 10: dest collides with an existing DIRECTORY (loop-2 GAP 2) ------
+# cp would drop the file INSIDE the dir and chmod 600 would strip exec from the
+# directory → worktree corruption. Must REFUSE: real failure (audit != ok), exit 0,
+# directory perms untouched, tracked file under it still readable, no exclude line.
+( c=10
+  new_box myapp
+  mkdir -p "$WT/config"
+  printf 'IMPORTANT\n' > "$WT/config/keep"
+  git -C "$WT" add config/keep
+  git -C "$WT" -c user.email=t@t -c user.name=t commit -q -m 'ship config dir'
+  dperm_before=$(perms "$WT/config")
+  printf 'SHOULD_NOT_LAND' > "$SECRETS/config"        # rel path collides with the dir
+  out=$(inject myapp 2>&1); rc=$?
+  [ "$rc" = 0 ] && pass "$c" "exit 0 (per-file refuse, not fatal)" || fail "$c" "exit $rc ($out)"
+  [ -d "$WT/config" ] && pass "$c" "dest still a directory" || fail "$c" "directory clobbered"
+  dperm_after=$(perms "$WT/config")
+  [ "$dperm_before" = "$dperm_after" ] && pass "$c" "directory perms unchanged ($dperm_before)" \
+    || fail "$c" "dir perms $dperm_before -> $dperm_after"
+  [ ! -e "$WT/config/config" ] && pass "$c" "no file cp'd into the directory" || fail "$c" "file landed inside dir"
+  got=$(cat "$WT/config/keep" 2>/dev/null)
+  [ "$got" = IMPORTANT ] && pass "$c" "tracked file under dir still readable" || fail "$c" "tracked file corrupted='$got'"
+  grep -qE 'dir-collision' "$AUDIT" 2>/dev/null && pass "$c" "audit outcome=dir-collision" || fail "$c" "audit missing dir-collision"
+  if grep -qE '	ok$' "$AUDIT" 2>/dev/null; then fail "$c" "audit wrongly recorded ok"; else pass "$c" "audit not ok"; fi
+  if grep -qxF '/config' "$(EXCL)" 2>/dev/null; then fail "$c" "refused placement still excluded"; else pass "$c" "no exclude line for refused dir"; fi
+) ; [ $? = 0 ] || true
+
 N=0; [ -f "$FAILMARK" ] && N=$(wc -l < "$FAILMARK" 2>/dev/null | tr -d ' '); N=${N:-0}
 echo "== summary: $N failed =="
 if [ "$N" = 0 ]; then echo "RESULT: ALL PASS — worktree-secrets v1 proven."; exit 0

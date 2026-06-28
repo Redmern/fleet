@@ -869,6 +869,14 @@ inject_secrets() { # <repo> <dir>
       *) printf 'fleet: secret %s escapes worktree, rejected\n' "$rel" >&2
          audit_secret "$audit" "$repo" "$rel" escape; continue ;;
     esac
+    # A dest colliding with a real DIRECTORY is never cp-into/chmod-able: cp would
+    # drop the file INSIDE it and chmod 600 would strip exec from the dir, corrupting
+    # the worktree. Refuse loudly — a REAL failure, never `ok`. (A symlink-to-dir is
+    # excluded so the rm below can still unlink+replace it.)
+    if [ -d "$dest" ] && [ ! -L "$dest" ]; then
+      printf 'fleet: secret %s dest is a directory, refused\n' "$rel" >&2
+      audit_secret "$audit" "$repo" "$rel" dir-collision; continue
+    fi
     rm -f "$dest" 2>/dev/null || true                         # never write through a symlink at dest
     outcome=ok
     first=$(head -1 "$f" 2>/dev/null)
@@ -891,10 +899,26 @@ inject_secrets() { # <repo> <dir>
     else
       (umask 077; cp "$f" "$dest" 2>/dev/null) || { outcome=copy-fail; rm -f "$dest" 2>/dev/null || true; }
     fi
-    [ "$outcome" = ok ] && chmod 600 "$dest" 2>/dev/null || true
-    # gitignore-enforce every dest we attempted (idempotent), so it can't be committed.
-    if [ -n "$excl" ]; then
-      grep -qxF "/$rel" "$excl" 2>/dev/null || printf '/%s\n' "$rel" >>"$excl" 2>/dev/null || true
+    # Only a placement that actually WROTE a value gets chmod'd and made
+    # uncommittable — never a failed one (missing / gpg-locked / no-backend /
+    # dir-collision leave no file to protect, and excluding a path we didn't write
+    # would be a lie in the exclude file).
+    if [ "$outcome" = ok ]; then
+      chmod 600 "$dest" 2>/dev/null || true
+      # Keep the local secret value uncommittable. info/exclude is POWERLESS for a
+      # path git already tracks (the placeholder-config-override case), so split on
+      # tracked-ness: a TRACKED dest is flagged skip-worktree (the value drops out of
+      # `git status` and can't be staged/committed); an UNTRACKED dest gets the
+      # idempotent info/exclude line. skip-worktree — not assume-unchanged — is the
+      # intended "I have local changes I never intend to commit" flag; assume-unchanged
+      # is a mere perf hint git may silently clear. Caveat: an upstream change to a
+      # tracked+skip-worktree path can conflict on later merge/checkout; acceptable
+      # for a value the user deliberately overrides locally.
+      if git -C "$dir" ls-files --error-unmatch -- "$rel" >/dev/null 2>&1; then
+        git -C "$dir" update-index --skip-worktree -- "$rel" 2>/dev/null || true
+      elif [ -n "$excl" ]; then
+        grep -qxF "/$rel" "$excl" 2>/dev/null || printf '/%s\n' "$rel" >>"$excl" 2>/dev/null || true
+      fi
     fi
     audit_secret "$audit" "$repo" "$rel" "$outcome"
   done < <(find "$srcr" -mindepth 1 \( -type f -o -type l \) -print0 2>/dev/null)
