@@ -212,3 +212,39 @@ Exceptional events (a dispatch hard-failed, a worker is BLOCKED on the human) ar
 **out-of-band only** — a tmux toast, a terminal bell, and a row in the dashboard alerts
 strip — never injected into your input. When pinged, check the dashboard /
 `.fleet/dispatch/` ledger; recover stranded work with `fleet reconcile`.
+
+## Worktree secrets (per-repo auto-injection)
+
+Keep per-repo secret files in one place and have fleet drop them into **every** new
+worktree it creates — so a fresh debug worktree already has its `.env.local` / DSN at
+the right path, no pasting into a prompt.
+
+**Setup (default mechanism — a mirrored folder, no schema):**
+```sh
+mkdir -p ~/.config/fleet/secrets/<repo>
+$EDITOR ~/.config/fleet/secrets/<repo>/.env.local      # lay files out exactly as the worktree wants them
+```
+On `fleet new <repo> <branch>`, fleet mirror-copies that tree into the worktree (the
+file's path **relative to** `secrets/<repo>/` IS its destination), `chmod 600`s each
+file, and appends each dest to the worktree's `.git/info/exclude` so a secret can never
+be accidentally committed. Re-running is idempotent (overwrites, no duplicate ignore
+lines). `--scratch` agents and repos with no `secrets/<repo>/` dir are untouched.
+
+**Optional `pass` sugar (encryption-at-rest):** if a file's content is exactly
+`pass:<entry>` (e.g. `pass:fleet/myapp/db-url`), fleet resolves it with `pass show` at
+injection and writes the decrypted value instead (value streamed straight to the file —
+never on a command line, never logged). Store the secret encrypted with
+`pass insert fleet/myapp/db-url` once.
+
+**Fail-silent:** a missing source, locked gpg, or absent `pass` only warns — it never
+aborts `fleet new` and never hangs on a pinentry prompt. Every placement is recorded in
+an append-only audit log (`~/.config/fleet/secrets/audit.log`, timestamp/repo/dest/outcome,
+**never the value**). `fleet doctor` reports `pass` state and whether referenced entries
+resolve (no decrypt).
+
+**Honest threat model — read this.** On a single-user box the agent runs as the **same
+uid** as you, so it **CAN** `cat` an injected file or run `pass show` itself. This feature
+buys **auto-injection + accidental-commit protection + encryption-at-rest** — it does
+**NOT** make the secret unreadable by the agent, and is not documented as such. Genuine
+"the AI cannot read it" is impossible same-uid and would need a separate uid for both
+placement and the consuming process (a much larger, separate project).

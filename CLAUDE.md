@@ -101,6 +101,24 @@ worktree at `<repo>/<branch-with-slashes-as-underscores>`, anchored off the
 container's bare repo or first worktree, cut from `--base` (or the remote default
 branch). Branches with `/` become `_` in directory and window names.
 
+### Worktree secrets (`inject_secrets`)
+
+`inject_secrets <repo> <dir>` runs inside `cmd_new` right after the worktree is
+materialized and before the tmux window spawns (skipped for `--scratch`; no-op when
+`~/.config/fleet/secrets/<repo>/` is absent — full backward compat). It mirror-copies
+that source tree into the worktree (relative path = dest), `chmod 600`s each file,
+**realpath-confines** every dest inside `$dir` (rejects source symlinks and
+parent-symlink escapes — fail-CLOSED, the one place that is not fail-silent), and
+appends each dest to the shared `.git/info/exclude` (idempotent). A file whose first
+line is `pass:<entry>` is resolved via `pass show` with the value streamed straight to
+the dest (never on argv/env, never logged), bounded by `timeout` so pinentry can't
+hang. Every placement is recorded in an append-only audit log
+(`$CONF_DIR/secrets/audit.log`, **never a value**). Exposed as the internal
+`fleet inject-secrets` subcommand for the proof harness
+(`test/worktree-secrets-proof.sh`). **Honest threat model:** same-uid agents CAN read
+injected secrets — this buys auto-injection + accidental-commit protection +
+encryption-at-rest, NOT secrecy from the agent. `doctor_secrets` prints that caveat.
+
 ### Permission-mode discovery (notable)
 
 Claude only exposes mode *cycling* (Shift+Tab), not "set mode X". `cmd_mode`

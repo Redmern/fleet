@@ -769,6 +769,138 @@ cmd_restore() { # respawn saved agents whose windows are gone
   echo "restored $n agent(s)"
 }
 
+# ---- worktree-secrets ---------------------------------------------------------
+# HONEST THREAT MODEL (read before touching this): on a single-user box the agent
+# runs as the SAME uid as the secret owner, so it CAN `cat` a placed file or run
+# `pass show` itself. This feature gives auto-injection + accidental-commit
+# protection + encryption-at-rest, NOT secrecy from the agent. Do not name or
+# document it as "the AI cannot read it". See _reports/worktree-secrets/SYNTHESIS.md.
+
+# Append a placement to the out-of-worktree audit log. NEVER logs a secret value —
+# only timestamp / repo / dest (relative) / outcome. Fail-silent.
+audit_secret() { # <logfile> <repo> <rel> <outcome>
+  printf '%s\t%s\t%s\t%s\n' \
+    "$(date -u +%Y-%m-%dT%H:%M:%SZ 2>/dev/null)" "$2" "$3" "$4" >>"$1" 2>/dev/null || true
+}
+
+# Drop the honest threat-model caveat physically into the config area, once.
+# Fail-silent; never overwrites an existing README.
+secrets_readme() {
+  local r="$CONF_DIR/secrets/README.md"
+  [ -e "$r" ] && return 0
+  mkdir -p "$CONF_DIR/secrets" 2>/dev/null || return 0
+  cat >"$r" 2>/dev/null <<'EOF' || true
+# fleet worktree-secrets
+
+Drop per-repo files under `secrets/<repo>/`; their relative path is the destination
+inside every new worktree fleet creates for that repo. `chmod 600`, git-ignored, and
+optionally `pass:<entry>` is resolved via `pass show` at injection.
+
+## Honest threat model — read this
+
+On a single-user box the agent runs as the SAME uid as you, so it CAN `cat` an injected
+file or run `pass show` itself. This buys auto-injection + accidental-commit protection
++ encryption-at-rest. It does NOT make the secret unreadable by the agent. Genuine
+"the AI cannot read it" is impossible same-uid (separate project).
+EOF
+}
+
+# Mirror-copy per-repo secrets into a freshly-materialized worktree. Source tree
+# is $CONF_DIR/secrets/<repo>/; each file's path RELATIVE to that dir IS its dest
+# under $dir. Each placement: chmod 600 (umask 077), realpath-confined inside $dir
+# (resolved parent must stay within $dir; pre-existing dest unlinked so we never
+# write through a planted symlink — O_NOFOLLOW-ish), dest appended idempotently to
+# .git/info/exclude. A file whose first line is `pass:<entry>` is resolved via
+# `pass show <entry>` (value streamed straight to the dest file — never on argv,
+# never in env, never echoed/logged) bounded by `timeout` so a pinentry prompt can
+# never hang `fleet new`. Append-only audit log outside the worktree. FAIL-SILENT
+# throughout: missing source / locked gpg / absent `pass` → warn at most, never
+# abort, never partial-sentinel. No-op when the repo has no secrets dir.
+inject_secrets() { # <repo> <dir>
+  local repo="$1" dir="$2"
+  [ -n "$repo" ] && [ -n "$dir" ] || return 0
+  local src="$CONF_DIR/secrets/$repo"
+  [ -d "$src" ] || return 0                                   # backward-compat no-op
+  local srcr dirr
+  srcr=$(realpath "$src" 2>/dev/null) || return 0
+  dirr=$(realpath "$dir" 2>/dev/null) || return 0
+  local audit="$CONF_DIR/secrets/audit.log"
+  mkdir -p "$CONF_DIR/secrets" 2>/dev/null || true
+  secrets_readme
+
+  # Shared common-dir info/exclude (every worktree of the repo reads it); absolutise.
+  local excl="" common
+  common=$(git -C "$dir" rev-parse --git-common-dir 2>/dev/null)
+  if [ -n "$common" ]; then
+    case "$common" in /*) ;; *) common="$dir/$common" ;; esac
+    mkdir -p "$common/info" 2>/dev/null || true
+    excl="$common/info/exclude"
+  fi
+
+  local TO=""; command -v timeout >/dev/null 2>&1 && TO="timeout 10"
+  local store="${PASSWORD_STORE_DIR:-$HOME/.password-store}"
+
+  local f rel dest destdir destr first entry outcome
+  while IFS= read -r -d '' f; do
+    rel="${f#"$srcr"/}"
+    dest="$dir/$rel"
+    # Reject a source entry that is itself a symlink — never follow it out of $src.
+    if [ -L "$f" ]; then
+      printf 'fleet: secret %s is a symlink, refused\n' "$rel" >&2
+      audit_secret "$audit" "$repo" "$rel" escape; continue
+    fi
+    # Realpath-confine BEFORE any mkdir: resolve the nearest EXISTING ancestor and
+    # require it inside $dirr, so a planted parent symlink can't even cause a dir to
+    # be created outside the worktree. Then mkdir and re-confirm the materialized
+    # parent (catches a TOCTOU symlink swapped in during mkdir).
+    destdir=$(dirname "$dest")
+    local anc="$destdir"
+    while [ ! -e "$anc" ]; do anc=$(dirname "$anc"); done
+    destr=$(realpath "$anc" 2>/dev/null)
+    case "$destr" in
+      "$dirr"|"$dirr"/*) ;;
+      *) printf 'fleet: secret %s escapes worktree, rejected\n' "$rel" >&2
+         audit_secret "$audit" "$repo" "$rel" escape; continue ;;
+    esac
+    mkdir -p "$destdir" 2>/dev/null || { audit_secret "$audit" "$repo" "$rel" mkdir-fail; continue; }
+    destr=$(realpath "$destdir" 2>/dev/null)
+    case "$destr" in
+      "$dirr"|"$dirr"/*) ;;                                   # inside the worktree → ok
+      *) printf 'fleet: secret %s escapes worktree, rejected\n' "$rel" >&2
+         audit_secret "$audit" "$repo" "$rel" escape; continue ;;
+    esac
+    rm -f "$dest" 2>/dev/null || true                         # never write through a symlink at dest
+    outcome=ok
+    first=$(head -1 "$f" 2>/dev/null)
+    if [ "${first#pass:}" != "$first" ]; then
+      # `pass:` sugar — resolve the entry, stream the value straight to dest.
+      entry="${first#pass:}"
+      if ! command -v pass >/dev/null 2>&1; then
+        printf 'fleet: pass not installed, secret %s skipped\n' "$rel" >&2
+        outcome=no-backend
+      elif [ ! -f "$store/$entry.gpg" ]; then
+        printf 'fleet: pass entry %s missing, secret %s skipped\n' "$entry" "$rel" >&2
+        outcome=missing
+      elif (umask 077; $TO pass show "$entry" </dev/null >"$dest" 2>/dev/null) && [ -s "$dest" ]; then
+        outcome=ok
+      else
+        rm -f "$dest" 2>/dev/null || true
+        printf 'fleet: pass could not resolve %s (gpg locked?), secret %s skipped\n' "$entry" "$rel" >&2
+        outcome=gpg-locked
+      fi
+    else
+      (umask 077; cp "$f" "$dest" 2>/dev/null) || { outcome=copy-fail; rm -f "$dest" 2>/dev/null || true; }
+    fi
+    [ "$outcome" = ok ] && chmod 600 "$dest" 2>/dev/null || true
+    # gitignore-enforce every dest we attempted (idempotent), so it can't be committed.
+    if [ -n "$excl" ]; then
+      grep -qxF "/$rel" "$excl" 2>/dev/null || printf '/%s\n' "$rel" >>"$excl" 2>/dev/null || true
+    fi
+    audit_secret "$audit" "$repo" "$rel" "$outcome"
+  done < <(find "$srcr" -mindepth 1 \( -type f -o -type l \) -print0 2>/dev/null)
+  return 0
+}
+
 # ---- new ----------------------------------------------------------------------
 
 cmd_new() {
@@ -879,6 +1011,9 @@ cmd_new() {
       local _excl="$_common/info/exclude"
       grep -qxF '/.fleet/' "$_excl" 2>/dev/null || printf '/.fleet/\n' >>"$_excl" 2>/dev/null || true
     fi
+    # Inject per-repo secrets now the worktree exists, before the window spawns.
+    # No-op unless ~/.config/fleet/secrets/<repo>/ exists; fail-silent throughout.
+    inject_secrets "$(basename "$repo_base")" "$dir" || true
   fi
 
   # OWNER + WORKER-PREFIX (Phase B / d<N> naming). A worker spawned BY a sub-orch
@@ -4157,7 +4292,32 @@ cmd_doctor() {
   local _curpfx; _curpfx=$(tmux show -gv prefix 2>/dev/null)
   [ -n "$_curpfx" ] && echo "ok   tmux prefix: $_curpfx (leader: prefix+$(keybind_for menu))"
   doctor_config_sync   # non-fatal advisories: symlinks / chezmoi / stale clones
+  doctor_secrets       # warn-only: pass state + referenced entries + honest caveat
   return $ok
+}
+
+# worktree-secrets health (warn-only — NEVER changes doctor's exit code). Reports
+# whether `pass` is installed and whether referenced `pass:` entries resolve (by
+# store-file presence, NO decrypt) and PRINTS the honest threat-model caveat.
+doctor_secrets() {
+  echo "--- worktree-secrets ---"
+  echo "note same-uid: the agent CAN read injected secrets (cat / pass show)."
+  echo "     this gives auto-injection + accidental-commit protection + encryption-at-rest,"
+  echo "     NOT secrecy from the agent. (See FLEET.md 'Worktree secrets'.)"
+  local sbase="$CONF_DIR/secrets"
+  if [ ! -d "$sbase" ]; then echo "ok   no secrets configured ($sbase absent)"; return 0; fi
+  secrets_readme
+  if command -v pass >/dev/null 2>&1; then echo "ok   pass installed ($(command -v pass))"
+  else echo "warn pass not installed (pass: sugar inert; plain-file secrets still work)"; fi
+  local store="${PASSWORD_STORE_DIR:-$HOME/.password-store}" f first entry
+  while IFS= read -r -d '' f; do
+    first=$(head -1 "$f" 2>/dev/null)
+    [ "${first#pass:}" != "$first" ] || continue
+    entry="${first#pass:}"
+    if [ -f "$store/$entry.gpg" ]; then echo "ok   pass entry resolves: $entry"
+    else echo "warn pass entry missing: $entry"; fi
+  done < <(find "$sbase" -mindepth 2 -type f -print0 2>/dev/null)
+  return 0
 }
 
 # config-sync guardrails (docs/config-sync-architecture.md §3.4). Read-only,
@@ -4598,6 +4758,7 @@ case "${1:-}" in
   orch-jump)  shift; cmd_orch_jump "$@" ;;            # internal: prefix-key jump to orchestrator pane
   main-pane)  shift; cmd_main_pane "$@" ;;            # internal: orchestrator pane id (dash pop target)
   safe-kill-window) shift; safe_kill_window "$@" ;;   # internal: brake — refuse to kill main/last/empty (dash routes kills here)
+  inject-secrets) shift; inject_secrets "$@" ;;       # internal: mirror per-repo secrets into a worktree (also called by cmd_new)
   dash-new)   shift; cmd_dash_new "$@" ;;             # internal: leader 'new' -> dash's own form
   dash-triage) shift; cmd_dash_triage "$@" ;;         # internal: leader 'triage' -> dash's cross-agent triage view
   apply-keybinds) shift; apply_keybinds ;;            # internal: re-apply runtime keybinds live
