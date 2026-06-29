@@ -49,7 +49,15 @@ this project with the `fleet` CLI.
 - `fleet watch <agent>... -m "message"` — **don't busy-poll.** Returns
   immediately and arms a background watcher; when every named agent goes idle it
   delivers `"message"` into your pane, waking you. Use this to wait on agents
-  without burning your own turn in a `sleep`/`fleet ls` loop.
+  without burning your own turn in a `sleep`/`fleet ls` loop. **Sub-orch wake
+  guarantee:** when the waiting pane is a **sub-orch** (or any non-main pane), the
+  watcher retries the in-band wake and **confirms it actually landed** (the
+  sub-orch must go `working`); if it can't be delivered (input busy, pane parked,
+  or the agent never resumes) the wake is **escalated to a durable inbox message**
+  (a sev=warn **⚙ system** ✉ naming `so-<id>`, desktop-notified) instead of being
+  silently dropped — pop it to resume that sub-orch. The **main** (human) pane is
+  unchanged: it is never send-keys'd, its wake stays out-of-band (toast + bell +
+  dashboard alert).
 - `fleet ready [<agent>] [-m "reason"]` — signal that a work item is **done and
   its worktree is ready for deletion.** A worker runs bare `fleet ready` from
   inside its own worktree; you flag someone else's with `fleet ready <agent>`.

@@ -262,6 +262,15 @@ fleet ls | grep -F "<repo>/${branch//\//_}"      # already a live/known worker?
 - **Periodically self-reconcile** while alive: re-read the ledger, re-check that each
   worker you own is still live (`fleet ls`), and re-arm a dropped watch. This recovers a
   lost `send-keys` poke on the next tick.
+- **Your wake can't be silently lost anymore.** When your workers go idle, `fleet watch`
+  retries the wake into your pane and **confirms it landed** (your pane must go
+  `working`). If it can't deliver — your input held a draft, you were parked, or you
+  never resumed — it **escalates the wake to the human's inbox** as a sev=warn **⚙
+  system** message naming your `so-<id>`, and the human pops it to resume you. So a
+  parked turn is recoverable by the human even if the in-band poke was undeliverable;
+  you do **not** need to poll `alerts.log` or the inbox yourself. (You still self-
+  reconcile per the bullet above — the escalation is the human's safety net, not your
+  primary path.)
 
 ## 5. Report to the human via the INBOX — never the main input line
 

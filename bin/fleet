@@ -1411,20 +1411,40 @@ cmd_watch() {
   done
   [ -n "$msg" ] || msg="fleet: agents now idle — ${targets[*]}"
   local self="$FLEET_DIR/bin/fleet"
+  # Pass this pane's FLEET_SUBORCH_ID (so-d<N>, empty for main/workers) as the soid
+  # positional: a sub-orch's detached watcher then NAMES its escalation and gates the
+  # pane-death path on the dispatch ledger. (The setsid child also inherits the env, so
+  # cmd_watch_run keeps an env fallback — belt and suspenders.)
+  local soid="${FLEET_SUBORCH_ID:-}"
   if command -v setsid >/dev/null; then
-    setsid "$self" watch-run "$pane" "$msg" "${targets[@]}" </dev/null >/dev/null 2>&1 &
+    setsid "$self" watch-run "$pane" "$msg" "$soid" "${targets[@]}" </dev/null >/dev/null 2>&1 &
   else
-    nohup "$self" watch-run "$pane" "$msg" "${targets[@]}" </dev/null >/dev/null 2>&1 &
+    nohup "$self" watch-run "$pane" "$msg" "$soid" "${targets[@]}" </dev/null >/dev/null 2>&1 &
   fi
   echo "watching ${targets[*]} in the background — this pane gets pinged when they're all idle. End your turn; you'll be woken."
 }
 
-cmd_watch_run() { # watch-run <pane> <msg> <target...>  (detached; internal)
-  local pane="$1" msg="$2"; shift 2
+cmd_watch_run() { # watch-run <pane> <msg> <soid> <target...>  (detached; internal)
+  local pane="$1" msg="$2" soid="${3:-}"; shift 3
+  # soid resolution: explicit argv (cmd_watch passes FLEET_SUBORCH_ID) -> env fallback
+  # (the setsid child inherits it) -> window-name so-* fallback. soid only NAMES an
+  # escalation; the retry+escalate path runs for EVERY non-main pane regardless (Q7).
+  [ -n "$soid" ] || soid="${FLEET_SUBORCH_ID:-}"
+  if [ -z "$soid" ]; then
+    local wn; wn=$(tmux display -p -t "$pane" '#{window_name}' 2>/dev/null)
+    case "$wn" in so-*) soid="$wn" ;; esac
+  fi
   local targets=("$@") streak=0 i tsv state t alldone blocked
   for (( i=0; i<2700; i++ )); do          # ~90min cap at 2s/iteration
     sleep 2
-    tmux display -p -t "$pane" '#{pane_id}' >/dev/null 2>&1 || return 0   # pane gone
+    if ! tmux display -p -t "$pane" '#{pane_id}' >/dev/null 2>&1; then
+      # Pane gone. R-3: a SUB-ORCH pane that vanished while its dispatch is still active
+      # (non-terminal ledger) must not silently swallow the wake — escalate durably.
+      # A worker pane (no soid) or an already-terminal sub-orch just stops the watcher.
+      [ -n "$soid" ] && suborch_ledger_active "$soid" \
+        && wake_escalate "fleet watch: $soid's pane vanished while work was still active — $msg" normal "$soid"
+      return 0
+    fi
     tsv=$(agents_tsv 2>/dev/null)
     alldone=1; blocked=""
     for t in "${targets[@]}"; do
@@ -1433,20 +1453,19 @@ cmd_watch_run() { # watch-run <pane> <msg> <target...>  (detached; internal)
       [ "$state" = blocked ] && blocked="$t"
     done
     if [ -n "$blocked" ]; then            # an agent needs input — stop waiting and say so
-      # Route through the one safe-delivery primitive. The main pane is auto-pinned
-      # out-of-band inside cmd_notify; a sub-orch pane gets the in-band wake iff its
-      # input is provably empty/generating. NOTE: the trailing unconditional Enter
-      # the old code sent is deliberately gone — cmd_notify owns delivery now.
-      cmd_notify "$pane" "fleet watch: agent '$blocked' is BLOCKED and needs your input (won't go idle on its own) — $msg" inband-ok blocked
+      # Route through the wake COMPOSER: main pane stays OOB (byte-for-byte today), every
+      # non-main pane gets bounded in-band retry + F1-confirmed delivery, falling through
+      # to a durable deduped inbox escalation if the wake can't be confirmed landed.
+      deliver_wake "$pane" "fleet watch: agent '$blocked' is BLOCKED and needs your input (won't go idle on its own) — $msg" blocked "$soid"
       return 0
     fi
     if [ "$alldone" = 1 ]; then streak=$((streak+1)); else streak=0; fi
     (( streak >= 3 )) && break             # idle for ~6s straight → done (not a blip)
   done
   if (( streak >= 3 )); then               # loop broke because agents went idle
-    cmd_notify "$pane" "$msg" inband-ok
+    deliver_wake "$pane" "$msg" normal "$soid"
   else                                     # loop ran out the wait cap — still busy
-    cmd_notify "$pane" "fleet watch: timed out after ~90min — still busy: ${targets[*]}" inband-ok
+    deliver_wake "$pane" "fleet watch: timed out after ~90min — still busy: ${targets[*]}" normal "$soid"
   fi
 }
 
@@ -2047,12 +2066,24 @@ append_dashboard_alert() { # <msg>
   printf '%s\t%s\n' "$(date -Is 2>/dev/null || date)" "$1" >> "$f" 2>/dev/null || true
 }
 
+# rc 0 iff an in-band send-keys into <pane>'s orchestrator input will LAND: the box is
+# empty, or a generating claude that queues the keys. Extracted from cmd_notify so the
+# watcher composer can own the deliverability DECISION without duplicating the state
+# list — and crucially WITHOUT touching cmd_notify's contract/rc (F2: no `return 10`,
+# so the public `fleet notify` CLI arm stays fail-silent exit-0). Pure read.
+orch_inband_deliverable() { # <pane>
+  local pane="${1:-}" state
+  [ -n "$pane" ] || return 1
+  state=$(orch_input_state "$pane")
+  [ "$state" = empty ] || [ "$state" = generating ]
+}
+
 # The single safe-delivery primitive (§6.4). policy: inband-ok (sub-orch/worker) |
 # oob (out-of-band only). class: normal | blocked (blocked = the only popup-worthy
 # class). The MAIN pane is HARD-PINNED to oob here regardless of caller, so no
 # security boundary rides on the scraper for the pane a human drives.
 cmd_notify() { # notify <pane> <msg> [policy] [class]
-  local pane="${1:-}" msg="${2:-}" policy="${3:-inband-ok}" class="${4:-normal}" wname state tty
+  local pane="${1:-}" msg="${2:-}" policy="${3:-inband-ok}" class="${4:-normal}" wname tty
   [ -n "$pane" ] && [ -n "$msg" ] || die "usage: fleet notify <pane> \"msg\" [inband-ok|oob] [normal|blocked]"
 
   # Hard pin: never send-keys into the main (human) pane. Detect it via
@@ -2061,13 +2092,10 @@ cmd_notify() { # notify <pane> <msg> [policy] [class]
   wname=$(tmux display -p -t "$pane" '#{window_name}' 2>/dev/null)
   is_main_pane "$pane" && policy=oob
 
-  if [ "$policy" = inband-ok ]; then
-    state=$(orch_input_state "$pane")
-    if [ "$state" = empty ] || [ "$state" = generating ]; then
-      tmux send-keys -t "$pane" -l "$msg" 2>/dev/null
-      tmux send-keys -t "$pane" Enter     2>/dev/null
-      return 0
-    fi
+  if [ "$policy" = inband-ok ] && orch_inband_deliverable "$pane"; then
+    tmux send-keys -t "$pane" -l "$msg" 2>/dev/null
+    tmux send-keys -t "$pane" Enter     2>/dev/null
+    return 0
   fi
 
   # OUT-OF-BAND: toast + (blocked only) a non-blocking popup + verbatim bell + panel.
@@ -2082,6 +2110,147 @@ cmd_notify() { # notify <pane> <msg> [policy] [class]
   tty=$(tmux display -p -t "$pane" '#{pane_tty}' 2>/dev/null)   # verbatim — no /dev/pts strip
   [ -n "$tty" ] && printf '\a' > "$tty" 2>/dev/null
   append_dashboard_alert "$msg"
+}
+
+# ---- watcher wake composer (sub-orch wake-drop fix) ---------------------------
+# A `fleet watch` armed from a SUB-ORCH pane used to deliver its wake through a SINGLE
+# cmd_notify call. cmd_notify only send-keys in-band when the input is empty/generating;
+# otherwise it falls to OOB (toast/bell/alerts.log) — which is a DEAD END for a sub-orch
+# (it polls neither alerts.log nor the inbox), so the wake evaporated and the pipeline
+# silently stalled. deliver_wake replaces those single shots with a two-layer delivery:
+# bounded in-band retry, each attempt CONFIRMED behaviourally (the wake is "landed" only
+# if the sub-orch actually goes `working`), falling through to a durable, deduped,
+# system-origin inbox escalation the human can pop. The MAIN pane keeps today's exact
+# OOB behaviour. Tunables (env-overridable for the proof harness; defaults match spec).
+: "${FLEET_WAKE_RETRIES:=5}"    # in-band retry attempts (~5, Q2)
+: "${FLEET_WAKE_INTERVAL:=2}"   # seconds between non-deliverable polls (~2s, flat — no backoff)
+: "${FLEET_WAKE_CONFIRM:=6}"    # post-send @agent_state->working confirm window (~6s, F1)
+
+# F1 behavioural confirmation. After an in-band send, the wake counts as LANDED only if
+# the target pane's daemon-mirrored @agent_state reads `working` within the confirm
+# window. A send-keys that raced a state flip, landed in a stale/parked pane, or was
+# swallowed mid-generation never flips it -> rc 1, so the composer keeps retrying /
+# escalates instead of silently declaring success (the original-bug reintroduction this
+# closes). rc 0 the moment `working` is observed. Fail-silent.
+wake_confirmed() { # <pane>
+  local pane="${1:-}" waited=0 st
+  [ -n "$pane" ] || return 1
+  while [ "$waited" -lt "${FLEET_WAKE_CONFIRM:-6}" ]; do
+    st=$(tmux show -wqv -t "$pane" @agent_state 2>/dev/null)
+    [ "$st" = working ] && return 0
+    sleep 1; waited=$((waited+1))
+  done
+  st=$(tmux show -wqv -t "$pane" @agent_state 2>/dev/null)   # final read after the last sleep
+  [ "$st" = working ]
+}
+
+# rc 0 iff the dispatch ledger entry for this sub-orch id is NON-TERMINAL (work not
+# already done/failed/cancelled) — the Q5/F5 gate for PANE-DEATH escalation (a sub-orch
+# that already wrote a terminal state needs no human nudge). Uses the EXACT terminal set
+# cmd_reconcile uses, so the two can never disagree about a dispatch's liveness. soid may
+# be the so-d<N>[-slug] window name or a bare d<N>; normalize to the ledger id either way.
+suborch_ledger_active() { # <soid>
+  local soid="${1:-}" did root st d
+  [ -n "$soid" ] || return 1
+  did="${soid#so-}"; did="${did%%-*}"          # so-d11[-slug] -> d11
+  root=$(fleet_root 2>/dev/null) || return 1
+  d="$root/.fleet/dispatch/$did"
+  [ -d "$d" ] || return 1                        # no ledger -> not an active dispatch
+  st=$(meta_get "$d" state 2>/dev/null)
+  case "$st" in done|failed|cancelled) return 1 ;; *) return 0 ;; esac
+}
+
+# F3 dedup scan: is an UNREAD (live, un-archived) system-origin wake escalation naming
+# this soid already queued? Mirrors inbox_has_needs_human_from's scan shape. Matches our
+# own body marker `[FLEET-WAKE soid=<soid>]` so it can never collide with an unrelated
+# message. (inbox_put --key does NOT dedup — zero consumers — so this explicit scan is
+# required, not optional.) Pure read; rc 0 = a dup exists -> skip the second escalation.
+wake_escalation_pending() { # <soid>
+  local soid="${1:-}" dir f
+  [ -n "$soid" ] || return 1
+  dir=$(inbox_dir 2>/dev/null) || return 1
+  [ -d "$dir" ] || return 1
+  for f in "$dir"/*.msg; do
+    [ -e "$f" ] || continue
+    [ "$(inbox_field "$f" from)" = "-" ] || continue        # cheap pre-filter: system-origin only
+    inbox_body "$f" | grep -qF "[FLEET-WAKE soid=$soid]" && return 0
+  done
+  return 1
+}
+
+# Durable fall-through when an in-band wake could not be CONFIRMED landed. SYSTEM-ORIGIN
+# (`inbox_put --from -`): inbox_route then returns dest=main submit=0, so it surfaces in
+# the dashboard ⚙ system row and desktop-notifies WITHOUT looping back into the stuck
+# sub-orch pane (the from=so-* auto-submit footgun). The body NAMES so-<id> for one-key
+# jump. F3 dedup is made atomic with the existing mkdir spawn-lock so two concurrent
+# watchers collapse to exactly ONE message. sev: warn (done/timeout) | blocked
+# (class=blocked). Fail-silent throughout; optional R-1 belt OOBs to main if the put fails.
+wake_escalate() { # <msg> <class> <soid>
+  local msg="${1:-}" class="${2:-normal}" soid="${3:-}"
+  local sev=warn; [ "$class" = blocked ] && sev=blocked
+  local name="${soid:-this agent}"
+  # Atomic dedup: hold a per-soid lock across scan+write so the scan can't race a peer.
+  local dir lk=""
+  if [ -n "$soid" ] && dir=$(inbox_dir 2>/dev/null) && [ -n "$dir" ]; then
+    mkdir -p "$dir" 2>/dev/null || true
+    lk="$dir/.wake-${soid}.lock"
+    acquire_lock "$lk" 2>/dev/null || lk=""    # best-effort: degrade to unlocked scan on contention
+  fi
+  if [ -n "$soid" ] && wake_escalation_pending "$soid"; then
+    [ -n "$lk" ] && release_lock "$lk" 2>/dev/null
+    append_dashboard_alert "wake: escalation for $name already queued — not duplicating"
+    return 0
+  fi
+  local title="sub-orch $name wake undelivered — resume to continue"
+  local body="[FLEET-WAKE soid=$name]
+fleet watch tried to wake $name in-band but could not confirm the wake landed (input busy, or the agent never resumed).
+$msg
+▸ POP this to resume $name (jump to its window and send to continue its pipeline)."
+  if ! inbox_put --from - --sev "$sev" -t "$title" -m "$body" >/dev/null 2>&1; then
+    local mp; mp=$(cmd_main_pane 2>/dev/null)   # R-1 belt: inbox write failed -> OOB to the human pane
+    [ -n "$mp" ] && cmd_notify "$mp" "$title" oob "$class" 2>/dev/null || true
+  fi
+  [ -n "$lk" ] && release_lock "$lk" 2>/dev/null
+  append_dashboard_alert "wake-escalation: $title"
+}
+
+# The watcher-side wake COMPOSER. Routes one watch outcome to the right delivery:
+#   - MAIN pane            -> a single OOB cmd_notify (today's behaviour, byte-for-byte;
+#                             the human pane is NEVER send-keys'd).
+#   - every NON-main pane  -> bounded in-band retry (safety is NOT gated on whether we
+#                             could prove it's a sub-orch — Q7/R-4 — a stranded worker
+#                             gets the same care), each send F1-confirmed; on exhaustion,
+#                             unconfirmed delivery, or pane-death-with-active-ledger, a
+#                             durable deduped escalation. soid (so-d<N>) only NAMES the
+#                             escalation; it does not gate the path.
+deliver_wake() { # <pane> <msg> <class> <soid>
+  local pane="${1:-}" msg="${2:-}" class="${3:-normal}" soid="${4:-}"
+  [ -n "$pane" ] || return 0
+
+  if is_main_pane "$pane"; then
+    cmd_notify "$pane" "$msg" oob "$class"
+    return 0
+  fi
+
+  local i confirmed=0 panedead=0
+  for (( i=0; i < ${FLEET_WAKE_RETRIES:-5}; i++ )); do
+    if ! tmux display -p -t "$pane" '#{pane_id}' >/dev/null 2>&1; then panedead=1; break; fi
+    if orch_inband_deliverable "$pane"; then
+      cmd_notify "$pane" "$msg" inband-ok "$class"
+      if wake_confirmed "$pane"; then confirmed=1; break; fi   # F1: only `working` counts as landed
+    else
+      sleep "${FLEET_WAKE_INTERVAL:-2}"
+    fi
+  done
+  [ "$confirmed" = 1 ] && return 0
+
+  # Pane died: escalate ONLY if the ledger says work is still active (Q5/F5); an
+  # already-terminal sub-orch (or a non-dispatch pane with no ledger) just stops here.
+  if [ "$panedead" = 1 ] && ! suborch_ledger_active "$soid"; then
+    return 0
+  fi
+
+  wake_escalate "$msg" "$class" "$soid"
 }
 
 # ---- inbox (durable worker→orchestrator message queue) ------------------------
@@ -4771,6 +4940,7 @@ case "${1:-}" in
   send)    shift; cmd_send "$@" ;;
   watch)     shift; cmd_watch "$@" ;;
   watch-run) shift; cmd_watch_run "$@" ;;  # internal: detached watcher
+  deliver-wake) shift; deliver_wake "$@" ;;  # internal: watcher wake composer (also driven by the proof harness)
   ready)   shift; cmd_ready "$@" ;;        # flag a worktree done/ready for reap
   reap)    shift; cmd_reap "$@" ;;         # remove flagged-ready worktrees
   inbox)   shift; cmd_inbox "$@" ;;        # durable worker→orchestrator message queue
