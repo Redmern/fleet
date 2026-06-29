@@ -52,3 +52,28 @@ RESULT: ALL PASS — worktree-secrets v1 proven.
 existing assertion weakened. `bash -n bin/fleet` clean. Fail-silent preserved
 (every git call `2>/dev/null || true`; the only fail-CLOSED point remains the
 realpath confinement). NOT merged.
+
+## Loop-3 — `.git/` confinement guard (one-line case)
+
+Added before the symlink check in `inject_secrets`:
+```sh
+case "/$rel/" in
+  */.git/*) printf 'fleet: secret %s targets a git dir, refused\n' "$rel" >&2
+     audit_secret "$audit" "$repo" "$rel" git-dir; continue ;;
+esac
+```
+Wrapping the rel path in `/…/` makes `.git`, `.git/hooks/x`, `sub/.git`, and
+`sub/.git/x` all match `*/.git/*` — refusing any `.git` path component (top-level
+worktree git dir or a nested submodule's) before any rm/cp. Outcome audited
+`git-dir` (a REAL failure, never ok); no exclude line for the refused placement;
+a sound sibling in the same run still lands (`continue`, not abort).
+
+### GREEN output
+
+```
+== summary: 0 failed ==
+RESULT: ALL PASS — worktree-secrets v1 proven.
+```
+**71 PASS / 0 FAIL.** Scenarios 1–12 unchanged and still green. `bash -n bin/fleet`
+clean. Fail-silent preserved (the fail-CLOSED confinement points are unchanged
+in spirit — this just extends them to the git dir). NOT merged.

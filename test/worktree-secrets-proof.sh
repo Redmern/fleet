@@ -342,6 +342,28 @@ echo "== worktree-secrets-proof: honest same-uid v1 =="
   grep -qxF '/.env.good' "$(EXCL)" 2>/dev/null && pass "$c" "sound secret excluded normally" || fail "$c" "sound secret not excluded"
 ) ; [ $? = 0 ] || true
 
+# --- Scenario 13: dest inside .git/ is refused (loop-3 confinement) ------------
+# realpath-confinement only proves the dest stays inside $dir — but $dir/.git IS
+# inside $dir, so a secret whose rel path lands under .git/ (e.g. a planted
+# .git/hooks/pre-commit → code execution, or a clobbered .git/config) sails through.
+# Any `.git` path component must be refused: nothing written into .git/, audit
+# `git-dir` (a REAL failure, never ok), no exclude line, exit 0, and a sound
+# sibling in the same run still lands (mid-list isolation).
+( c=13
+  new_box myapp
+  printf 'GOODVAL' > "$SECRETS/.env.good"                            # well-formed sibling
+  mkdir -p "$SECRETS/.git/hooks"
+  printf '#!/bin/sh\necho PWNED\n' > "$SECRETS/.git/hooks/pre-commit"  # would plant a hook
+  out=$(inject myapp 2>&1); rc=$?
+  [ "$rc" = 0 ] && pass "$c" "exit 0 (per-file refuse, not fatal)" || fail "$c" "exit $rc ($out)"
+  if grep -qF PWNED "$WT/.git/hooks/pre-commit" 2>/dev/null; then
+    fail "$c" "secret written INTO .git/ (hook planted)"
+  else pass "$c" "no secret planted in .git/"; fi
+  grep -qE '\.git/hooks/pre-commit	git-dir$' "$AUDIT" 2>/dev/null && pass "$c" "git-dir audited as failure (not ok)" || fail "$c" "git-dir not audited as failure"
+  if grep -qF '.git/hooks/pre-commit' "$(EXCL)" 2>/dev/null; then fail "$c" "refused git-dir placement still excluded"; else pass "$c" "no exclude line for refused git-dir"; fi
+  [ "$(cat "$WT/.env.good" 2>/dev/null)" = GOODVAL ] && pass "$c" "sibling secret still lands (mid-list isolation)" || fail "$c" "sound secret missing"
+) ; [ $? = 0 ] || true
+
 N=0; [ -f "$FAILMARK" ] && N=$(wc -l < "$FAILMARK" 2>/dev/null | tr -d ' '); N=${N:-0}
 echo "== summary: $N failed =="
 if [ "$N" = 0 ]; then echo "RESULT: ALL PASS — worktree-secrets v1 proven."; exit 0

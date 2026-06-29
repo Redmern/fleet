@@ -853,6 +853,13 @@ inject_secrets() { # <repo> <dir>
       *$'\n'*|*$'\r'*) printf 'fleet: secret name contains newline/CR, rejected\n' >&2
          audit_secret "$audit" "$repo" "$rel" bad-name; continue ;;
     esac
+    # realpath-confinement only proves the dest stays inside $dir — but $dir/.git IS
+    # inside $dir, so any `.git` path component (top-level worktree git dir or a
+    # nested submodule's) would let a secret plant a hook / clobber git config. Refuse it.
+    case "/$rel/" in
+      */.git/*) printf 'fleet: secret %s targets a git dir, refused\n' "$rel" >&2
+         audit_secret "$audit" "$repo" "$rel" git-dir; continue ;;
+    esac
     # Reject a source entry that is itself a symlink — never follow it out of $src.
     if [ -L "$f" ]; then
       printf 'fleet: secret %s is a symlink, refused\n' "$rel" >&2

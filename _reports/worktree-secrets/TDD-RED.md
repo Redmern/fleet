@@ -34,3 +34,23 @@ All 7 failures isolated to the two new scenarios; scenarios 1–8 (prior loop) s
 GREEN — no existing assertion weakened. Scenario 10's `tracked file corrupted=''`
 is the smoking gun: `chmod 600` on the directory removed traversal (`x`), so the
 tracked `config/keep` under it became unreadable.
+
+## Loop-3 — dest inside `.git/` bypasses confinement (one-line fix)
+
+The realpath confinement only proves the dest stays inside `$dir`; but `$dir/.git`
+*is* inside `$dir`, so a secret whose rel path lands under `.git/` (e.g.
+`.git/hooks/pre-commit` → code execution on next commit, or a clobbered
+`.git/config`) sails straight through. Scenario 13 added to
+`test/worktree-secrets-proof.sh` FIRST.
+
+### RED output (guard NOT yet added)
+
+```
+  FAIL(13): secret written INTO .git/ (hook planted)
+  FAIL(13): git-dir not audited as failure
+  FAIL(13): refused git-dir placement still excluded
+== summary: 3 failed ==
+RESULT: 3 assertion(s) FAILED.
+```
+
+3 failures isolated to scenario 13; scenarios 1–12 still GREEN.
