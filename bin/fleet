@@ -844,6 +844,15 @@ inject_secrets() { # <repo> <dir>
   while IFS= read -r -d '' f; do
     rel="${f#"$srcr"/}"
     dest="$dir/$rel"
+    # A newline or CR in the relative path can never be written as a SINGLE git
+    # info/exclude line (`printf '/%s\n'` would split it, breaking both the exclude
+    # and the dedup grep), so the value could not be made uncommittable. Such a
+    # filename is almost certainly a mistake or attack — refuse it EARLY, before any
+    # realpath/confinement work and before any rm/cp, so we write nothing at all.
+    case "$rel" in
+      *$'\n'*|*$'\r'*) printf 'fleet: secret name contains newline/CR, rejected\n' >&2
+         audit_secret "$audit" "$repo" "$rel" bad-name; continue ;;
+    esac
     # Reject a source entry that is itself a symlink — never follow it out of $src.
     if [ -L "$f" ]; then
       printf 'fleet: secret %s is a symlink, refused\n' "$rel" >&2
@@ -880,6 +889,7 @@ inject_secrets() { # <repo> <dir>
     rm -f "$dest" 2>/dev/null || true                         # never write through a symlink at dest
     outcome=ok
     first=$(head -1 "$f" 2>/dev/null)
+    first=${first%$'\r'}                                      # CR-tolerant directive parse (CRLF-authored secret files); plain-file bytes untouched
     if [ "${first#pass:}" != "$first" ]; then
       # `pass:` sugar — resolve the entry, stream the value straight to dest.
       entry="${first#pass:}"

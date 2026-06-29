@@ -290,6 +290,58 @@ echo "== worktree-secrets-proof: honest same-uid v1 =="
   if grep -qxF '/config' "$(EXCL)" 2>/dev/null; then fail "$c" "refused placement still excluded"; else pass "$c" "no exclude line for refused dir"; fi
 ) ; [ $? = 0 ] || true
 
+# --- Scenario 11: `pass:` directive with CRLF line endings (footgun 1) --------
+# A secret file authored on Windows ends the directive with \r\n, so `head -1`
+# keeps a trailing \r and the parsed entry becomes `…\r` — the pass lookup then
+# misses and the secret is audited `missing` instead of resolving. The directive
+# parse must tolerate (strip) the CR. Uses a throwaway batch GPG key + pass store;
+# the DECRYPTED value must land byte-exact (and NO CR may leak into it).
+( c=11
+  type -P gpg >/dev/null 2>&1 && type -P pass >/dev/null 2>&1 || { pass "$c" "gpg/pass absent — scenario skipped"; exit 0; }
+  new_box myapp
+  export GNUPGHOME="$BOX/gnupg"; mkdir -p "$GNUPGHOME"; chmod 700 "$GNUPGHOME"
+  export PASSWORD_STORE_DIR="$BOX/store"
+  gpg --batch --pinentry-mode loopback --passphrase '' \
+      --quick-generate-key 'Fleet Test <test@fleet>' default default never >/dev/null 2>&1
+  keyid=$(gpg --homedir "$GNUPGHOME" --list-keys --with-colons test@fleet 2>/dev/null | awk -F: '/^fpr:/{print $10; exit}')
+  if [ -z "$keyid" ]; then pass "$c" "could not mint throwaway key — scenario skipped"; gpgconf --homedir "$GNUPGHOME" --kill gpg-agent 2>/dev/null; exit 0; fi
+  # NB: the harness defines pass()/fail() shell functions that shadow the `pass`
+  # password-manager binary — use `command pass` here to reach the real tool.
+  command pass init "$keyid" >/dev/null 2>&1
+  printf 'DECRYPTED_SENTINEL_VALUE' | command pass insert -m -f fleet/myapp/db-url >/dev/null 2>&1
+  printf 'pass:fleet/myapp/db-url\r\n' > "$SECRETS/.env.local"        # CRLF directive
+  out=$(inject myapp PASSWORD_STORE_DIR="$PASSWORD_STORE_DIR" GNUPGHOME="$GNUPGHOME" 2>&1); rc=$?
+  [ "$rc" = 0 ] && pass "$c" "exit 0" || fail "$c" "exit $rc ($out)"
+  if [ -f "$WT/.env.local" ]; then pass "$c" "dest placed (CRLF directive resolved)"; else fail "$c" "dest missing — CR broke the pass lookup"; fi
+  got=$(cat "$WT/.env.local" 2>/dev/null)
+  [ "$got" = "DECRYPTED_SENTINEL_VALUE" ] && pass "$c" "decrypted value byte-exact" || fail "$c" "content='$got'"
+  if grep -qE '	ok$' "$AUDIT" 2>/dev/null; then pass "$c" "audit outcome=ok"; else fail "$c" "audit not ok (recorded missing?)"; fi
+  if grep -qE '	missing$' "$AUDIT" 2>/dev/null; then fail "$c" "audit wrongly recorded missing (CR not stripped)"; else pass "$c" "audit not missing"; fi
+  gpgconf --homedir "$GNUPGHOME" --kill gpg-agent 2>/dev/null
+) ; [ $? = 0 ] || true
+
+# --- Scenario 12: newline in a secret's source filename (footgun 2) -----------
+# A `$rel` containing a newline cannot be written as a single git info/exclude
+# line (`printf '/%s\n'` splits it), corrupting the exclude + the dedup grep. Such
+# a name is a mistake/attack and must be REJECTED early (nothing written, audit
+# `bad-name`, exit 0), the exclude must gain NO split/garbage line, AND a SOUND
+# secret in the same run must still land (mid-list isolation — `continue`, not abort).
+( c=12
+  new_box myapp
+  printf 'GOODVAL' > "$SECRETS/.env.good"                            # well-formed sibling
+  : > "$SECRETS/$(printf 'bad\nname')"                               # source name has a newline
+  out=$(inject myapp 2>&1); rc=$?
+  [ "$rc" = 0 ] && pass "$c" "exit 0 (per-file reject, not fatal)" || fail "$c" "exit $rc ($out)"
+  # exactly ONE secret file placed (the good one); the bad-name file wrote nothing.
+  cnt=$(find "$WT" -mindepth 1 -type f -not -path "$WT/.git/*" -print0 2>/dev/null | tr -dc '\0' | wc -c)
+  [ "$cnt" = 1 ] && pass "$c" "only the sound secret landed (count=1)" || fail "$c" "$cnt files placed — bad-name file was written"
+  [ "$(cat "$WT/.env.good" 2>/dev/null)" = GOODVAL ] && pass "$c" "sibling secret still lands (mid-list isolation)" || fail "$c" "sound secret missing"
+  grep -qE 'bad-name' "$AUDIT" 2>/dev/null && pass "$c" "audit outcome=bad-name" || fail "$c" "audit missing bad-name"
+  # the split second half of the rel ('name') must NOT appear as an exclude line.
+  if grep -qxF 'name' "$(EXCL)" 2>/dev/null; then fail "$c" "exclude gained a split garbage line"; else pass "$c" "no split/garbage exclude line"; fi
+  grep -qxF '/.env.good' "$(EXCL)" 2>/dev/null && pass "$c" "sound secret excluded normally" || fail "$c" "sound secret not excluded"
+) ; [ $? = 0 ] || true
+
 N=0; [ -f "$FAILMARK" ] && N=$(wc -l < "$FAILMARK" 2>/dev/null | tr -d ' '); N=${N:-0}
 echo "== summary: $N failed =="
 if [ "$N" = 0 ]; then echo "RESULT: ALL PASS — worktree-secrets v1 proven."; exit 0
