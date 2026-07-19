@@ -199,7 +199,7 @@ safe_kill_window() { # <window-id-or-target>
   tmux kill-window -t "$win" 2>/dev/null
 }
 
-agents_tsv() { # state<TAB>label<TAB>session<TAB>window_id<TAB>window_name<TAB>since<TAB>pane_id
+agents_tsv() { # state<TAB>label<TAB>session<TAB>window_id<TAB>window_name<TAB>since<TAB>pane_id<TAB>age<TAB>ready
   local json
   if json=$(rpc fleet.list); then
     python3 - "$json" <<'PY'
@@ -273,7 +273,12 @@ PY
           # window must still be recognized (is_main_pane reads the role registry).
           [ "$wname" = main ] && continue
           is_main_pane "$pane" && continue
-          printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$st" "$(agent_label "$path")" "$sess" "$wid" "$wname" "$since" "$pane"
+          # NINE fields, exactly as the daemon path above. The trailing two (age,
+          # ready) are legitimately unavailable here — but the COUNT is what
+          # matters: consumers index field 8 (age) and field 9 (ready), so a
+          # 7-field row made the ready column always empty and NO UI ever painted
+          # `done` while `fleet reap` still destroyed the worktree.
+          printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t\t\n' "$st" "$(agent_label "$path")" "$sess" "$wid" "$wname" "$since" "$pane"
         done
   fi
 }
@@ -1070,6 +1075,11 @@ cmd_new() {
     # Inject per-repo secrets now the worktree exists, before the window spawns.
     # No-op unless ~/.config/fleet/secrets/<repo>/ exists; fail-silent throughout.
     inject_secrets "$(basename "$repo_base")" "$dir" || true
+    # DURABLE copy of the completion instruction. The prompt trailer seeded below
+    # dies with the first context window (a /clear or a compaction drops it); this
+    # file is what the worker can RE-read. Covered by the same /.fleet/ exclude
+    # written just above, so it never dirties the tree.
+    ready_instructions >"$dir/.fleet/ready-instructions" 2>/dev/null || true
   fi
 
   # OWNER + WORKER-PREFIX (Phase B / d<N> naming). A worker spawned BY a sub-orch
@@ -1085,6 +1095,18 @@ cmd_new() {
     _owner="$FLEET_SUBORCH_ID"
     local _did="${FLEET_SUBORCH_ID#so-}"; _did="${_did%%-*}"   # so-d11[-slug] -> d11
     case "$_did" in d[0-9]*) wname="$_did-$wname" ;; esac       # d11-<repo>/<branchdir>
+  fi
+
+  # Seed the completion instruction onto the worker's first prompt, so being told
+  # to self-mark is DETERMINISTIC rather than ambient. The original -p is
+  # preserved verbatim above the trailer. Two skips:
+  #   --scratch — no worktree at all, so `fleet ready` would hit the bleed guard
+  #               and no-op; telling it to run one is noise.
+  #   no -p     — an empty pane the human is about to drive by hand.
+  if [ "$scratch" != 1 ] && [ -n "$prompt" ]; then
+    prompt="$prompt
+
+$(ready_instructions)"
   fi
 
   local hbin
@@ -3022,6 +3044,24 @@ dispatch_status() { # report whether the hook is wired + the ledger rollup
 # dashboard, and `fleet reap` then tears down every flagged worktree — refusing
 # any with uncommitted changes or an unmerged branch unless --force.
 
+# The completion instruction seeded into every worktree worker by cmd_new — both
+# as a trailer on its first prompt AND as a durable per-worktree file. Nothing
+# else in fleet ever tells a worker to self-mark: cmd_new passes -p through
+# verbatim, and workers complied only by luck (the project-root CLAUDE.md that
+# `fleet up` installs happens to be an ancestor of every worktree, so its
+# orchestrator-addressed "a worker runs bare `fleet ready`" sentence leaked in).
+# Worded to gate on THE TASK being complete, never on "the agent stopped talking":
+# a Stop-hook auto-mark was rejected precisely because idle is not done (a worker
+# is idle at the end of every turn, including the one where it asks a question).
+ready_instructions() {
+  cat <<'EOF'
+--- fleet ---
+When the work you were spawned for is COMPLETE and committed, run `fleet ready`
+from inside this worktree. That flags the worktree for deletion by `fleet reap`.
+Do NOT run it if you are pausing, blocked, or asking a question — only when done.
+EOF
+}
+
 cmd_ready() { # ready [<agent>] [-m "reason"] [--clear]
   local target="" reason="" clear=0
   while [ $# -gt 0 ]; do
@@ -3045,15 +3085,17 @@ cmd_ready() { # ready [<agent>] [-m "reason"] [--clear]
   fi
   [ -n "$dir" ] || die "could not resolve a worktree directory"
   local root; root=$(git -C "$dir" rev-parse --show-toplevel 2>/dev/null) || root="$dir"
-  # Scratch-ready bleed guard (self-path only). A scratch/repo-less/orchestrator
-  # agent lives at the project root, not in a per-branch worktree. Writing the
-  # marker there drops it into the SHARED root/.fleet/ready, which then falsely
-  # flags every other root-cwd agent (main, claude, sub-orchs) as done once the
-  # writer pane dies. Only the self-path (no <target>) can hit this: a worker in
-  # its own worktree resolves a real worktree root; the orchestrator flagging
-  # another agent by <target> targets that agent's worktree. --clear still runs
-  # (lets a stray root marker be cleaned up). Compare realpaths, fail-silent.
-  if [ -z "$target" ] && [ "$clear" != 1 ]; then
+  # Scratch-ready bleed guard. A scratch/repo-less/orchestrator agent lives at the
+  # project root, not in a per-branch worktree. Writing the marker there drops it
+  # into the SHARED root/.fleet/ready, which then falsely flags every other
+  # root-cwd agent (main, claude, sub-orchs) as done once the writer pane dies.
+  # Guards BOTH paths: the self-path (a scratch agent running bare `fleet ready`)
+  # and the <target> path — the orchestrator, or the dashboard's `y`, naming a
+  # scratch agent resolves that agent's cwd, which IS the shared root. Keying on
+  # the resolved root rather than on whether <target> was given is what makes this
+  # hold for every caller. --clear still runs (lets a stray root marker be cleaned
+  # up). Compare realpaths, fail-silent.
+  if [ "$clear" != 1 ]; then
     local proot; proot=$(fleet_root 2>/dev/null)
     if [ -n "$proot" ] \
        && [ "$(realpath "$root" 2>/dev/null || echo "$root")" = "$(realpath "$proot" 2>/dev/null || echo "$proot")" ]; then
@@ -3083,6 +3125,15 @@ cmd_ready() { # ready [<agent>] [-m "reason"] [--clear]
   # the writes succeeded. Check the actual outcome — a non-empty marker file.
   if [ -s "$marker" ]; then
     echo "marked ready for deletion: $root${reason:+ ($reason)}"
+    # SOFT warn only. `cmd_reap` removes LINKED worktrees; a plain working repo
+    # (used in place, no worktree layout) can be flagged and shown `done` but will
+    # never be reaped — a permanent tombstone. Say so, but still write the marker:
+    # the `done` pill is useful on its own, and refusing here would contradict the
+    # display. Never `die`.
+    case "$(git -C "$root" rev-parse --git-dir 2>/dev/null)" in
+      *"/worktrees/"*) ;;
+      *) echo "note: not a linked worktree — 'fleet reap' will skip this" ;;
+    esac
   else
     echo "could not write marker at $marker" >&2; return 1
   fi
@@ -3132,6 +3183,24 @@ cmd_reap() { # reap [<target>] [--force] — remove worktrees flagged ready
     local gd; gd=$(git -C "$dir" rev-parse --git-dir 2>/dev/null)
     case "$gd" in *"/worktrees/"*) ;; *) echo "skip   $lbl: not a linked worktree"; continue ;; esac
     if [ "$force" != 1 ]; then
+      # LIVE-STATE GUARD: never reap a worktree whose agent is still working or
+      # blocked. The four DISPLAY sites already refuse to paint `done` over a live
+      # agent — reap had no equivalent, so a flagged, actively-working agent was
+      # destroyable. That gap is what makes a false/premature marker dangerous, and
+      # it is the same shape as both prior incidents (a cheap signal trusted by a
+      # destructive consumer that never re-verified), both fixed at this same end.
+      # @agent_state is fleetd's tmux mirror, so this resolves daemon-up AND
+      # daemon-down. FAIL-SILENT, NOT fail-safe: an unresolvable state (dead pane,
+      # no mirror) must NOT skip — unresolvable is not "working", and a stale
+      # worktree whose pane died has to stay reapable. Like the other guards,
+      # --force overrides.
+      local lstate
+      lstate=$(tmux list-panes -a -F '#{pane_current_path}'$'\t''#{@agent_state}' 2>/dev/null \
+                | awk -F'\t' -v d="$dir" '$1==d && $2!=""{print $2; exit}')
+      case "$lstate" in
+        working|blocked)
+          echo "skip   $lbl: agent is still $lstate (use --force)"; continue ;;
+      esac
       # Ignore fleet's own UNTRACKED .fleet/ metadata only (the ready marker shows
       # as "?? .fleet/"). Keying on the `??` status — not on the path prefix —
       # keeps a TRACKED-and-modified note (" M .fleet/notes/plan.md", " D ", "A ",
@@ -4013,7 +4082,6 @@ fleet_actions() {
 menu|F|-|Leader menu|Open the which-key leader menu (the only prefix binding: prefix+F)
 pick|a|Agents|Pick / jump to agent|fzf popup of all agents, Enter jumps
 new|n|Agents|New agent|Open the new-agent form on the dashboard
-ready|y|Agents|Flag ready|Flag a worktree done/ready for reap (blank = this cwd)
 reap|x|Agents|Reap ready worktrees|Remove every worktree flagged ready (confirm)
 orch-jump|m|Agents|Orchestrator|Jump to the main window's orchestrator pane
 popmsg|p|Agents|Pop oldest message|Pop the oldest queued worker message into the orchestrator
@@ -4047,7 +4115,6 @@ action_tmux_command() { # tmux command string run when an action's key is presse
     pick) echo "display-popup -E -b rounded -w 80% -h 60% '$self pick'" ;;
     new)  echo "run-shell '$self dash-new'" ;;
     save) echo "command-prompt -p 'fleet save (name, blank=session):' \"run-shell '$self save %%'\"" ;;
-    ready) echo "command-prompt -p 'fleet ready (agent, blank=cwd):' \"run-shell '$self ready %%'\"" ;;
     reap)  echo "display-menu -b rounded -T '#[align=centre]Reap every worktree flagged ready?' -x C -y C 'Yes, reap' y \"run-shell '$self reap'\" 'Cancel' n ''" ;;
     main)   echo "run-shell '$self main'" ;;
     orch-jump) echo "run-shell '$self orch-jump'" ;;
