@@ -364,6 +364,51 @@ echo "== worktree-secrets-proof: honest same-uid v1 =="
   [ "$(cat "$WT/.env.good" 2>/dev/null)" = GOODVAL ] && pass "$c" "sibling secret still lands (mid-list isolation)" || fail "$c" "sound secret missing"
 ) ; [ $? = 0 ] || true
 
+# --- Scenario 14: committed parent symlink to .git (loop-4 resolved-path) ------
+# The loop-3 guard matches a literal `.git` component on the SOURCE-relative rel,
+# but rel is never resolved. A symlink committed in the BASE BRANCH (`foo -> .git`)
+# routes a rel with NO literal `.git` (`foo/hooks/post-checkout`) straight into the
+# real git dir: `cp` follows it, and the realpath confinement passes because .git IS
+# inside $dir. Lands a live hook → code execution. The source-symlink guard can't
+# fire (the symlink is in the DEST worktree, not the secrets source).
+( c=14
+  new_box myapp
+  printf 'GOODVAL' > "$SECRETS/.env.good"                            # well-formed sibling
+  ln -s .git "$WT/foo"                                               # committed in base branch
+  git -C "$WT" add foo
+  git -C "$WT" -c user.email=t@t -c user.name=t commit -q -m 'ship foo -> .git symlink'
+  # A3: plant a hook through the symlink parent
+  mkdir -p "$SECRETS/foo/hooks"
+  printf '#!/bin/sh\necho PWNED\n' > "$SECRETS/foo/hooks/post-checkout"
+  # A4: clobber an arbitrary file inside .git through the same symlink
+  printf 'PWNED_CONFIG' > "$SECRETS/foo/config-injected"
+  out=$(inject myapp 2>&1); rc=$?
+  [ "$rc" = 0 ] && pass "$c" "exit 0 (per-file refuse, not fatal)" || fail "$c" "exit $rc ($out)"
+  if grep -qF PWNED "$WT/.git/hooks/post-checkout" 2>/dev/null; then
+    fail "$c" "A3 hook planted in .git via committed symlink parent"
+  else pass "$c" "A3 no hook planted through symlink parent"; fi
+  if [ -e "$WT/.git/config-injected" ]; then
+    fail "$c" "A4 arbitrary file written inside real .git"
+  else pass "$c" "A4 no arbitrary file written into .git"; fi
+  grep -qE '	git-dir$' "$AUDIT" 2>/dev/null && pass "$c" "audited git-dir (not ok)" || fail "$c" "resolved git-dir not audited as failure"
+  if grep -qF 'foo/hooks/post-checkout' "$(EXCL)" 2>/dev/null; then fail "$c" "refused placement still excluded"; else pass "$c" "no exclude line for refused placement"; fi
+  [ "$(cat "$WT/.env.good" 2>/dev/null)" = GOODVAL ] && pass "$c" "sibling secret still lands (mid-list isolation)" || fail "$c" "sound secret missing"
+) ; [ $? = 0 ] || true
+
+# --- Scenario 15: `.git`-lookalike names must NOT be over-rejected -------------
+# The loop-4 confinement resolves real paths, so legitimate names that merely
+# START with `.git` (.gitignore, .gitfoo) must still be placed normally.
+( c=15
+  new_box myapp
+  printf 'IGNORED' > "$SECRETS/.gitignore"
+  printf 'FOOVAL'  > "$SECRETS/.gitfoo"
+  out=$(inject myapp 2>&1); rc=$?
+  [ "$rc" = 0 ] && pass "$c" "exit 0" || fail "$c" "exit $rc ($out)"
+  [ "$(cat "$WT/.gitignore" 2>/dev/null)" = IGNORED ] && pass "$c" ".gitignore placed (not over-rejected)" || fail "$c" ".gitignore wrongly refused"
+  [ "$(cat "$WT/.gitfoo" 2>/dev/null)" = FOOVAL ] && pass "$c" ".gitfoo placed (not over-rejected)" || fail "$c" ".gitfoo wrongly refused"
+  grep -qE '	git-dir$' "$AUDIT" 2>/dev/null && fail "$c" "lookalike wrongly audited git-dir" || pass "$c" "no spurious git-dir audit"
+) ; [ $? = 0 ] || true
+
 N=0; [ -f "$FAILMARK" ] && N=$(wc -l < "$FAILMARK" 2>/dev/null | tr -d ' '); N=${N:-0}
 echo "== summary: $N failed =="
 if [ "$N" = 0 ]; then echo "RESULT: ALL PASS — worktree-secrets v1 proven."; exit 0
