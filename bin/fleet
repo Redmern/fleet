@@ -350,7 +350,11 @@ cmd_ls() {
       # (header, prompt, info), mirroring cmd_sessions --measure. No fzf.
       [ -n "$prows" ] && printf '%s\n' "$prows" | cut -f3-
       printf '%s\n' "$hdr"
-      printf 'agent> \n\n'
+      # +2 NON-BLANK chrome lines: fzf prompt + info/count. They MUST be
+      # non-blank — popup_fit_content captures this via `$(...)`, which strips
+      # trailing newlines, so a blank final line is eaten, the popup comes up one
+      # row short and the last agent is clipped. Same rule as sessions --measure.
+      printf 'agent> \n  --\n'
       return 0
     fi
 
