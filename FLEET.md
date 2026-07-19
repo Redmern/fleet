@@ -9,7 +9,7 @@ this project with the `fleet` CLI.
 > agent-neutral. Capabilities only some harnesses support are noted inline.
 
 - `fleet ls` — list THIS project's agents: state (working/blocked/idle), repo/branch, window. `--all`/`-a` lists every project on the server.
-- `fleet new <repo> <branch> [-p "task"] [--bare] [--base <branch>] [--harness|-h <name>] [--self-merge|--no-self-merge]`
+- `fleet new <repo> <branch> [-p "task"] [--bare] [--base <branch>] [--harness|-h <name>] [--self-merge|--no-self-merge] [--task|-T <kind>]`
   — spawn an agent: creates a git worktree for `<branch>` if needed, opens a tmux
   window (editor + agent split by default, `--bare` for a plain agent pane), and
   seeds it with the `-p` prompt. `<repo>` is a repo name/alias in this project
@@ -17,7 +17,12 @@ this project with the `fleet` CLI.
   …; see `fleet harnesses`). By **default** a worker **may** `git merge`/`git push`
   its branch (fleet-guard allows it). Flip the whole project to *blocked* with
   `fleet selfmerge off`; override a single spawn either way with `--self-merge`
-  (force allow) or `--no-self-merge` (force block).
+  (force allow) or `--no-self-merge` (force block). **`--task <kind>`** tags what
+  KIND of work this agent does — one of `research|plan|impl|test|scratch|generic`
+  — shown as a 4-char tag (`rsch`/`plan`/`impl`/`test`/`scr`) in the tmux window
+  status bar, the dashboard row, and `fleet ls`'s TASK column. Unset (or unknown,
+  which warns and drops) renders blank. Display only: it is a separate namespace
+  from the orchestrator/worker *role*, and `--task main` is rejected.
 - `fleet selfmerge on|off|status` — project-wide worker self-merge toggle. `off`
   drops a `<root>/.fleet/no-self-merge` marker so newly-spawned workers in this
   project (all repos) are blocked from merge/push; `on` removes it (the default,

@@ -105,7 +105,7 @@ The load-bearing rule **every role prompt MUST carry**:
 > only a short digest, so write full detail to `$FLEET_DOCS` / `_reports/<slug>/` and
 > return a digest. Scope-scale the sub-agent count; when in doubt add one lens, not fewer.
 
-**Role 1 — RESEARCH** — `fleet new --scratch <slug>-research -p "<prompt>"` (repo-less,
+**Role 1 — RESEARCH** — `fleet new --scratch <slug>-research --task research -p "<prompt>"` (repo-less,
 reads code in place). The role agent fans out via Task sub-agents:
 - 1–N **explorer** sub-agents (scope-scaled), each maps a subsystem and cites `file:line`.
 - **≥2 adviser** sub-agents with distinct lenses — minimum **pro / con**; bigger scope
@@ -118,7 +118,7 @@ reads code in place). The role agent fans out via Task sub-agents:
   REJECT/REVISE → handle per §7; **BUILD → GATE 1** (§7).
 
 **Role 2 — IMPLEMENTATION** — after the GATE 1 pop. `fleet new <repo> fleet/<slug>
---no-self-merge`, seeded with `PLAN.md` + `SYNTHESIS.md`. Does **TDD** (proving tests
+--no-self-merge --task impl`, seeded with `PLAN.md` + `SYNTHESIS.md`. Does **TDD** (proving tests
 first → confirm RED → implement to green **without weakening a test**). Implements
 **directly by default**. Parallel implementation is **NOT** a sub-agent job: Task
 sub-agents share the role agent's single cwd (no per-sub-agent worktree), so two writers
@@ -127,8 +127,8 @@ race the same tree. If the feature genuinely needs parallel writers on overlappi
 reviewer sub-agent is fine. `--no-self-merge` because the human gate authorises the merge;
 **YOU** execute it after GATE 2.
 
-**Role 3 — TEST** — after implementation goes idle. One fleet agent on the impl branch,
-fanning out via Task sub-agents:
+**Role 3 — TEST** — after implementation goes idle. One fleet agent on the impl branch
+(`fleet new <repo> fleet/<slug> --task test`), fanning out via Task sub-agents:
 - **≥2 independent tester** sub-agents that do **NOT** share context — the "two
   independent testers" guarantee, realized as two sub-agents. Each exercises the feature
   end-to-end in a throwaway `/tmp` `FLEET_SESSION` (never the live session), and captures

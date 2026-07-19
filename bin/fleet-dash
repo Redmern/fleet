@@ -199,6 +199,46 @@ owner_of() { # window_id -> owning sub-orch window name (so-<id>), or "" (prints
   fi
   printf '%s' "${OWN_RAW[$wid]}"
 }
+
+# --- task tag ----------------------------------------------------------------
+# WHAT KIND of work an agent does (research/plan/impl/test/scratch/generic), set by
+# `fleet new --task`. NOT the same thing as ROW_ROLE above (card header vs worker)
+# and NOT @fleet_role (orchestrator vs worker, a security gate) — separate
+# namespace on purpose. Read from the @fleet_task window option, falling back to
+# the durable <root>/.fleet/tasks/<wname> file, and re-validated here because the
+# file is hand-editable. Cached PROCESS-LIFETIME: the tag is stamped once at spawn
+# and never mutates, exactly like OWN_RAW.
+declare -A TASK_RAW                         # window_id -> validated task ("" = unset)
+HAS_TASKS=0                                 # 1 when >=1 visible row carries a task
+TASK_ROOT=""                                # dash_root, resolved once per load_rows
+
+prime_task() { # <window_id> <window_name> — fill TASK_RAW[wid]. Prints NOTHING on
+               # purpose: it MUST be called bare, never as $(…). A command
+               # substitution runs in a subshell, so the cache write would be
+               # discarded — the trap owner_of documents at :192-195. load_rows
+               # calls this directly (its while-loop is not a subshell), so by the
+               # time the row printer runs, every visible window is already cached.
+  local wid="$1"
+  [ -z "${TASK_RAW[$wid]+x}" ] || return 0
+  local t; t=$(tmux show -wqv -t "$wid" @fleet_task 2>/dev/null)
+  [ -n "$t" ] || t=$(cat "$TASK_ROOT/.fleet/tasks/$2" 2>/dev/null)
+  case "$t" in research|plan|impl|test|scratch|generic) ;; *) t="" ;; esac
+  TASK_RAW[$wid]="$t"
+}
+
+task_of_win() { # <window_id> -> the cached validated task, or "" (prints to stdout)
+  printf '%s' "${TASK_RAW[$1]:-}"
+}
+
+task_tag() { # <task> -> a fixed 4-char PURE-ASCII tag. fit_left/hrule/popup_fit_content
+             # all count codepoints, not display cells, so width-1-only is the house
+             # rule (see the glyph note below) and 4 ASCII bytes is the safe form.
+  case "${1:-}" in
+    research) printf 'rsch' ;; plan) printf 'plan' ;; impl) printf 'impl' ;;
+    test)     printf 'test' ;; scratch) printf 'scr ' ;;
+    *)        printf '    ' ;;   # generic + unset + unknown render as nothing
+  esac
+}
 # Sub-orch window-name shape: bare so-d<N> OR slugged so-d<N>-<slug> (display name set by
 # `fleet dispatch rename`). The optional suffix group keeps a bare name matching, and the
 # `d[0-9]+` anchor still rejects a worker (d<N>-repo/branch — no so- prefix, has a '/').
@@ -404,6 +444,8 @@ load_rows() {
 
   ROWS=()
   HIDDEN_N=0                               # parked-agent count, threaded into the title
+  HAS_TASKS=0                              # no task anywhere => rows render byte-identically to before the flag
+  TASK_ROOT=$(dash_root)                   # once per refresh, not once per row
   local line state label sess win wname since pane age order hid
   while IFS=$'\t' read -r state label sess win wname since pane age ready; do
     [ -n "$pane" ] || continue
@@ -414,6 +456,7 @@ load_rows() {
     # A window parked in <sess>_hidden is hidden (authoritative — physical
     # location beats a possibly-stale @fleet_hidden marker). Field 9 of ROWS[].
     hid=0; [ "$sess" = "${SESS}_hidden" ] && { hid=1; HIDDEN_N=$((HIDDEN_N+1)); }
+    prime_task "$win" "$wname"; [ -n "${TASK_RAW[$win]}" ] && HAS_TASKS=1
     ROWS+=("$state"$'\t'"$label"$'\t'"$win"$'\t'"$wname"$'\t'"$since"$'\t'"$pane"$'\t'"${age:-0}"$'\t'"$ready"$'\t'"$hid")
   done < <("$FLEET_BIN" agents 2>/dev/null | sort -t$'\t' -k1,1 \
             | awk -F'\t' '
@@ -991,7 +1034,17 @@ render() {
       local iunread=${UNREAD[$wname]:-0} ibx_show=0
       (( iunread > 0 )) && ibx_show=1
       np=$(( 1 + git_show + mode_show + ibx_show ))   # state always + git/mode/✉ optional
-      LW=$(( cw - np*PW - CF - (np+1)*G ))         # np pills + cost + gaps
+      # Task tag: a plain 4-char TEXT field (not a pill — a pill costs PW+4=11
+      # columns, and the ladder below already sheds cost/mode/✉ on the narrow panes
+      # a fleet actually runs in). Shown only when SOME visible agent has a task, so
+      # a fleet that never uses --task renders exactly as it did before the flag;
+      # once any row has one, every row reserves the 4 cells so the column aligns.
+      local task_show=$HAS_TASKS TFW=0
+      (( task_show )) && TFW=$(( 4 + G ))
+      LW=$(( cw - np*PW - CF - (np+1)*G - TFW ))   # np pills + cost + task field + gaps
+      # DROP THE TASK FIELD FIRST — before cost/mode/✉. The badge is a convenience;
+      # the label is the identity, and it must never be squeezed by the badge.
+      (( LW < 1 )) && (( task_show )) && { task_show=0; TFW=0; LW=$(( cw - np*PW - CF - (np+1)*G )); }
       (( LW < 1 )) && { cost_show=0; LW=$(( cw - np*PW - np*G )); }                 # drop cost
       (( LW < 1 )) && (( mode_show )) && { mode_show=0; np=$((np-1)); LW=$(( cw - np*PW - np*G )); }  # drop mode
       (( LW < 1 )) && (( ibx_show )) && { ibx_show=0; np=$((np-1)); LW=$(( cw - np*PW - np*G )); }    # drop ✉
@@ -1010,6 +1063,7 @@ render() {
       esac
       (( i == sel )) && lblsgr='\033[1m' || lblsgr='\033[2m'
       content=$(pill "$sdisp" "$scol")
+      (( task_show )) && content+=$(printf "%s\033[2m%s\033[0m" "$gap" "$(task_tag "$(task_of_win "$(field "$i" 3)")")")
       content+=$(printf "%s${lblsgr}%b\033[22m" "$gap" "$(fit_left "$label" "$LW")")
       (( git_show )) && content+="$gap$(pill "$gt" "$(git_pcol "$g")")"
       (( mode_show )) && content+="$gap$(pill "$(mode_short "$mode")" "$(mode_pcol "$mode")")"
