@@ -840,7 +840,7 @@ inject_secrets() { # <repo> <dir>
   local TO=""; command -v timeout >/dev/null 2>&1 && TO="timeout 10"
   local store="${PASSWORD_STORE_DIR:-$HOME/.password-store}"
 
-  local f rel dest destdir destr first entry outcome
+  local f rel dest destdir destr first entry outcome g
   while IFS= read -r -d '' f; do
     rel="${f#"$srcr"/}"
     dest="$dir/$rel"
@@ -852,6 +852,13 @@ inject_secrets() { # <repo> <dir>
     case "$rel" in
       *$'\n'*|*$'\r'*) printf 'fleet: secret name contains newline/CR, rejected\n' >&2
          audit_secret "$audit" "$repo" "$rel" bad-name; continue ;;
+    esac
+    # realpath-confinement only proves the dest stays inside $dir — but $dir/.git IS
+    # inside $dir, so any `.git` path component (top-level worktree git dir or a
+    # nested submodule's) would let a secret plant a hook / clobber git config. Refuse it.
+    case "/$rel/" in
+      */.git/*) printf 'fleet: secret %s targets a git dir, refused\n' "$rel" >&2
+         audit_secret "$audit" "$repo" "$rel" git-dir; continue ;;
     esac
     # Reject a source entry that is itself a symlink — never follow it out of $src.
     if [ -L "$f" ]; then
@@ -878,6 +885,21 @@ inject_secrets() { # <repo> <dir>
       *) printf 'fleet: secret %s escapes worktree, rejected\n' "$rel" >&2
          audit_secret "$audit" "$repo" "$rel" escape; continue ;;
     esac
+    # …but $dir/.git is ITSELF inside $dir, so the confinement above happily passes
+    # anything that RESOLVES into the control dir. A symlink committed in the base
+    # branch (`foo -> .git`) routes a rel with no literal `.git` component straight
+    # into the git dir — `cp` follows it and plants e.g. a live hooks/post-checkout
+    # (code execution). The source-symlink guard can't fire: that symlink lives in the
+    # DEST worktree, not the secrets source. So confine the RESOLVED destdir against
+    # the real gitdir and common-dir too. (This also covers what the literal pattern
+    # above cannot see: `.GIT` on a case-insensitive FS, `.git.`/`.git ` on Windows.)
+    for g in "$(realpath "$dir/.git" 2>/dev/null)" "$(realpath "$common" 2>/dev/null)"; do
+      [ -n "$g" ] || continue
+      case "$destr/" in
+        "$g/"|"$g"/*) printf 'fleet: secret %s resolves into a git dir, refused\n' "$rel" >&2
+           audit_secret "$audit" "$repo" "$rel" git-dir; continue 2 ;;
+      esac
+    done
     # A dest colliding with a real DIRECTORY is never cp-into/chmod-able: cp would
     # drop the file INSIDE it and chmod 600 would strip exec from the dir, corrupting
     # the worktree. Refuse loudly — a REAL failure, never `ok`. (A symlink-to-dir is

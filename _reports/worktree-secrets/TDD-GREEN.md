@@ -52,3 +52,61 @@ RESULT: ALL PASS — worktree-secrets v1 proven.
 existing assertion weakened. `bash -n bin/fleet` clean. Fail-silent preserved
 (every git call `2>/dev/null || true`; the only fail-CLOSED point remains the
 realpath confinement). NOT merged.
+
+## Loop-3 — `.git/` confinement guard (one-line case)
+
+Added before the symlink check in `inject_secrets`:
+```sh
+case "/$rel/" in
+  */.git/*) printf 'fleet: secret %s targets a git dir, refused\n' "$rel" >&2
+     audit_secret "$audit" "$repo" "$rel" git-dir; continue ;;
+esac
+```
+Wrapping the rel path in `/…/` makes `.git`, `.git/hooks/x`, `sub/.git`, and
+`sub/.git/x` all match `*/.git/*` — refusing any `.git` path component (top-level
+worktree git dir or a nested submodule's) before any rm/cp. Outcome audited
+`git-dir` (a REAL failure, never ok); no exclude line for the refused placement;
+a sound sibling in the same run still lands (`continue`, not abort).
+
+### GREEN output
+
+```
+== summary: 0 failed ==
+RESULT: ALL PASS — worktree-secrets v1 proven.
+```
+**71 PASS / 0 FAIL.** Scenarios 1–12 unchanged and still green. `bash -n bin/fleet`
+clean. Fail-silent preserved (the fail-CLOSED confinement points are unchanged
+in spirit — this just extends them to the git dir). NOT merged.
+
+## Loop-4 — confine the RESOLVED dest against the gitdir
+
+Added after the post-`mkdir` confinement re-check (`local … g` added to the decls):
+```sh
+for g in "$(realpath "$dir/.git" 2>/dev/null)" "$(realpath "$common" 2>/dev/null)"; do
+  [ -n "$g" ] || continue
+  case "$destr/" in
+    "$g/"|"$g"/*) printf 'fleet: secret %s resolves into a git dir, refused\n' "$rel" >&2
+       audit_secret "$audit" "$repo" "$rel" git-dir; continue 2 ;;
+  esac
+done
+```
+The existing source-relative literal `.git` pattern is KEPT as the cheap fail-fast
+for the common case; this adds the resolved-path check the confinement was missing.
+`continue 2` breaks out to the outer `while` (mid-list isolation preserved). Covers
+both gitdir and common-dir (linked-worktree layout), and incidentally the
+case-insensitive / trailing-dot FS variants the literal pattern cannot see.
+
+### GREEN output
+
+```
+== summary: 0 failed ==
+RESULT: ALL PASS — worktree-secrets v1 proven.
+```
+**81 PASS / 0 FAIL** (scenarios 1–15). `bash -n bin/fleet` clean.
+
+Independently re-verified against the adversary's OWN repro harness
+(`_reports/worktree-secrets/ADV-LOOP3-repro.sh`): **A3 and A4 now PASS**
+("symlink-parent route did NOT write into .git/hooks", "no file landed inside .git
+via symlink"), zero FAILs across the whole harness, and its R1–R5 prior-protection
+spot-checks (skip-worktree, dir-collision, no-values-in-audit, fail-silent,
+external-escape confinement) all still hold.
