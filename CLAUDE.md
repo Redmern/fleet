@@ -89,8 +89,27 @@ State lives in three places, none of them a database:
 - **Done markers** — `<worktree>/.fleet/ready` (written by `fleet ready` when a
   work item is finished). Read by `agents_tsv`/the dashboard to show the agent as
   `done`, and consumed by `fleet reap`, which removes flagged worktrees (skipping
-  unmerged/dirty ones). The dirty check ignores `.fleet/` so the marker itself
-  never blocks a reap.
+  unmerged/dirty ones). The dirty check ignores only **untracked** (`??`)
+  `.fleet/` entries so the marker itself never blocks a reap — a *tracked*
+  `.fleet/` path with local edits is real user work and still refuses.
+
+### Reap is atomic (`cmd_reap`)
+
+`cmd_reap` is split into **DECIDE** (pure reads: the ready marker, target match,
+linked-worktree, dirty, merged, inbox, gate-wait, worktree-**lock**, plus resolving
+the window to kill) and **MUTATE**. Nothing destructive happens until
+`git worktree remove` has *succeeded*; only then does it run `branch -D` →
+`safe_kill_window` → `cmd_forget`. Scratch docs are archived by **`cp -a` into a
+freshly-made stage dir, never `mv`** — moving a *tracked* note deletes it from the
+worktree, which dirties the tree and makes removal refuse: reap dirtying the tree
+and then refusing because the tree is dirty (the orphan bug). The only pre-remove
+deletion is on an **exclude-less** worktree (`git check-ignore -q .fleet/` fails),
+where fleet's own untracked markers would block removal; that path — and only that
+path — carries a rollback that restores the notes and the marker and, if the
+marker cannot be restored, prints the exact `touch` recovery to stderr. Net
+contract: **any refusal leaves worktree + window + agents line + marker intact, so
+a plain re-run is the retry.** Locked in by `test/reap-tracked-notes-proof.sh`
+(19 cases) and `test/reap-teardown-safety.sh` (8).
 
 ### Worktree / repo layout (`cmd_new`)
 
@@ -213,7 +232,12 @@ this project with the `fleet` CLI.
   its window, delete the worktree and its merged branch). Refuses any worktree
   with uncommitted changes, a branch not merged into its base, or a worker that
   still has an **unread needs-human message** (sev warn/blocked) in the inbox —
-  pop/handle that message first so reaping can never orphan it — unless `--force`.
+  pop/handle that message first so reaping can never orphan it — a **locked**
+  worktree is refused too — unless `--force`. **Reap is atomic:** every refusal,
+  early or late, leaves the worktree, its window, its saved-agents line and its
+  `.fleet/ready` marker untouched, so a plain **re-run is the retry** — reach for
+  `--force` only to genuinely discard dirty or unmerged work, never as the generic
+  remedy (it disables the dirty *and* unmerged guards together).
 
 ## Leader menu (which-key)
 

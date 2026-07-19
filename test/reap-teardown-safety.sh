@@ -28,6 +28,10 @@ TMPROOT=$(mktemp -d)
 export TMUX_TMPDIR="$TMPROOT/tmuxsock"; mkdir -p "$TMUX_TMPDIR"
 export XDG_CONFIG_HOME="$TMPROOT/config"; mkdir -p "$XDG_CONFIG_HOME/fleet/sessions"
 unset TMUX  # we must not look like we're already inside a session
+export GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null
+# cmd_reap ends in `fuser -k ${FLEET_DEBUG_PORT:-9222}/tcp`. Left unset, a test
+# run kills the developer's real Chromium remote-debug session (HF-2).
+export FLEET_DEBUG_PORT=59222
 
 cleanup() { tmux kill-server 2>/dev/null; rm -rf "$TMPROOT"; }
 trap cleanup EXIT
