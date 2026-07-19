@@ -991,11 +991,17 @@ render() {
       local iunread=${UNREAD[$wname]:-0} ibx_show=0
       (( iunread > 0 )) && ibx_show=1
       np=$(( 1 + git_show + mode_show + ibx_show ))   # state always + git/mode/✉ optional
-      LW=$(( cw - np*PW - CF - (np+1)*G ))         # np pills + cost + gaps
-      (( LW < 1 )) && { cost_show=0; LW=$(( cw - np*PW - np*G )); }                 # drop cost
-      (( LW < 1 )) && (( mode_show )) && { mode_show=0; np=$((np-1)); LW=$(( cw - np*PW - np*G )); }  # drop mode
-      (( LW < 1 )) && (( ibx_show )) && { ibx_show=0; np=$((np-1)); LW=$(( cw - np*PW - np*G )); }    # drop ✉
-      (( LW < 1 )) && { git_show=0; ibx_show=0; mode_show=0; LW=$(( cw - PW - G )); }                 # state+label only
+      # Reserve the ready-glyph's 2 columns UP FRONT, before the drop-cost/mode/✉
+      # cascade below reasons about the remaining width — taking them afterwards
+      # would both mis-inform the cascade and push the row 2 columns past $cw at
+      # the widths where LW clamps to 0 (content is printed between two │ with no
+      # truncation, so the right rail would shift/wrap).
+      local cwg=$(( cw - 2 ))
+      LW=$(( cwg - np*PW - CF - (np+1)*G ))         # np pills + cost + gaps
+      (( LW < 1 )) && { cost_show=0; LW=$(( cwg - np*PW - np*G )); }                 # drop cost
+      (( LW < 1 )) && (( mode_show )) && { mode_show=0; np=$((np-1)); LW=$(( cwg - np*PW - np*G )); }  # drop mode
+      (( LW < 1 )) && (( ibx_show )) && { ibx_show=0; np=$((np-1)); LW=$(( cwg - np*PW - np*G )); }    # drop ✉
+      (( LW < 1 )) && { git_show=0; ibx_show=0; mode_show=0; LW=$(( cwg - PW - G )); }                 # state+label only
       (( LW < 0 )) && LW=0
       # stall: an agent stuck "working" too long shows a red 'stalled' pill
       sdisp="$state"; scol=$(state_pcol "$state")
@@ -1016,7 +1022,6 @@ render() {
       # never shifts between a flagged and an unflagged row.
       local rglyph="  "
       [ -n "$(field "$i" 8)" ] && rglyph=$'⚑ '
-      LW=$(( LW - 2 )); (( LW < 0 )) && LW=0
       (( i == sel )) && lblsgr='\033[1m' || lblsgr='\033[2m'
       content=$(pill "$sdisp" "$scol")
       content+=$(printf "%s\033[35m%s\033[0m${lblsgr}%b\033[22m" "$gap" "$rglyph" "$(fit_left "$label" "$LW")")
@@ -1742,24 +1747,29 @@ toggle_ready() {
   (( sel < N )) || { status="orphans row — press e for messages"; return 0; }
   local lbl win rdy st out
   lbl=$(field "$sel" 2); win=$(field "$sel" 4); rdy=$(field "$sel" 8); st=$(field "$sel" 1)
+  # Pass the WINDOW NAME (field 4), never the label (field 2): cmd_ready's target
+  # match is a SUBSTRING match, first hit wins, so a repo/branch label that is a
+  # substring of another agent's would flag the wrong worktree.
+  # Report only what actually happened — a status line that claims a flag landed
+  # when the marker write failed is worse than no feedback at all.
   if [ -n "$rdy" ]; then
-    # Pass the WINDOW NAME (field 4), never the label (field 2): cmd_ready's
-    # target match is a SUBSTRING match, first hit wins, so a repo/branch label
-    # that is a substring of another agent's would flag the wrong worktree.
-    "$FLEET_BIN" ready "$win" --clear >/dev/null 2>&1
-    status="ready cleared → $lbl"
+    if out=$("$FLEET_BIN" ready "$win" --clear 2>&1); then status="ready cleared → $lbl"
+    else status="clear FAILED → $lbl: $(printf '%s' "$out" | tail -1)"; fi
   else
-    out=$("$FLEET_BIN" ready "$win" 2>&1)
-    case "$out" in
-      # A scratch/root agent has no worktree; cmd_ready's bleed guard refuses
-      # rather than dropping a marker into the SHARED project root. Surface it.
-      *"no worktree"*) status="scratch agent — nothing to reap" ;;
-      *) case "$st" in
-           # The `done` pill is idle-only by design, so say why nothing changed.
-           working|blocked) status="flagged ready → $lbl (still $st — shows done when idle)" ;;
-           *) status="flagged ready → $lbl" ;;
-         esac ;;
-    esac
+    if ! out=$("$FLEET_BIN" ready "$win" 2>&1); then
+      status="flag FAILED → $lbl: $(printf '%s' "$out" | tail -1)"
+    else
+      case "$out" in
+        # A scratch/root agent has no worktree; cmd_ready's bleed guard refuses
+        # rather than dropping a marker into the SHARED project root. Surface it.
+        *"no worktree"*) status="scratch agent — nothing to reap" ;;
+        *) case "$st" in
+             # The `done` pill is idle-only by design, so say why nothing changed.
+             working|blocked) status="flagged ready → $lbl (still $st — shows done when idle)" ;;
+             *) status="flagged ready → $lbl" ;;
+           esac ;;
+      esac
+    fi
   fi
   return 0
 }

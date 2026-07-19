@@ -273,12 +273,22 @@ PY
           # window must still be recognized (is_main_pane reads the role registry).
           [ "$wname" = main ] && continue
           is_main_pane "$pane" && continue
-          # NINE fields, exactly as the daemon path above. The trailing two (age,
-          # ready) are legitimately unavailable here — but the COUNT is what
-          # matters: consumers index field 8 (age) and field 9 (ready), so a
-          # 7-field row made the ready column always empty and NO UI ever painted
-          # `done` while `fleet reap` still destroyed the worktree.
-          printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t\t\n' "$st" "$(agent_label "$path")" "$sess" "$wid" "$wname" "$since" "$pane"
+          # NINE fields, exactly as the daemon path above. Consumers index field 8
+          # (age) and field 9 (ready); a 7-field row ran them off the end, so the
+          # ready column was ALWAYS empty and no UI ever painted `done` while
+          # `fleet reap` still destroyed the worktree. Age is genuinely
+          # unavailable here (no since-timestamp to subtract), but READY is just a
+          # file — read it, or the `done` pill, the ⚑ glyph and the dashboard's
+          # `y` toggle (which reads field 9 to decide flag-vs-clear, so it would
+          # re-flag instead of clearing) all silently break whenever the daemon is
+          # down. Legacy cwd behaviour: no pane= disambiguation on this path, and
+          # this whole fallback is already documented as possibly stale.
+          local rdy=""
+          if [ -e "$path/.fleet/ready" ]; then
+            rdy=$(sed -n 's/^reason=//p' "$path/.fleet/ready" 2>/dev/null | head -1)
+            rdy="${rdy:-ready}"
+          fi
+          printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t\t%s\n' "$st" "$(agent_label "$path")" "$sess" "$wid" "$wname" "$since" "$pane" "$rdy"
         done
   fi
 }
@@ -3095,7 +3105,13 @@ cmd_ready() { # ready [<agent>] [-m "reason"] [--clear]
   # the resolved root rather than on whether <target> was given is what makes this
   # hold for every caller. --clear still runs (lets a stray root marker be cleaned
   # up). Compare realpaths, fail-silent.
-  if [ "$clear" != 1 ]; then
+  # A LINKED WORKTREE is never the project root, so exempt it outright: with
+  # @fleet_root and $FLEET_ROOT both unset (a tmux server restart) `fleet_root`
+  # falls back to $PWD, and an orchestrator sitting inside the target's worktree
+  # would otherwise see proot == root and refuse a perfectly real worktree.
+  local _gd _is_wt=0; _gd=$(git -C "$dir" rev-parse --git-dir 2>/dev/null)
+  case "$_gd" in *"/worktrees/"*) _is_wt=1 ;; esac
+  if [ "$clear" != 1 ] && [ "$_is_wt" != 1 ]; then
     local proot; proot=$(fleet_root 2>/dev/null)
     if [ -n "$proot" ] \
        && [ "$(realpath "$root" 2>/dev/null || echo "$root")" = "$(realpath "$proot" 2>/dev/null || echo "$proot")" ]; then
@@ -3194,13 +3210,27 @@ cmd_reap() { # reap [<target>] [--force] — remove worktrees flagged ready
       # no mirror) must NOT skip — unresolvable is not "working", and a stale
       # worktree whose pane died has to stay reapable. Like the other guards,
       # --force overrides.
-      local lstate
-      lstate=$(tmux list-panes -a -F '#{pane_current_path}'$'\t''#{@agent_state}' 2>/dev/null \
-                | awk -F'\t' -v d="$dir" '$1==d && $2!=""{print $2; exit}')
-      case "$lstate" in
-        working|blocked)
-          echo "skip   $lbl: agent is still $lstate (use --force)"; continue ;;
-      esac
+      # Match on REALPATHS, not the raw strings: tmux reports the resolved
+      # physical cwd, while $dir comes verbatim from the saved-agents file — a
+      # symlinked project root makes a literal compare never match, which would
+      # silently disable this guard and reap the working agent it exists to
+      # protect. And SKIP the command-center pane (is_main_pane), exactly as the
+      # window-resolution loop below does: main parked in a worktree's cwd would
+      # otherwise lend that worktree its own state and refuse forever, with
+      # --force (which drops the dirty AND unmerged guards) the only way out.
+      # Scan every match rather than taking the first: two panes share a cwd on
+      # the nvim+agent split, and a live one anywhere in the worktree is decisive.
+      local lstate="" _gp _gpath _gstate _drp
+      _drp=$(realpath "$dir" 2>/dev/null || echo "$dir")
+      while IFS=$'\t' read -r _gp _gpath _gstate; do
+        [ -n "$_gstate" ] || continue
+        [ "$(realpath "$_gpath" 2>/dev/null || echo "$_gpath")" = "$_drp" ] || continue
+        is_main_pane "$_gp" && continue
+        case "$_gstate" in working|blocked) lstate="$_gstate"; break ;; esac
+      done < <(tmux list-panes -a -F '#{pane_id}'$'\t''#{pane_current_path}'$'\t''#{@agent_state}' 2>/dev/null)
+      if [ -n "$lstate" ]; then
+        echo "skip   $lbl: agent is still $lstate (use --force)"; continue
+      fi
       # Ignore fleet's own UNTRACKED .fleet/ metadata only (the ready marker shows
       # as "?? .fleet/"). Keying on the `??` status — not on the path prefix —
       # keeps a TRACKED-and-modified note (" M .fleet/notes/plan.md", " D ", "A ",

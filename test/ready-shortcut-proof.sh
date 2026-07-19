@@ -168,12 +168,56 @@ fi ) || FAILED=1
   out=$(FLEET_SESSION="$s" "$FLEET" reap 2>&1)
   if [ -d "$wt" ]; then
     case "$out" in
-      *skip*) pass $c ;;
+      *"still working"*) pass $c ;;
+      *skip*) fail $c "reap skipped, but NOT via the live-state guard — some other guard masked it (got: $out)" ;;
       *) fail $c "worktree survived but reap printed no 'skip' line (got: $out)" ;;
     esac
   else
     fail $c "REAPED a worktree whose agent is still working — output: $out"
   fi ) || FAILED=1
+
+# --- Case 4b: the live-state guard holds through a SYMLINKED project root ------
+# tmux reports the RESOLVED physical cwd; $dir is whatever cmd_new recorded. A
+# literal string compare never matches under a symlinked root, which silently
+# disables the guard and reaps the working agent it exists to protect.
+( c=4b; s=rs4b; real="$TMPROOT/c4b-real"; r="$TMPROOT/c4b-link"
+  mkdir -p "$real"; ln -s "$real" "$r"
+  tmux new-session -d -s "$s" -n main -c "$r" 'sleep 9999' 2>/dev/null
+  tmux set -t "$s" @fleet_root "$r" 2>/dev/null
+  wt=$(mkready "$r" "$s" feat4b)          # saved-agents records the SYMLINK path
+  addwin "$s" repo-feat4b "$wt" working >/dev/null
+  sleep 0.3
+  out=$(FLEET_SESSION="$s" "$FLEET" reap 2>&1)
+  if [ ! -d "$wt" ]; then
+    fail $c "REAPED a working agent's worktree under a symlinked root — the guard compared raw strings (got: $out)"
+  else
+    case "$out" in
+      *"still working"*) pass $c ;;
+      *) fail $c "worktree survived but not via the live-state guard (got: $out)" ;;
+    esac
+  fi ) || FAILED=1
+
+# --- Case 4c: the main pane's cwd must NOT lend a worktree its state -----------
+# main parked in a worktree's cwd would otherwise make that worktree refuse
+# forever, with --force (which drops the dirty AND unmerged guards) the only way out.
+( c=4c; s=rs4c; r="$TMPROOT/c4c"; mkdir -p "$r"
+  wt_pre="$r/repo/feat4c"
+  tmux new-session -d -s "$s" -n main -c "$r" 'sleep 9999' 2>/dev/null
+  tmux set -t "$s" @fleet_root "$r" 2>/dev/null
+  mw=$(tmux list-windows -t "=$s" -F '#{window_id}' 2>/dev/null | head -1)
+  mp=$(tmux list-panes -t "$mw" -F '#{pane_id}' 2>/dev/null | head -1)
+  tmux set -w -t "$mw" @fleet_role main 2>/dev/null
+  mkdir -p "$r/.fleet/roles"; printf 'main\n' > "$r/.fleet/roles/$mp"
+  wt=$(mkready "$r" "$s" feat4c)
+  # park MAIN in the worktree cwd, marked working; the real worker is idle
+  tmux respawn-pane -k -t "$mp" -c "$wt" 'sleep 9999' 2>/dev/null
+  tmux set -w -t "$mw" @agent_state working 2>/dev/null
+  addwin "$s" repo-feat4c "$wt" idle >/dev/null
+  sleep 0.4
+  out=$(FLEET_SESSION="$s" "$FLEET" reap 2>&1)
+  if [ -d "$wt" ]; then
+    fail $c "the command-center pane's own cwd/state blocked the reap of an IDLE worker (got: $out)"
+  else pass $c; fi ) || FAILED=1
 
 # --- Case 5: reap STILL works on an idle flagged agent (regression guard) -------
 ( c=5; s=rs5; r="$TMPROOT/c5"; mkdir -p "$r"
@@ -213,9 +257,19 @@ fi ) || FAILED=1
     fail $c "no agent rows on the daemon-down path — fixture produced nothing to count"; exit 1
   fi
   bad=$(printf '%s\n' "$rows" | awk -F'\t' 'NF!=9{c++} END{print c+0}')
-  if [ "$bad" = 0 ]; then pass $c
-  else
+  if [ "$bad" != 0 ]; then
     fail $c "$bad row(s) are not 9 fields (widths: $(printf '%s\n' "$rows" | awk -F'\t' '{print NF}' | sort -u | tr '\n' ' '))"
+    exit 1
+  fi
+  # Field COUNT alone is not the property. Field 9 must actually carry the marker,
+  # or the `done` pill, the ⚑ glyph and the dash `y` toggle (which reads field 9
+  # to decide flag-vs-clear, so it would RE-FLAG instead of clearing) all break
+  # silently whenever the daemon is down.
+  mkdir -p "$FLEET_ROOT/.fleet"; printf 'reason=all done\n' > "$FLEET_ROOT/.fleet/ready"
+  got=$("$FLEET" agents 2>/dev/null | awk -F'\t' '$5=="tsvprobe"{print $9; exit}')
+  rm -f "$FLEET_ROOT/.fleet/ready"
+  if [ "$got" = "all done" ]; then pass $c
+  else fail $c "daemon-down ready column is '$got', expected 'all done' — no UI can show \`done\` and \`y\` cannot toggle off"
   fi ) || FAILED=1
 
 # --- Case 8: the leader-menu `ready` action is gone -----------------------------
@@ -267,6 +321,8 @@ EOS
     fail $c "unflagged row: expected \`ready repo-feat\` (window_name), got \`$got1\`"
   elif [ "$got2" != "ready repo-feat --clear" ]; then
     fail $c "flagged row: expected \`ready repo-feat --clear\` (toggle back), got \`$got2\`"
+  elif ! grep -qE '^\s+y\)' "$DASH"; then
+    fail $c "toggle_ready works but no \`y)\` case binds it in the dashboard key loop"
   else pass $c; fi ) || FAILED=1
 
 # --- Case 10: the scratch/root bleed guard covers the <target> path too ---------
