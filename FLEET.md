@@ -67,7 +67,12 @@ this project with the `fleet` CLI.
   its window, delete the worktree and its merged branch). Refuses any worktree
   with uncommitted changes, a branch not merged into its base, or a worker that
   still has an **unread needs-human message** (sev warn/blocked) in the inbox —
-  pop/handle that message first so reaping can never orphan it — unless `--force`.
+  pop/handle that message first so reaping can never orphan it — a **locked**
+  worktree is refused too — unless `--force`. **Reap is atomic:** every refusal,
+  early or late, leaves the worktree, its window, its saved-agents line and its
+  `.fleet/ready` marker untouched, so a plain **re-run is the retry** — reach for
+  `--force` only to genuinely discard dirty or unmerged work, never as the generic
+  remedy (it disables the dirty *and* unmerged guards together).
 
 ## Leader menu (which-key)
 

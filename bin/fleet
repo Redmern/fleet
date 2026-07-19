@@ -3132,8 +3132,13 @@ cmd_reap() { # reap [<target>] [--force] — remove worktrees flagged ready
     local gd; gd=$(git -C "$dir" rev-parse --git-dir 2>/dev/null)
     case "$gd" in *"/worktrees/"*) ;; *) echo "skip   $lbl: not a linked worktree"; continue ;; esac
     if [ "$force" != 1 ]; then
-      # ignore fleet's own .fleet/ metadata (the ready marker shows as "?? .fleet/")
-      local dirty; dirty=$(git -C "$dir" status --porcelain 2>/dev/null | grep -vE '^...\.fleet/')
+      # Ignore fleet's own UNTRACKED .fleet/ metadata only (the ready marker shows
+      # as "?? .fleet/"). Keying on the `??` status — not on the path prefix —
+      # keeps a TRACKED-and-modified note (" M .fleet/notes/plan.md", " D ", "A ",
+      # "R  ORIG -> DEST", "UU ") visible to this guard, so real uncommitted user
+      # work inside .fleet/ refuses HERE, before anything is killed, instead of
+      # sneaking through to the removal and taking the late-skip path.
+      local dirty; dirty=$(git -C "$dir" status --porcelain 2>/dev/null | grep -vE '^\?\? \.fleet/')
       if [ -n "$dirty" ]; then
         echo "skip   $lbl: $(printf '%s\n' "$dirty" | grep -c .) uncommitted file(s) (use --force)"; continue
       fi
@@ -3173,6 +3178,7 @@ cmd_reap() { # reap [<target>] [--force] — remove worktrees flagged ready
         echo "skip   $lbl: sub-orch parked at a gate — pop its message first (use --force)"; continue
       fi
     fi
+    # ---- DECIDE (read-only; every refusal below leaves the worktree untouched) --
     # Resolve the window to kill from the worktree's cwd, but SKIP any pane that
     # is the command center (is_main_pane) — so a cwd-collision (main parked in a
     # reaped worktree dir) falls through to the real worker window instead of
@@ -3184,23 +3190,62 @@ cmd_reap() { # reap [<target>] [--force] — remove worktrees flagged ready
       is_main_pane "$_rp" && continue
       win="$_rwid"; break
     done < <(tmux list-panes -a -F '#{pane_id}'$'\t''#{pane_current_path}'$'\t''#{window_id}' 2>/dev/null)
-    safe_kill_window "$win"
-    cmd_forget "$dir"
-    # Archive a non-empty scratch-docs dir out to <root>/.fleet/notes/archive/ so
-    # the worker's research/plan markdown survives the reap. Fully fail-silent —
-    # must NEVER block removal; on any failure we just fall through and remove.
-    # The move also empties .fleet/notes so the rmdir .fleet path below still works.
-    if [ -n "$root" ] && [ -d "$dir/.fleet/notes" ] && [ -n "$(ls -A "$dir/.fleet/notes" 2>/dev/null)" ]; then
+    # LOCK GUARD: a locked worktree is the one refusal cause `worktree remove`
+    # raises that we can see up front. Refuse in DECIDE rather than discovering it
+    # after the mutations have run. (--force still cannot remove a locked worktree
+    # — git wants an explicit unlock — so say so.)
+    if git -C "$dir" worktree list --porcelain 2>/dev/null \
+         | awk -v d="$dir" '$1=="worktree"{cur=($2==d)} cur && /^locked/{found=1; exit} END{exit !found}'; then
+      echo "skip   $lbl: worktree is locked (git worktree unlock '$dir' first)"; continue
+    fi
+
+    # ---- MUTATE ---------------------------------------------------------------
+    # 1. ADDITIVE ONLY. Stage a COMPLETE copy of the scratch docs (tracked,
+    #    untracked and locally-modified alike) into the archive — `cp`, never
+    #    `mv`: moving a TRACKED note deletes it from the worktree, which dirties
+    #    the tree and makes `worktree remove` refuse. That is reap dirtying the
+    #    tree and then refusing because the tree is dirty — the orphan bug.
+    #    A symlinked notes dir is "not ours": never archive through or move it.
+    local stage=""
+    if [ -n "$root" ] && [ ! -L "$dir/.fleet/notes" ] && [ -d "$dir/.fleet/notes" ] \
+       && [ -n "$(ls -A "$dir/.fleet/notes" 2>/dev/null)" ]; then
       local ts; ts=$(date +%s 2>/dev/null)
       local arch="$root/.fleet/notes/archive/${repo:-repo}__${branch//\//_}__${ts}"
-      mkdir -p "$root/.fleet/notes/archive" 2>/dev/null \
-        && mv "$dir/.fleet/notes" "$arch" 2>/dev/null \
-        && echo "archived $lbl notes -> $arch" || true
+      if mkdir -p "$root/.fleet/notes/archive" 2>/dev/null; then
+        if mkdir "$arch" 2>/dev/null; then stage="$arch"
+        else stage=$(mktemp -d "${arch}_XXXX" 2>/dev/null) || stage=""; fi   # 1-second collision
+      fi
+      if [ -n "$stage" ]; then
+        cp -a "$dir/.fleet/notes/." "$stage/" 2>/dev/null || { rm -rf "$stage" 2>/dev/null; stage=""; }
+      fi
+      # A failed archive must never license a deletion: skip, keep everything.
+      [ -n "$stage" ] || { echo "skip   $lbl: could not archive notes — worktree left intact"; continue; }
     fi
-    rm -f "$dir/.fleet/ready" 2>/dev/null; rmdir "$dir/.fleet/notes" "$dir/.fleet" 2>/dev/null || true  # else it blocks remove
+    # 2. FLEET-OWNED DELETIONS — only where they are actually needed, and only of
+    #    things we can put back. When `.fleet/` is IGNORED (every worktree cmd_new
+    #    makes carries the common `/.fleet/` exclude line) git removes it happily,
+    #    so we delete NOTHING here and the failure branch has nothing to roll back.
+    #    On an exclude-less worktree our own untracked markers WOULD make removal
+    #    refuse, so clear the ones we own — untracked notes (staged above) and the
+    #    ready marker — never a tracked file, never anything else under .fleet/.
+    local restore=0 saved_ready=""
+    if [ "$force" != 1 ] && ! git -C "$dir" check-ignore -q .fleet/ 2>/dev/null; then
+      restore=1; saved_ready=$(cat "$dir/.fleet/ready" 2>/dev/null)
+      local keep p
+      keep=$(git -C "$dir" ls-files -- .fleet/notes 2>/dev/null)
+      while IFS= read -r p; do
+        [ -n "$p" ] || continue
+        printf '%s\n' "$keep" | grep -qxF "${p#$dir/}" && continue   # tracked: git removes it
+        rm -f "$p" 2>/dev/null
+      done < <(find "$dir/.fleet/notes" -type f 2>/dev/null)
+      rm -f "$dir/.fleet/ready" 2>/dev/null
+      rmdir "$dir/.fleet/notes" "$dir/.fleet" 2>/dev/null || true
+    fi
+    # 3. POINT OF NO RETURN.
     local main; main=$(git -C "$dir" worktree list --porcelain 2>/dev/null | awk '/^worktree /{print $2; exit}')
     local rmflag=""; [ "$force" = 1 ] && rmflag="--force"
-    if git -C "${main:-$dir}" worktree remove $rmflag "$dir" 2>/dev/null; then
+    local rmerr
+    if rmerr=$(git -C "${main:-$dir}" worktree remove $rmflag "$dir" 2>&1); then
       local bnote=""
       if [ -n "$branch" ] && [ -n "$main" ]; then
         # Always -D: the non-force path already verified the branch is merged
@@ -3216,9 +3261,41 @@ cmd_reap() { # reap [<target>] [--force] — remove worktrees flagged ready
           bnote=" (branch $branch kept: $(printf '%s' "$derr" | head -1))"
         fi
       fi
+      # SUCCESS — and only now the irreversible fleet-side steps, least
+      # recoverable last: window (tmux side effect first, so a cmd_forget hiccup
+      # cannot leave a live window pointing at a deleted dir), then the registry.
+      safe_kill_window "$win"
+      cmd_forget "$dir"
       echo "reaped $lbl$bnote"; reaped=$((reaped+1))
+      [ -n "$stage" ] && echo "archived $lbl notes -> $stage"
     else
-      echo "skip   $lbl: worktree remove failed (uncommitted? use --force)"
+      # FAILURE — put back exactly what we deleted (step 2) and leave the window,
+      # the agents line and the ready marker as they were, so a PLAIN re-run is
+      # the retry. Nothing else was ever touched.
+      if [ "$restore" = 1 ]; then
+        mkdir -p "$dir/.fleet" 2>/dev/null
+        if [ -n "$stage" ]; then
+          mkdir -p "$dir/.fleet/notes" 2>/dev/null
+          cp -a "$stage/." "$dir/.fleet/notes/" 2>/dev/null || true
+        fi
+        printf '%s' "$saved_ready" > "$dir/.fleet/ready" 2>/dev/null || true
+      fi
+      echo "skip   $lbl: worktree remove failed — worktree left intact, retry after resolving"
+      printf '%s\n' "$rmerr" | head -1 | sed 's/^/       git: /'
+      if [ "$restore" = 1 ] && [ ! -e "$dir/.fleet/ready" ]; then
+        # The marker is the ONE rollback item whose loss re-creates the original
+        # orphan (unreachable by any flag). Verify it, and if it is gone be loud,
+        # keep the staged copy as evidence, and print the exact recovery command.
+        {
+          echo "reap: ROLLBACK INCOMPLETE for $lbl"
+          echo "  worktree still present: $dir"
+          echo "  ready marker could NOT be restored — this worktree will not be selected by 'fleet reap'"
+          [ -n "$stage" ] && echo "  archived copy of its notes KEPT at: $stage"
+          echo "  recover with:  touch $dir/.fleet/ready   (then re-run fleet reap)"
+        } >&2
+      else
+        [ -n "$stage" ] && rm -rf "$stage" 2>/dev/null   # the archive was never earned
+      fi
     fi
   done <<EOF
 $lines
