@@ -112,8 +112,11 @@ echo "[3] §3.0.1b RECON pre-step + budgets"
 if hasre "$MANUAL" '^### 3\.0\.1b .*RECON'; then pass "§3.0.1b heading"
 else fail "§3.0.1b heading" "no '### 3.0.1b … RECON' heading"; fi
 if has "$MANUAL" 'RECON.md'; then pass "names RECON.md"; else fail "names RECON.md" "missing"; fi
-if has "$MANUAL" '_reports/<slug>/RECON.md'; then pass "RECON.md path under _reports/<slug>/"
-else fail "RECON.md path under _reports/<slug>/" "RECON.md is not pinned to the artifacts dir"; fi
+# Pinned to the artifacts dir — but that dir is the ABSOLUTE $reports from the ledger
+# (§3.0.1), not a cwd-relative _reports/<slug>/. Relative paths are what scattered d28's
+# artifacts across three trees and produced the false "PLAN artifacts LOST" report.
+if has "$MANUAL" '$reports/RECON.md'; then pass "RECON.md pinned to absolute \$reports/"
+else fail "RECON.md pinned to absolute \$reports/" "RECON.md is not pinned to the artifacts dir"; fi
 # The three numbers the human signed off on.
 hasre "$MANUAL" '15[- ]line|≤ ?15|<= ?15' && pass "15-line digest budget" \
   || fail "15-line digest budget" "no <=15-line digest cap"
