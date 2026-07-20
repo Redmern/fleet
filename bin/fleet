@@ -412,6 +412,12 @@ cmd_ls() {
     NR==FNR { if (NF >= 2) tag[$1]=$2; next }
     {
       st=$1; extra=""; tg=($4 in tag) ? tag[$4] : ""
+      # `fleet ls | column -t` is a documented pipe, and column -t splits on RUNS
+      # of whitespace: an EMPTY tag field collapses, so every later column on that
+      # row shifts one left (worst case: a fleet that never used --task, where
+      # EVERY row shifts). A placeholder keeps the field present. It must not be a
+      # space — that is what collapses — so an untagged row reads "-".
+      if (tg == "") tg = "-"
       if ($9 != "" && $1 != "working" && $1 != "blocked") { st="done"; extra="  (ready: " $9 ")" }
       else if ($9 != "")                                  { extra="  (ready? " $9 " — but " $1 ")" }
       printf "%s\t%s\t%s\t%s:%s\t%s%s\n", st, tg, $2, $3, $5, $6, extra
@@ -1030,8 +1036,8 @@ cmd_new() {
   #     is_main_pane), and this namespace must stay unable to touch them.
   # Anything else: warn, drop, continue (fail-silent house style, CLAUDE.md).
   case "$task" in
-    ""|research|plan|impl|test|scratch|generic) ;;
-    *) printf 'fleet: unknown --task %s (ignored; want: research|plan|impl|test|scratch|generic)\n' "$task" >&2; task="" ;;
+    ""|research|plan|impl|test|scratch) ;;
+    *) printf 'fleet: unknown --task %s (ignored; want: research|plan|impl|test|scratch)\n' "$task" >&2; task="" ;;
   esac
 
   local root; root=$(fleet_root) || die "not inside tmux"
@@ -1657,7 +1663,7 @@ record_pane_role() { # <root> <pane_id> <role>
 }
 
 # ---- task tag -----------------------------------------------------------------
-# WHAT KIND OF WORK an agent is doing (research/plan/impl/test/scratch/generic),
+# WHAT KIND OF WORK an agent is doing (research/plan/impl/test/scratch),
 # purely for display. Deliberately a SEPARATE namespace from `role`: FLEET_ROLE,
 # .fleet/roles/<pane> and @fleet_role all mean "orchestrator vs worker" and all
 # three gate something (fork-bomb, merge/push, is_main_pane). Nothing here may
@@ -1692,7 +1698,7 @@ task_of() { # <win_id> <root> <wname> -> validated task, or "" — option wins, 
   # RE-VALIDATE ON READ. The write site is not the only way a value can arrive
   # here: the file is a plain file a human (or a stray script) can edit, and its
   # contents end up inside a tmux format string. Unknown → blank, never rendered.
-  case "$t" in research|plan|impl|test|scratch|generic) printf '%s' "$t" ;; esac
+  case "$t" in research|plan|impl|test|scratch) printf '%s' "$t" ;; esac
 }
 
 task_tag() { # <task> -> a FIXED-WIDTH 4-char pure-ASCII tag ("    " when unset/unknown)
@@ -1703,7 +1709,7 @@ task_tag() { # <task> -> a FIXED-WIDTH 4-char pure-ASCII tag ("    " when unset/
   case "${1:-}" in
     research) printf 'rsch' ;; plan) printf 'plan' ;; impl) printf 'impl' ;;
     test)     printf 'test' ;; scratch) printf 'scr ' ;;
-    *)        printf '    ' ;;   # generic + unset + unknown all render as nothing
+    *)        printf '    ' ;;   # unset + unknown all render as nothing
   esac
 }
 
@@ -5125,7 +5131,7 @@ fleet — agent fleet manager (tmux + nvim + Claude Code)
   fleet up [name|path]   boot project session + daemon + command center (auto-restores saved agents; --no-restore for main only, --tmuxinator to load a same-named tmuxinator layout)
   fleet save [name]      save the current session as a reusable project alias (fleet up <name>)
   fleet restore          respawn saved agents from a previous session
-  fleet new <repo> <br>  spawn agent (worktree + window + claude) [-p prompt] [--bare] [--switch|-s] [--base br] [-h harness] [--self-merge|--no-self-merge] [--task|-T research|plan|impl|test|scratch|generic]  (workers may merge/push by default)
+  fleet new <repo> <br>  spawn agent (worktree + window + claude) [-p prompt] [--bare] [--switch|-s] [--base br] [-h harness] [--self-merge|--no-self-merge] [--task|-T research|plan|impl|test|scratch]  (workers may merge/push by default)
   fleet new --scratch    spawn a repo-less agent (no repo/branch/worktree) [label] [-p prompt] [-h harness]
   fleet ls               list THIS project's agents and states (--all|-a = every project on the server; --pick = fzf jump-to-agent popup, Enter jumps)
   fleet pick             fzf jump-to-agent
@@ -5214,6 +5220,7 @@ case "${1:-}" in
   main-pane)  shift; cmd_main_pane "$@" ;;            # internal: orchestrator pane id (dash pop target)
   safe-kill-window) shift; safe_kill_window "$@" ;;   # internal: brake — refuse to kill main/last/empty (dash routes kills here)
   inject-secrets) shift; inject_secrets "$@" ;;       # internal: mirror per-repo secrets into a worktree (also called by cmd_new)
+  inject-status-format) shift; inject_status_format "$@" ;;  # internal: status-bar token injection, for the proof harness (also called by fleet up / fleetd)
   task-of)  shift; task_of "$@" ;;                    # internal: <win_id> <root> <wname> -> validated task (proof harness / dash)
   task-tag) shift; task_tag "$@" ;;                   # internal: <task> -> 4-char ASCII tag (proof harness)
   dash-new)   shift; cmd_dash_new "$@" ;;             # internal: leader 'new' -> dash's own form

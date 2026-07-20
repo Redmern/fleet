@@ -363,10 +363,13 @@ done < <(tmux list-windows -a -F '#{window_id}' 2>/dev/null)
 # ------------------------------------------------------------------------- 16b
 # …and the bar must actually SHOW the tag. This is the surface the human sees
 # without running any command — the whole point of the feature. inject_status_format
-# is only run by `fleet up`/fleetd, so drive it directly against a known format.
+# is only run by `fleet up`/fleetd, so drive it through its internal subcommand
+# against a known format. NOT `( . "$FLEET"; inject_status_format )`: sourcing the
+# CLI runs its dispatch block, which falls through to usage — or, on a tty, to the
+# interactive project picker, where it HANGS. That made this case prove nothing.
 tmux set -g window-status-format '#I:#W' 2>/dev/null
 tmux set -g window-status-current-format '#I:#W' 2>/dev/null
-( . "$FLEET" >/dev/null 2>&1; inject_status_format ) >/dev/null 2>&1
+"$FLEET" inject-status-format >/dev/null 2>&1
 gfmt=$(tmux show -g -v window-status-format 2>/dev/null)
 e_tagged=$(tmux display-message -p -t "$W1" '#{E:window-status-format}' 2>/dev/null)
 e_plain=$(tmux display-message -p -t "$WBASE" '#{E:window-status-format}' 2>/dev/null)
@@ -381,7 +384,7 @@ elif printf '%s' "$e_plain" | grep -qE 'rsch|impl|test|scr'; then
   fail 16b "an untagged window's status bar shows a tag: '$e_plain'"
 else pass 16b; fi
 # second run must be a no-op (fleetd's heal_status_format re-runs this forever)
-( . "$FLEET" >/dev/null 2>&1; inject_status_format ) >/dev/null 2>&1
+"$FLEET" inject-status-format >/dev/null 2>&1
 [ "$(tmux show -g -v window-status-format 2>/dev/null)" = "$gfmt" ] \
   && pass 16c || fail 16c "inject_status_format is not idempotent across runs"
 
@@ -409,14 +412,49 @@ odd=$(printf '%s' "$ls_out" | awk -F'\t' -v n="$hdr_nf" 'NF && NF!=n{c++} END{pr
 [ "$odd" = 0 ] && pass 18b || fail 18b "$odd row(s) do not match the header's $hdr_nf fields"
 
 # -------------------------------------------------------------------------- 19
-# STRUCTURAL (the dashboard is an interactive TUI and its draw loop is not
-# separately invocable): the width-degradation ladder must shed the task field
-# FIRST — before cost / mode / ✉ — so a narrow pane never squeezes the label.
-lad=$(grep -n 'LW < 1' "$DASH" | head -1 | cut -d: -f1)
+# The width-degradation ladder must shed the task field FIRST — before cost /
+# mode / ✉ — so a narrow pane never squeezes the label.
+#
+# 19a is STRUCTURAL (shed ORDER). It is kept, but it is NOT sufficient and must
+# never again stand alone: a source-grep proves the rungs are in the right ORDER
+# and says nothing about the THRESHOLD they fire at. The shipped gate was
+# `LW < 1`, while fit_left elides as soon as the label exceeds LW — so the ladder
+# was in the correct order and still truncated the identity to keep a 4-char
+# badge. That is what 19b measures, by RENDERING.
+lad=$(grep -n 'LW < LBLMIN' "$DASH" | head -1 | cut -d: -f1)
 tdrop=$(grep -n 'task_show=0' "$DASH" | head -1 | cut -d: -f1)
 cdrop=$(grep -n 'cost_show=0' "$DASH" | head -1 | cut -d: -f1)
-if [ -n "$tdrop" ] && [ -n "$cdrop" ] && [ "$tdrop" -lt "$cdrop" ]; then pass 19
-else fail 19 "task must be dropped before cost in the dash width ladder (task@${tdrop:-none} cost@${cdrop:-none}, ladder starts @${lad:-none})"; fi
+if [ -n "$tdrop" ] && [ -n "$cdrop" ] && [ "$tdrop" -lt "$cdrop" ]; then pass 19a
+else fail 19a "task must be dropped before cost in the dash width ladder (task@${tdrop:-none} cost@${cdrop:-none}, ladder gate @${lad:-none})"; fi
+
+# 19b FUNCTIONAL — the real invariant, measured on rendered output across the
+# width band where the ladder actually trades. THE RULE: a row may show a task
+# tag, or it may show a left-ellipsised (squeezed) label, but NEVER BOTH — the
+# badge is a convenience, the label is the identity. Widths step through the band
+# one at a time because the failure lives INSIDE it: sampling 100 then 60 steps
+# straight over the point where the tag is still held and the label has already
+# been eaten.
+bad=""
+for W in 120 110 100 95 90 85 80; do
+  tmux kill-window -t "=$FLEET_SESSION:dashw" 2>/dev/null
+  tmux new-window -d -t "=$FLEET_SESSION" -n dashw -c "$FLEET_ROOT" "$DASH $FLEET_SESSION" 2>/dev/null
+  tmux set -w -t "=$FLEET_SESSION:dashw" window-size manual 2>/dev/null
+  tmux resize-window -t "=$FLEET_SESSION:dashw" -x "$W" -y 24 2>/dev/null
+  sleep 0.8
+  cap=$(tmux capture-pane -p -t "=$FLEET_SESSION:dashw" 2>/dev/null)
+  # a squeezed row is one carrying the left-ellipsis fit_left inserts
+  while IFS= read -r ln; do
+    case "$ln" in
+      *…*) case "$ln" in
+             *rsch*|*plan*|*impl*|*test*|*scr*)
+               bad="$bad w=$W:[$(printf '%s' "$ln" | sed 's/^ *//;s/ *$//')]" ;;
+           esac ;;
+    esac
+  done <<< "$cap"
+done
+tmux kill-window -t "=$FLEET_SESSION:dashw" 2>/dev/null
+[ -z "$bad" ] && pass 19b \
+  || fail 19b "a task tag survived while its label was squeezed (tag must shed first):$bad"
 
 # -------------------------------------------------------------------------- 20
 # THE CODEPOINT-VS-CELL GUARD: every tag is 4 ASCII bytes AND 4 characters. This
@@ -489,6 +527,31 @@ else fail 24 "an untagged respawn inherited a dead agent's tag (task='$t', file 
 # leaving only the header. Assert real data rows survive.
 rows=$("$FLEET" ls 2>/dev/null | tail -n +2 | grep -c .)
 [ "${rows:-0}" -ge 1 ] && pass 25 || fail 25 "\`fleet ls\` printed a header and no rows"
+
+# -------------------------------------------------------------------------- 26
+# `generic` is REJECTED (d26 gate item 4), exactly like `main`. It was accepted but
+# rendered on no surface, while still flipping HAS_TASKS — so it cost every label
+# 4+G columns fleet-wide to display nothing, which is the precise harm the
+# "--scratch does not default to task=scratch" decision was taken to avoid.
+spawn repo feat/generic --task generic >/dev/null 2>&1
+WG=$(wid_of "repo/feat_generic")
+if [ -n "$WG" ] && [ -z "$(opt_of "$WG")" ]; then pass 26a
+else fail 26a "--task generic must be rejected; got '$(opt_of "$WG")'"; fi
+# …and the rejection must leave NOTHING behind that could flip HAS_TASKS: no
+# @fleet_task_tag, no durable sidecar. The dash derives HAS_TASKS from the tag, so
+# a stored-but-unrenderable value is exactly the failure being closed here.
+gtag=$(tmux show -wqv -t "$WG" @fleet_task_tag 2>/dev/null)
+if [ -z "$gtag" ] && [ ! -e "$(task_file 'repo/feat_generic')" ]; then pass 26b
+else fail 26b "rejected 'generic' left state behind: tag='$gtag' file=$(task_file 'repo/feat_generic')"; fi
+# the warning must name the CLOSED enum, so the message can't advertise a value
+# the write site rejects
+gmsg=$(spawn repo feat/generic2 --task generic 2>&1 | grep -i 'unknown --task' | head -1)
+case "$gmsg" in
+  *generic*want*research*plan*impl*test*scratch*)
+    case "$gmsg" in *"|generic"*) fail 26c "the warning still advertises 'generic': $gmsg" ;;
+                    *) pass 26c ;; esac ;;
+  *) fail 26c "no closed-enum warning for --task generic: '$gmsg'" ;;
+esac
 
 echo "== tail: syntax ============================================================"
 bash -n "$FLEET"  && pass "syntax-fleet"  || fail "syntax-fleet"  "bin/fleet does not parse"

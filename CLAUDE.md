@@ -122,7 +122,7 @@ branch). Branches with `/` become `_` in directory and window names.
 
 ### Task tag (`--task`, `@fleet_task`) — NOT `role`
 
-`fleet new --task <research|plan|impl|test|scratch|generic>` tags what KIND of work
+`fleet new --task <research|plan|impl|test|scratch>` tags what KIND of work
 an agent does, for display only. Three load-bearing constraints:
 
 1. **It is never a TSV column.** The `.agents` line and `fleet agents` are both
@@ -239,7 +239,7 @@ this project with the `fleet` CLI.
   its branch (fleet-guard allows it). Flip the whole project to *blocked* with
   `fleet selfmerge off`; override a single spawn either way with `--self-merge`
   (force allow) or `--no-self-merge` (force block). **`--task <kind>`** tags what
-  KIND of work this agent does — one of `research|plan|impl|test|scratch|generic`
+  KIND of work this agent does — one of `research|plan|impl|test|scratch`
   — shown as a 4-char tag (`rsch`/`plan`/`impl`/`test`/`scr`) in the tmux window
   status bar, the dashboard row, and `fleet ls`'s TASK column. Unset (or unknown,
   which warns and drops) renders blank. Display only: it is a separate namespace
