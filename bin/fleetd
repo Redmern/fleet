@@ -238,15 +238,22 @@ class Fleet:
         self.last_scrape = now
         out = tmux(
             "list-panes", "-a", "-F",
-            "#{pane_id}\t#{@fleet_state_src}\t#{@fleet_busy_re}\t#{pane_current_path}",
+            "#{pane_id}\t#{@fleet_state_src}\t#{@fleet_busy_re}\t#{pane_current_path}"
+            "\t#{@fleet_viewer}",
         )
         if not out:
             return
         for line in out.splitlines():
             parts = line.split("\t")
-            if len(parts) != 4:
+            if len(parts) != 5:
                 continue
-            pane, src, busy_re, path = parts
+            pane, src, busy_re, path, viewer = parts
+            # @fleet_state_src / @fleet_busy_re are WINDOW options, so tmux inherits
+            # them onto a sub-orch's nvim VIEWER pane too. Scraping it would report a
+            # state for a pane that is not an agent, putting it into self.panes and
+            # emitting a second row for the window. @fleet_viewer is a pane option.
+            if viewer == "1":
+                continue
             if src != "scrape" or not busy_re:
                 continue
             cap = tmux("capture-pane", "-p", "-t", pane)
@@ -326,12 +333,12 @@ class Fleet:
             "list-panes", "-a", "-F",
             "#{pane_id}\t#{window_id}\t#{session_name}\t#{window_name}"
             "\t#{pane_current_path}\t#{pane_active}\t#{@fleet_harness}"
-            "\t#{window_activity}\t#{@fleet_role}",
+            "\t#{window_activity}\t#{@fleet_role}\t#{@fleet_viewer}",
         ) or ""
         meta = {}
         for line in out.splitlines():
             parts = line.split("\t")
-            if len(parts) == 9:
+            if len(parts) == 10:
                 meta[parts[0]] = parts[1:]
         agents = []
         covered = set()  # window_ids that already have a real reported pane
@@ -340,6 +347,13 @@ class Fleet:
             if not cur:
                 continue
             m = meta.get(pane)
+            # Belt to scrape_harnesses' braces: a sub-orch VIEWER pane is never an
+            # agent, so it must not surface a row even if something managed to report
+            # a state for it. NB meta holds parts[1:], so the indices are shifted by
+            # one against the format string: m[7] is @fleet_role (used just below),
+            # m[8] is @fleet_viewer.
+            if m and len(m) > 8 and m[8] == "1":
+                continue
             window_id, session, window_name, path = (m[0], m[1], m[2], m[3]) if m else ("", "", "", "")
             # Exclude the orchestrator by ROLE (@fleet_role main) or name — a drifted
             # "main" name must still be hidden so it can't surface as a reapable row.
@@ -369,7 +383,13 @@ class Fleet:
         now = time.time()
         synth = {}  # window_id -> chosen meta row
         for pane, m in meta.items():
-            window_id, session, window_name, path, pane_active, harness, activity, role = m
+            window_id, session, window_name, path, pane_active, harness, activity, role, viewer = m
+            # A sub-orch's nvim VIEWER pane is not an agent. @fleet_harness is a window
+            # option so tmux inherits it onto the viewer too, and the "prefer the active
+            # pane" rule below would hand `fleet send`/`fleet mode` the file browser the
+            # moment the human focuses it. @fleet_viewer is a pane option — skip it.
+            if viewer == "1":
+                continue
             if not harness or not window_id or window_id in covered:
                 continue
             if window_name == "main" or role == "main":   # exclude orchestrator by role or name
@@ -379,7 +399,7 @@ class Fleet:
             if prev is None or (pane_active == "1" and prev[5] != "1"):
                 synth[window_id] = (pane,) + tuple(m)
         for window_id, row in synth.items():
-            pane, _wid, session, window_name, path, _pa, harness, activity, _role = row
+            pane, _wid, session, window_name, path, _pa, harness, activity, _role, _viewer = row
             try:
                 since = float(activity)
             except (TypeError, ValueError):
