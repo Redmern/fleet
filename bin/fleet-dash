@@ -991,11 +991,17 @@ render() {
       local iunread=${UNREAD[$wname]:-0} ibx_show=0
       (( iunread > 0 )) && ibx_show=1
       np=$(( 1 + git_show + mode_show + ibx_show ))   # state always + git/mode/✉ optional
-      LW=$(( cw - np*PW - CF - (np+1)*G ))         # np pills + cost + gaps
-      (( LW < 1 )) && { cost_show=0; LW=$(( cw - np*PW - np*G )); }                 # drop cost
-      (( LW < 1 )) && (( mode_show )) && { mode_show=0; np=$((np-1)); LW=$(( cw - np*PW - np*G )); }  # drop mode
-      (( LW < 1 )) && (( ibx_show )) && { ibx_show=0; np=$((np-1)); LW=$(( cw - np*PW - np*G )); }    # drop ✉
-      (( LW < 1 )) && { git_show=0; ibx_show=0; mode_show=0; LW=$(( cw - PW - G )); }                 # state+label only
+      # Reserve the ready-glyph's 2 columns UP FRONT, before the drop-cost/mode/✉
+      # cascade below reasons about the remaining width — taking them afterwards
+      # would both mis-inform the cascade and push the row 2 columns past $cw at
+      # the widths where LW clamps to 0 (content is printed between two │ with no
+      # truncation, so the right rail would shift/wrap).
+      local cwg=$(( cw - 2 ))
+      LW=$(( cwg - np*PW - CF - (np+1)*G ))         # np pills + cost + gaps
+      (( LW < 1 )) && { cost_show=0; LW=$(( cwg - np*PW - np*G )); }                 # drop cost
+      (( LW < 1 )) && (( mode_show )) && { mode_show=0; np=$((np-1)); LW=$(( cwg - np*PW - np*G )); }  # drop mode
+      (( LW < 1 )) && (( ibx_show )) && { ibx_show=0; np=$((np-1)); LW=$(( cwg - np*PW - np*G )); }    # drop ✉
+      (( LW < 1 )) && { git_show=0; ibx_show=0; mode_show=0; LW=$(( cwg - PW - G )); }                 # state+label only
       (( LW < 0 )) && LW=0
       # stall: an agent stuck "working" too long shows a red 'stalled' pill
       sdisp="$state"; scol=$(state_pcol "$state")
@@ -1008,9 +1014,17 @@ render() {
         working|blocked) ;;
         *) [ -n "$(field "$i" 8)" ] && { sdisp="done"; scol=5; } ;;
       esac
+      # State-independent ready glyph. The `done` pill above is idle-only BY
+      # DESIGN (a `done` pill on a live agent would make the reap scan lie), so a
+      # flagged working/blocked row would otherwise show NOTHING — and `status` is
+      # wiped by the read timeout after ~one tick. This is the second, permanent
+      # feedback channel. Reserve the 2 columns unconditionally so the layout
+      # never shifts between a flagged and an unflagged row.
+      local rglyph="  "
+      [ -n "$(field "$i" 8)" ] && rglyph=$'⚑ '
       (( i == sel )) && lblsgr='\033[1m' || lblsgr='\033[2m'
       content=$(pill "$sdisp" "$scol")
-      content+=$(printf "%s${lblsgr}%b\033[22m" "$gap" "$(fit_left "$label" "$LW")")
+      content+=$(printf "%s\033[35m%s\033[0m${lblsgr}%b\033[22m" "$gap" "$rglyph" "$(fit_left "$label" "$LW")")
       (( git_show )) && content+="$gap$(pill "$gt" "$(git_pcol "$g")")"
       (( mode_show )) && content+="$gap$(pill "$(mode_short "$mode")" "$(mode_pcol "$mode")")"
       (( ibx_show )) && content+="$gap$(pill "✉$iunread" "$(sev_pcol "${MAXSEV[$wname]:-}")")"
@@ -1096,7 +1110,11 @@ render() {
   # bottom border with key hints (or a transient status)
   local hint
   if [ -n "$status" ]; then hint="$status"
-  else hint="Spc leader · j/k · Ent jump · e msgs · h hide · v diff · m mode · s send · n new · d close · r/R refresh"; fi
+  # `hrule` hard-truncates at inner-1, and the right-hand pane already clipped the
+  # old 104-char string. Gains `y ready` and is still 7 columns CHEAPER: `r`/`R`
+  # drop out of the legend (R is in the leader menu, r is redundant under the ~1s
+  # auto-refresh). Both keys still work — they are just no longer advertised.
+  else hint="Spc ldr · j/k · Ent jump · e msgs · h hide · v diff · m mode · s send · n new · y ready · d close"; fi
   tput cup $(( rows - 1 )) 0 2>/dev/null
   printf '\033[2m%s\033[0m\033[K' "$(hrule '╰' '╯' "$inner" "$hint")"
 }
@@ -1713,6 +1731,49 @@ drain_nav() {
   done
 }
 
+# Agents view `y`: TOGGLE the ready flag on the selected agent. Ready = "this
+# worktree is done and safe for `fleet reap` to delete". Normally the worker
+# self-flags when its task completes (cmd_new seeds it that instruction); this is
+# the manual override for when it doesn't. A TOGGLE, not one-way, so a mis-press
+# is undone with the same key — cheapest-possible-undo is exactly what lets this
+# skip a confirm modal, and it keeps a mis-flag from becoming a mis-reap. (The
+# other half of that bargain is cmd_reap's live-state guard, which refuses to
+# delete a worktree whose agent is still working/blocked.)
+# A function, not an inline key branch, so the proof harness can drive it under
+# the DASH_LIB seam below.
+toggle_ready() {
+  [ "$MODE" = agents ] || return 0
+  (( N == 0 )) && return 0
+  (( sel < N )) || { status="orphans row — press e for messages"; return 0; }
+  local lbl win rdy st out
+  lbl=$(field "$sel" 2); win=$(field "$sel" 4); rdy=$(field "$sel" 8); st=$(field "$sel" 1)
+  # Pass the WINDOW NAME (field 4), never the label (field 2): cmd_ready's target
+  # match is a SUBSTRING match, first hit wins, so a repo/branch label that is a
+  # substring of another agent's would flag the wrong worktree.
+  # Report only what actually happened — a status line that claims a flag landed
+  # when the marker write failed is worse than no feedback at all.
+  if [ -n "$rdy" ]; then
+    if out=$("$FLEET_BIN" ready "$win" --clear 2>&1); then status="ready cleared → $lbl"
+    else status="clear FAILED → $lbl: $(printf '%s' "$out" | tail -1)"; fi
+  else
+    if ! out=$("$FLEET_BIN" ready "$win" 2>&1); then
+      status="flag FAILED → $lbl: $(printf '%s' "$out" | tail -1)"
+    else
+      case "$out" in
+        # A scratch/root agent has no worktree; cmd_ready's bleed guard refuses
+        # rather than dropping a marker into the SHARED project root. Surface it.
+        *"no worktree"*) status="scratch agent — nothing to reap" ;;
+        *) case "$st" in
+             # The `done` pill is idle-only by design, so say why nothing changed.
+             working|blocked) status="flagged ready → $lbl (still $st — shows done when idle)" ;;
+             *) status="flagged ready → $lbl" ;;
+           esac ;;
+      esac
+    fi
+  fi
+  return 0
+}
+
 # --- main loop ---------------------------------------------------------------
 # Test/lib seam: under DASH_LIB the functions are loaded but the interactive loop
 # (and its tty/render side effects) never runs — the sourcing test drives the
@@ -1766,6 +1827,9 @@ while :; do
       # — nvim/claude/shell Space stays untouched. Same popup as prefix+Space.
       "$FLEET_BIN" menu-popup 2>/dev/null   # fit-to-content frame; blocks until the popup closes
       clear; status="" ;;
+    y)             # agents view: toggle the READY flag on the selected agent (no confirm)
+      [ "$MODE" = agents ] || continue
+      toggle_ready; load_rows; last_load=$SECONDS ;;
     t)             # agents view: open the cross-agent message triage (all queued msgs)
       [ "$MODE" = agents ] || continue
       open_triage; last_load=$SECONDS ;;

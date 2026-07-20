@@ -59,10 +59,14 @@ this project with the `fleet` CLI.
   unchanged: it is never send-keys'd, its wake stays out-of-band (toast + bell +
   dashboard alert).
 - `fleet ready [<agent>] [-m "reason"]` — signal that a work item is **done and
-  its worktree is ready for deletion.** A worker runs bare `fleet ready` from
-  inside its own worktree; you flag someone else's with `fleet ready <agent>`.
-  This drops a `.fleet/ready` marker, so the agent shows as `done` in `fleet ls`
-  and the dashboard. `--clear` removes the flag.
+  its worktree is ready for deletion.** **Workers: run bare `fleet ready` from
+  inside your own worktree when the task you were spawned for is complete AND
+  committed — not when you are pausing, blocked, or asking a question.** (Every
+  spawned worker is seeded this instruction on its first prompt and again in
+  `<worktree>/.fleet/ready-instructions`, which survives a `/clear`.) You flag
+  someone else's with `fleet ready <agent>`, or press **`y`** on its row in the
+  dashboard. This drops a `.fleet/ready` marker, so the agent shows as `done` in
+  `fleet ls` and the dashboard. `--clear` removes the flag.
 - `fleet reap [<target>] [--force]` — remove every worktree flagged ready (close
   its window, delete the worktree and its merged branch). Refuses any worktree
   with uncommitted changes, a branch not merged into its base, or a worker that
@@ -81,8 +85,8 @@ one-key actions. Open it with **prefix+F** or **prefix+Space** (both work from
 any pane, including this orchestrator pane — both are prefix-table bindings, so
 plain Space typing in panes is untouched), or by pressing **bare Space while the
 dashboard pane is focused**. Press the shown key to run an action;
-**Esc/q/Space** closes. Actions are grouped **+Agents** (pick `a`, new `n`, ready
-`y`, reap `x`, orchestrator `m`, pop oldest message `p`, triage messages `t`,
+**Esc/q/Space** closes. Actions are grouped **+Agents** (pick `a`, new `n`,
+reap `x`, orchestrator `m`, pop oldest message `p`, triage messages `t`,
 rebuild `M`), **+Session**
 (save `s`, sessions `o`, reload `R`, dispatch mode `d`, quit `Q`), and **+Info** (ls `l`, keys `?`,
 rebind `c`). Those single keys are pressed **inside** the popup — fleet binds
@@ -92,7 +96,12 @@ prefix default (`n`, `x`, `s`, … ) stays intact; the only default it reclaims 
 (`fleet rebind` → `menu`); the `prefix+Space` alias is set/disabled via
 `menu-alt=` in `keybinds.conf`. `fleet keys` lists every action and its in-menu
 key; `fleet rebind` (or the menu's `c`) changes one. Per-agent verbs (msgs `e`,
-send, mode, diff, close) stay on the dashboard's selected row, not in the leader.
+ready `y`, send, mode, diff, close) stay on the dashboard's selected row, not in
+the leader — mark-ready moved off the leader menu entirely, because a leader key
+cannot know which row you mean. In the dashboard's agents view
+**`y`** toggles the ready flag on the selected agent — no confirm modal, because
+the same key undoes it, and a flagged row carries a **⚑** glyph whatever its
+live state (the `done` pill stays idle-only, so it never lies about a live agent).
 
 **Two jump actions — `a` vs `l`.** Both `pick` (`a`) and `ls` (`l`) are now
 **interactive fzf jumpers** that land you on an agent's window (Enter jumps,
