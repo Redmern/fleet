@@ -257,8 +257,8 @@ in as you go**. Two rules, both cheap:
 
 `ln -sfn` is re-pointable and idempotent, so re-running any of this is safe — no guard
 needed. After `fleet reap` deletes a worktree its link **dangles**; that is intended. A
-dangling link is a visible tombstone of work that existed, it breaks nothing, and oil.nvim
-renders it plainly.
+dangling link is a visible tombstone of work that existed, it breaks nothing, and the
+viewer's file browser renders it plainly.
 
 ## 3. Fall-through: decompose INLINE and spawn flat workers (non-feature chores)
 
