@@ -138,6 +138,51 @@ hang. Every placement is recorded in an append-only audit log
 injected secrets — this buys auto-injection + accidental-commit protection +
 encryption-at-rest, NOT secrecy from the agent. `doctor_secrets` prints that caveat.
 
+### Sub-orch viewer pane (`suborch_attach_viewer`)
+
+A sub-orch window is **two panes**: pane 0 is the harness (byte-identical to any other
+`--scratch` spawn), pane 1 is an **nvim viewer** rooted at `.fleet/dispatch/<id>/`, the
+per-dispatch **symlink farm** the sub-orch populates itself (`reports ->`, one link per
+worker worktree, one per worker notes dir — `FLEET_SUBORCH.md` §3.0.6). The absolute
+reports path comes from the ledger `reports` key, written by `cmd_dispatch_rename` — the
+only place `d<N>` and `<slug>` are both in hand.
+
+Making nvim the sub-orch's *own* pane instead would be **silent death**: `is_harness_cmd`
+allowlists `nvim`, so the pane would read ALIVE forever after the agent inside it died,
+`cmd_reconcile` would never re-animate, and the dispatch would stall showing green. Hence
+the pane is *added*, `-d` (no focus steal) and **no `-b`** (pane 0 stays the harness), and
+it carries the `@fleet_viewer` **pane** option — never the `@fleet_nvim_sock` *window*
+option, which `cmd_send` keys on to route all delivery over nvim RPC with no fallback.
+
+Two consequences everything else must respect:
+
+- **Liveness may not use `head -1`.** When the harness pane exits the window survives on
+  the viewer and the viewer *becomes* pane 0 → false ALIVE. `suborch_live` resolves through
+  `suborch_harness_pane` (first non-viewer pane) instead, and
+  `suborch_prune_orphan_window` drops the harness-less husk before reconcile respawns.
+- **Row producers enumerate panes and key on WINDOW options, which tmux inherits down to
+  every pane.** Three of them: `agents_tsv`'s daemon-down fallback keys on `@agent_state`
+  (→ a duplicate row per sub-orch, skewing `fleet-dash`'s `HIDDEN_N`); `fleetd`'s
+  synthetic pass keys on `@fleet_harness` and *prefers the active pane* (→ `fleet
+  send`/`mode` targeting nvim the moment the human focuses it); `fleetd.scrape_harnesses`
+  keys on `@fleet_state_src`/`@fleet_busy_re` (→ for a hookless harness like omp it
+  capture-panes the viewer and reports a state for it). All three filter on
+  `@fleet_viewer`, as do `window_pane_for` and `suborch_pane_for`. **Any new pane
+  enumeration must too.** `suborch_has_live_workers` is the documented exception —
+  a sub-orch is excluded from `@fleet_owner` stamping, so its viewer reads an empty owner.
+
+`fleetd`'s tmux format grew a 10th field for this. Note `meta` stores `parts[1:]`, so
+format index *n* is `m[n-1]` — the synth pass unpacks `(pane,) + tuple(m)` (10 names)
+while the reported-pane loop indexes `m[8]`. Both arities were wrong on the first pass and
+`fleetd` has no try/except around method dispatch, so each one exited the daemon;
+`Restart=on-failure` then crash-looped it to permanently `failed` while everything
+silently degraded to the stale tmux-option fallback. Any change here must keep
+`test/suborch-viewer-focus.sh` case **4b** (daemon still alive after serving) green —
+case 4 alone passes just as happily against a corpse.
+
+Proofs: `test/suborch-viewer-{liveness,send,focus,idempotent}.sh` and
+`test/dispatch-symlink-farm.sh`. The liveness one is the critical guard.
+
 ### Permission-mode discovery (notable)
 
 Claude only exposes mode *cycling* (Shift+Tab), not "set mode X". `cmd_mode`

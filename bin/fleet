@@ -266,9 +266,13 @@ PY
     # (drops window_name=="main"); the raw path must too, or main becomes a
     # resolvable send/mode target. Unpack every field so the per-row wname check
     # is possible (field order is unchanged).
-    tmux list-panes -a -F $'#{?@agent_state,#{@agent_state}\t#{pane_current_path}\t#{session_name}\t#{window_id}\t#{window_name}\t-\t#{pane_id},}' 2>/dev/null \
+    tmux list-panes -a -F $'#{?@agent_state,#{@agent_state}\t#{pane_current_path}\t#{session_name}\t#{window_id}\t#{window_name}\t-\t#{pane_id}\t#{@fleet_viewer},}' 2>/dev/null \
       | sed '/^$/d' \
-      | while IFS=$'\t' read -r st path sess wid wname since pane; do
+      | while IFS=$'\t' read -r st path sess wid wname since pane viewer; do
+          # @agent_state is a WINDOW option, so tmux inherits it down to EVERY pane —
+          # a sub-orch's viewer pane would emit a second row for the same window,
+          # doubling the agent and skewing fleet-dash's HIDDEN_N parked count.
+          [ "$viewer" = 1 ] && continue
           # Drop the orchestrator by ROLE, not just the bare name — a drifted "main"
           # window must still be recognized (is_main_pane reads the role registry).
           [ "$wname" = main ] && continue
@@ -1267,13 +1271,14 @@ main_pane_for_target() { # <target> -> this session's orchestrator pane_id, or r
 # main_pane_for_target so a same-named window in another project is never matched.
 # Used by the gate pop router to find the owning sub-orch's pane. rc 1 if no live match.
 window_pane_for() { # <wname> -> pane_id, or rc 1
-  local wname="${1:-}" sess s w pane
+  local wname="${1:-}" sess s w pane v
   [ -n "$wname" ] || return 1
   sess=$(session_name 2>/dev/null) || return 1; [ -n "$sess" ] || return 1
-  while IFS=$'\t' read -r s w pane; do
+  while IFS=$'\t' read -r s w pane v; do
     { [ "$s" = "$sess" ] || [ "$s" = "${sess}_hidden" ]; } || continue
+    [ "$v" = 1 ] && continue    # never resolve onto a sub-orch viewer pane (nvim, no agent)
     [ "$w" = "$wname" ] && { printf '%s' "$pane"; return 0; }
-  done < <(tmux list-panes -a -F $'#{session_name}\t#{window_name}\t#{pane_id}' 2>/dev/null)
+  done < <(tmux list-panes -a -F $'#{session_name}\t#{window_name}\t#{pane_id}\t#{@fleet_viewer}' 2>/dev/null)
   return 1
 }
 
@@ -1283,13 +1288,17 @@ window_pane_for() { # <wname> -> pane_id, or rc 1
 # OR starts with "owner-" — the trailing dash is load-bearing: it stops so-d1 matching
 # so-d11 (so-d11 does not start with "so-d1-"). Hidden-session-aware like window_pane_for.
 suborch_pane_for() { # <owner-bare-name> -> pane_id, or rc 1
-  local owner="${1:-}" sess s w pane
+  local owner="${1:-}" sess s w pane v
   [ -n "$owner" ] || return 1
   sess=$(session_name 2>/dev/null) || return 1; [ -n "$sess" ] || return 1
-  while IFS=$'\t' read -r s w pane; do
+  while IFS=$'\t' read -r s w pane v; do
     { [ "$s" = "$sess" ] || [ "$s" = "${sess}_hidden" ]; } || continue
+    # Skip the sub-orch's own VIEWER pane: it is an nvim with no agent terminal, and
+    # once the harness pane dies it would otherwise be the only match left — sending
+    # the human's gate pop into a file browser.
+    [ "$v" = 1 ] && continue
     case "$w" in "$owner"|"$owner"-*) printf '%s' "$pane"; return 0 ;; esac
-  done < <(tmux list-panes -a -F $'#{session_name}\t#{window_name}\t#{pane_id}' 2>/dev/null)
+  done < <(tmux list-panes -a -F $'#{session_name}\t#{window_name}\t#{pane_id}\t#{@fleet_viewer}' 2>/dev/null)
   return 1
 }
 
@@ -1593,6 +1602,101 @@ is_harness_cmd() { # <pane_current_command>
   case "$1" in claude|node|*claude*|nvim) return 0 ;; *) return 1 ;; esac
 }
 
+# ---- sub-orch VIEWER pane -----------------------------------------------------
+# The sub-orch is the one agent whose entire product is FILES (STATUS.md, the ledger,
+# the curated reports the human approves at gates) and the only one with no file view.
+# It gets one — as an ADDED pane, never by converting its own pane to nvim. Converting
+# would be silent death: is_harness_cmd allowlists `nvim`, so a pane whose program IS
+# nvim reads ALIVE forever, including after the agent inside it dies -> `fleet
+# reconcile` never re-animates -> the dispatch stalls permanently showing green.
+# Keeping the harness pane byte-identical voids that by construction.
+#
+# The viewer is flagged with the @fleet_viewer PANE option (never the
+# @fleet_nvim_sock WINDOW option — cmd_send keys on that one and would route every
+# delivery over nvim RPC, then `die` with no fallback). Everything that enumerates
+# panes must filter on it; the helpers below are the single place that knows how.
+
+# The window's HARNESS pane: the first pane that is NOT the viewer. `head -1` alone is
+# not enough — when the harness pane exits the window survives on the viewer, and the
+# viewer becomes pane index 0. That is precisely the false-ALIVE this design exists to
+# avoid, so every probe resolves through here.
+suborch_harness_pane() { # <window_id> -> "<pane_id> <pane_current_command>", or rc 1
+  local wid="${1:-}" line
+  [ -n "$wid" ] || return 1
+  line=$(tmux list-panes -t "$wid" -F $'#{@fleet_viewer}\t#{pane_id} #{pane_current_command}' \
+         2>/dev/null | awk -F'\t' '$1!="1"{print $2; exit}') || return 1
+  [ -n "$line" ] || return 1
+  printf '%s' "$line"
+}
+
+# Attach the viewer pane to a sub-orch window, rooted at <dir> (the per-dispatch
+# symlink farm in .fleet/dispatch/<id>/ — see FLEET_SUBORCH.md). Idempotent: this runs
+# on every `fleet dispatch` and every `fleet reconcile` sweep, so a second nvim would
+# be a per-tick pane leak. Fail-silent throughout — a missing nvim, a dead window or a
+# refused split must never break a dispatch.
+#   * NO -b   → pane 0 stays the harness (suborch_pane_for and the probes above).
+#   * -d      → focus stays on the harness (fleetd prefers #{pane_active} for its
+#               pre-first-hook synthetic row; a focus-stealing split would transiently
+#               make `fleet send` / `fleet mode` target nvim).
+#   * no --cmd nvim/fleet.lua and no FLEET_AUTOCLAUDE → the viewer must never
+#               autostart a harness of its own.
+#   * -c <dir> is independent of the harness cwd, which stays $root.
+suborch_attach_viewer() { # <window_id> <dir>
+  local wid="${1:-}" dir="${2:-}" v harness
+  [ -n "$wid" ] && [ -n "$dir" ] && [ -d "$dir" ] || return 0
+  command -v nvim >/dev/null 2>&1 || return 0
+  tmux list-panes -t "$wid" -F '#{pane_id}' >/dev/null 2>&1 || return 0
+  v=$(tmux list-panes -t "$wid" -F $'#{pane_id}\t#{@fleet_viewer}' 2>/dev/null \
+      | awk -F'\t' '$2=="1"{print $1; exit}')
+  [ -n "$v" ] && return 0                     # already attached — idempotent no-op
+  # Second guard, on pane COUNT. The flag guard above is not enough on its own: the
+  # split and the `set -p` are two commands, so a kill (or a failing set) between them
+  # leaves an UNFLAGGED nvim pane that the flag guard cannot see — and this function
+  # runs on every reconcile tick, so that would be an unbounded pane leak on a window
+  # nobody is looking at. A sub-orch window is only ever harness + viewer.
+  local npanes; npanes=$(tmux list-panes -t "$wid" -F '#{pane_id}' 2>/dev/null | grep -c .)
+  [ "${npanes:-0}" -ge 2 ] && return 0
+  harness=$(tmux list-panes -t "$wid" -F '#{pane_id}' 2>/dev/null | head -1)
+  [ -n "$harness" ] || return 0
+  v=$(tmux split-window -d -P -F '#{pane_id}' -h -t "$harness" -l '40%' \
+        -c "$dir" nvim . 2>/dev/null) || return 0
+  [ -n "$v" ] || return 0
+  tmux set -p -t "$v" @fleet_viewer 1 2>/dev/null || true
+  # Read the flag back. An unflagged viewer is worse than no viewer: every filter added
+  # for it keys on @fleet_viewer, so it would count as an agent row, be a `fleet send`
+  # target, and mask a dead harness in suborch_live. If the stamp did not take, undo
+  # the split rather than leave that pane behind.
+  if [ "$(tmux display -p -t "$v" '#{@fleet_viewer}' 2>/dev/null)" != 1 ]; then
+    tmux kill-pane -t "$v" 2>/dev/null || true
+  fi
+  return 0
+}
+
+# A sub-orch window whose harness pane died but whose viewer keeps it alive is a
+# husk: reconcile is about to respawn the sub-orch in a fresh window, and leaving the
+# husk behind leaks a window per crash and gives suborch_find_wid a decoy to match.
+# REFUSES any window that still has a harness pane — this can only ever remove a
+# window that is already dead by suborch_live's own definition. It ALSO refuses a
+# window whose name is not this sub-orch's: tmux window ids restart at @0 on a server
+# restart, so a stale ledger `window_id` can name a window fleet never created.
+suborch_prune_orphan_window() { # <window_id> [expected-window-name]
+  local wid="${1:-}" want="${2:-}" name
+  [ -n "$wid" ] || return 0
+  tmux list-panes -t "$wid" -F '#{pane_id}' >/dev/null 2>&1 || return 0
+  suborch_harness_pane "$wid" >/dev/null 2>&1 && return 0   # still has a harness — never touch
+  name=$(tmux display -p -t "$wid" '#{window_name}' 2>/dev/null)
+  # Prefix-tolerant like suborch_pane_for: `dispatch rename` appends -<slug>.
+  case "$name" in
+    so-*) ;;                                   # a sub-orch window — fair game
+    *)    return 0 ;;
+  esac
+  if [ -n "$want" ]; then
+    case "$name" in "$want"|"$want"-*) ;; *) return 0 ;; esac
+  fi
+  safe_kill_window "$wid" 2>/dev/null || true
+  return 0
+}
+
 # Liveness = window exists AND its foreground proc is the harness (not a dead shell).
 # Resolve by the window_id recorded in the ledger at spawn (session-independent: a
 # scratch sub-orch lives in <sess>_hidden, so a "$sess:$wname" pane lookup never
@@ -1603,8 +1707,10 @@ suborch_live() { # <dispatch-dir> <sess> <wname>
   wid=$(meta_get "$d" window_id)
   [ -n "$wid" ] || wid=$(suborch_find_wid "$sess" "$wname")
   [ -n "$wid" ] || return 1
-  pane=$(tmux list-panes -t "$wid" -F '#{pane_id} #{pane_current_command}' \
-         2>/dev/null | head -1) || return 1
+  # NOT `head -1`: a sub-orch window may carry a viewer pane, and once the harness
+  # pane exits the viewer becomes pane 0 — nvim is an allowlisted harness command, so
+  # head -1 would read ALIVE forever on a dead agent. Probe the harness pane by name.
+  pane=$(suborch_harness_pane "$wid") || return 1
   [ -n "$pane" ] || return 1
   cmd=${pane#* }
   is_harness_cmd "$cmd"
@@ -1617,6 +1723,11 @@ suborch_live() { # <dispatch-dir> <sess> <wname>
 # respawn cap: a genuine pipeline that merely lost its sub-orch pane (workers still
 # running) must be RE-ANIMATED, never abandoned as `failed`. Idle-but-unfinished
 # workers count as live (err toward keeping the pipeline alive).
+# NB no @fleet_viewer filter is needed here, and that is load-bearing rather than an
+# oversight: the only viewer pane fleet creates lives on a SUB-ORCH window, and cmd_new
+# deliberately excludes a sub-orch from @fleet_owner stamping (a sub-orch is not its own
+# worker), so the viewer reads an empty owner and is skipped by the `[ "$o" = "$owner" ]`
+# test. If a viewer is ever attached to an OWNED window, this must filter too.
 suborch_has_live_workers() { # <id> <sess>
   local id="$1" sess="$2" s o cmd
   local owner="so-$id"   # separate decl: `local id=.. owner="so-$id"` trips set -u (id unbound mid-decl)
@@ -1642,6 +1753,11 @@ resolve_or_spawn_suborch() { # <sess> <wname> <id> <root>
   if suborch_live "$d" "$sess" "$wname"; then
     : # already up, harness alive — idempotent no-op (replay/reconcile-safe)
   else
+    # Dead. If a previous incarnation left a husk window — harness pane gone, viewer
+    # pane keeping the window alive — drop it before respawning, so we don't leak a
+    # window per crash and leave suborch_find_wid a decoy to match. Refuses any
+    # window that still has a harness pane, so this can only remove an already-dead one.
+    suborch_prune_orphan_window "$(meta_get "$d" window_id)" "$wname"
     # Capture the spawned window_id (FLEET_NEW_WID_FILE) and pin it in the ledger so
     # later liveness checks resolve session-independently — cmd_new --scratch parks
     # the sub-orch in <sess>_hidden, which "$sess:$wname" can't see.
@@ -1668,6 +1784,12 @@ THEN handle DISPATCH ID: $id — read your instruction at .fleet/dispatch/$id/in
     local wid; wid=$(cat "$widf" 2>/dev/null); rm -f "$widf" 2>/dev/null
     [ -n "$wid" ] && meta_set "$d" window_id "$wid"
   fi
+  # Give the sub-orch its file view: an nvim pane BESIDE the harness (never on top of
+  # it), rooted at this dispatch's own ledger dir — which the sub-orch populates with
+  # a symlink farm (reports / each worker's worktree / each worker's notes) as it
+  # spawns workers, per FLEET_SUBORCH.md. Runs on both branches so a re-resolution of
+  # an already-live sub-orch heals a missing viewer; idempotent and fail-silent.
+  suborch_attach_viewer "$(meta_get "$d" window_id)" "$d"
   release_lock "$led/.spawnlock-$id"
 }
 
@@ -1829,6 +1951,12 @@ cmd_dispatch_rename() {
   local wid new; wid=$(meta_get "$d" window_id); new="so-$id-$slug"
   [ -n "$wid" ] && tmux rename-window -t "$wid" "$new" 2>/dev/null || true
   meta_set "$d" window "$new"   # forward name resolution for gate_waiting/reconcile/reap-skip
+  # The ledger is keyed d<N>, the reports tree is keyed <slug>, and nothing joined the
+  # two. Record the ABSOLUTE reports dir here — this is the only point where both are
+  # in hand. `_reports/<slug>/` is otherwise a bare relative path that resolves against
+  # whichever agent's cwd wrote it (research at $root, impl/test inside their own
+  # worktrees), which is what makes crash recovery mis-read the pipeline phase.
+  meta_set "$d" reports "$root/_reports/$slug"
   release_lock "$led/.spawnlock-$id"
   echo "renamed $id → $new"
 }
@@ -2005,6 +2133,13 @@ cmd_reconcile() {
          && ! suborch_has_live_workers "$id" "$sess"; then
         meta_set "$d" state failed
         append_dashboard_alert "reconcile: abandoned $id (state=failed) after $n respawn(s) — dead window, no live workers"
+        # Abandoning is the path that produces the most husks (it fires on every
+        # further sweep and never reaches resolve_or_spawn_suborch), and a husk here
+        # is INVISIBLE: every row producer filters @fleet_viewer, so an orphan nvim
+        # window shows in no `fleet ls`, no dashboard row and no HIDDEN_N, while its
+        # inherited @fleet_harness stamp keeps `fleet up`'s stale-hidden-session sweep
+        # from ever cleaning that session. Drop it here too.
+        suborch_prune_orphan_window "$(meta_get "$d" window_id)" "$wn"
         continue
       fi
       meta_set "$d" respawns "$((n+1))"
@@ -5062,6 +5197,9 @@ case "${1:-}" in
   main-pane)  shift; cmd_main_pane "$@" ;;            # internal: orchestrator pane id (dash pop target)
   safe-kill-window) shift; safe_kill_window "$@" ;;   # internal: brake — refuse to kill main/last/empty (dash routes kills here)
   inject-secrets) shift; inject_secrets "$@" ;;       # internal: mirror per-repo secrets into a worktree (also called by cmd_new)
+  attach-viewer)  shift; suborch_attach_viewer "$@" ;;      # internal: sub-orch nvim viewer pane (also driven by the proof harness)
+  suborch-live)   shift; suborch_live "$@" ;;               # internal: liveness probe (proof harness)
+  suborch-prune)  shift; suborch_prune_orphan_window "$@" ;; # internal: drop a harness-less sub-orch husk (proof harness)
   dash-new)   shift; cmd_dash_new "$@" ;;             # internal: leader 'new' -> dash's own form
   dash-triage) shift; cmd_dash_triage "$@" ;;         # internal: leader 'triage' -> dash's cross-agent triage view
   apply-keybinds) shift; apply_keybinds ;;            # internal: re-apply runtime keybinds live

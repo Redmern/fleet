@@ -87,6 +87,23 @@ route under you. It is **advisory** — skip it and your window simply stays `so
 regression), but a named card is far easier for the human to read in `fleet ls` / the
 dashboard. Do it once, right after you classify.
 
+The rename also writes the dispatch's **reports dir** into the ledger — the absolute
+path, the one place `d<id>` and `<slug>` are both known. **Read it back immediately and
+use `$reports` everywhere from here on**, including in every prompt you write:
+
+```
+d=.fleet/dispatch/<id>
+reports=$(awk -F'\t' '$1=="reports"{v=$2} END{print v}' "$d/meta.tsv")   # last-wins, like meta_get
+mkdir -p "$reports"
+```
+
+**Never write `_reports/<slug>/` into a prompt.** It is a *relative* path with no env var
+behind it, so each agent resolves it against its own cwd — research agents at the project
+root, impl/test workers inside their own worktrees — and the pipeline ends up with three or
+four unrelated `_reports` trees. The ledger key is only *true* if you make it true: pass
+`$reports` absolutely, so what the ledger records is where the artifacts actually land.
+Crash recovery (§3.0.5) and the viewer's symlink farm (§3.0.6) both depend on that.
+
 ### 3.0.2 The three roles (one fleet agent each; breadth lives INSIDE)
 
 A feature decomposes into **exactly three fleet agents, spawned in sequence**, one per
@@ -102,7 +119,8 @@ The load-bearing rule **every role prompt MUST carry**:
 > Fan out with the **Task tool only**. **Never `fleet new`** — you are a worker, not an
 > orchestrator; the sub-orch is the sole fleet-agent spawner. Sub-agents are **leaves**
 > (they cannot spawn their own sub-agents) and **do not share context** — each returns
-> only a short digest, so write full detail to `$FLEET_DOCS` / `_reports/<slug>/` and
+> only a short digest, so write full detail to `$FLEET_DOCS` / the absolute `$reports` dir
+> you were given (§3.0.1 — never a relative `_reports/<slug>/`) and
 > return a digest. Scope-scale the sub-agent count; when in doubt add one lens, not fewer.
 
 **Role 1 — RESEARCH** — `fleet new --scratch <slug>-research -p "<prompt>"` (repo-less,
@@ -112,7 +130,8 @@ reads code in place). The role agent fans out via Task sub-agents:
   adds alternatives, security/abuse, UX, cost. This IS the debate, now in-agent.
 - a **synthesis** pass producing the verdict.
 
-  Outputs (same artifact contract the gates expect): `_reports/<slug>/PLAN.md`,
+  Outputs (same artifact contract the gates expect), written to the **absolute**
+  `$reports` dir you pass in the prompt: `$reports/PLAN.md`,
   `SYNTHESIS.md` (**BUILD / REVISE / REJECT**), `PLAN-PLAIN.md` (plain-English plan +
   **PROOF DESIGN**). **Research only — no code.** On idle, read `SYNTHESIS.md`:
   REJECT/REVISE → handle per §7; **BUILD → GATE 1** (§7).
@@ -132,8 +151,8 @@ fanning out via Task sub-agents:
 - **≥2 independent tester** sub-agents that do **NOT** share context — the "two
   independent testers" guarantee, realized as two sub-agents. Each exercises the feature
   end-to-end in a throwaway `/tmp` `FLEET_SESSION` (never the live session), and captures
-  concrete command+output evidence → `_reports/<slug>/TEST-a.md`, `TEST-b.md`.
-- a dedicated **adversary** sub-agent (§3.0.4) → `_reports/<slug>/TEST-VERDICT.md`:
+  concrete command+output evidence → `$reports/TEST-a.md`, `$reports/TEST-b.md`.
+- a dedicated **adversary** sub-agent (§3.0.4) → `$reports/TEST-VERDICT.md`:
   **DONE** or **NEEDS-WORK**.
 
   On idle: **DONE → GATE 2** (§7); **NEEDS-WORK → loop** to a re-implementation research
@@ -191,10 +210,55 @@ plain append is safe because `meta_get` reads **last-wins** and `fleet reconcile
 stacked keys before reading state.
 
 On respawn, read `role-phase` (fast path) **and cross-check the artifacts on disk** as the
-truth (`_reports/<slug>/SYNTHESIS.md` present ⇒ research done; `TEST-VERDICT.md` present ⇒
-test done), then resume at the right role rather than restarting the pipeline. This is
-**not** optional — without the cursor a mid-pipeline crash re-runs completed roles. The
-cursor is the fast path; the artifacts are the cross-check, never the primary signal.
+truth. **Resolve the reports dir from the ledger, never from your cwd** — `_reports/<slug>/`
+is a *relative* path with no env var behind it, so it resolves against whichever agent
+happened to write it (research agents at `$root`, impl/test workers inside their own
+worktrees). `fleet dispatch rename` records the absolute path for you:
+
+```
+d=.fleet/dispatch/<id>
+reports=$(awk -F'\t' '$1=="reports"{v=$2} END{print v}' "$d/meta.tsv")   # last-wins, like meta_get
+[ -f "$reports/SYNTHESIS.md" ]     && : research done
+[ -f "$reports/TEST-VERDICT.md" ]  && : test done
+```
+
+Then resume at the right role rather than restarting the pipeline. This is **not**
+optional — without the cursor a mid-pipeline crash re-runs completed roles. The cursor is
+the fast path; the artifacts are the cross-check, never the primary signal. A *cwd-relative*
+read is worse than no cross-check: it silently reports "not done" and re-runs a finished role.
+
+### 3.0.6 Make the dispatch folder real — the symlink farm (REQUIRED)
+
+Your window has a second pane: an **nvim viewer** rooted at `.fleet/dispatch/<id>/`, so the
+human can see what this dispatch produced without hunting through worktrees. It shows
+exactly what you put there — and your files are scattered across four trees by
+construction (your ledger, the reports dir, and one worktree per worker). So **link them
+in as you go**. Two rules, both cheap:
+
+1. **The moment the reports dir exists** (right after `fleet dispatch rename`):
+
+   ```
+   d=.fleet/dispatch/<id>
+   reports=$(awk -F'\t' '$1=="reports"{v=$2} END{print v}' "$d/meta.tsv")
+   mkdir -p "$reports" && ln -sfn "$reports" "$d/reports"
+   ```
+
+   giving `.fleet/dispatch/<id>/reports -> <abs reports dir>`.
+
+2. **The moment you append a `workers.tsv` row**, link that worker's worktree and its
+   scratch-notes dir alongside it — you already hold both columns:
+
+   ```
+   wt="$root/<repo>/${branch//\//_}"                  # branch slashes become underscores
+   printf '%s\t%s\n' "<repo>" "$branch" >> "$d/workers.tsv"
+   ln -sfn "$wt"               "$d/<repo>-${branch//\//_}"
+   ln -sfn "$wt/.fleet/notes"  "$d/notes-<role-or-label>"     # e.g. notes-impl, notes-test
+   ```
+
+`ln -sfn` is re-pointable and idempotent, so re-running any of this is safe — no guard
+needed. After `fleet reap` deletes a worktree its link **dangles**; that is intended. A
+dangling link is a visible tombstone of work that existed, it breaks nothing, and oil.nvim
+renders it plainly.
 
 ## 3. Fall-through: decompose INLINE and spawn flat workers (non-feature chores)
 
@@ -236,7 +300,11 @@ fleet ls | grep -F "<repo>/${branch//\//_}"      # already a live/known worker?
   ```
   fleet new <repo> "$branch" -p "<precise sub-task prompt>"
   printf '%s\t%s\n' "<repo>" "$branch" >> .fleet/dispatch/<id>/workers.tsv
+  ln -sfn "$root/<repo>/${branch//\//_}" ".fleet/dispatch/<id>/<repo>-${branch//\//_}"
   ```
+
+  …and link it into the symlink farm in the same breath (§3.0.6) — the farm is what the
+  viewer pane shows, and a worker that is not linked is invisible to the human.
 
   In every worker's sub-task prompt, tell it how to report back:
   *"When done, post your completion summary with `fleet inbox put -t '<title>' -m '<body>'`
