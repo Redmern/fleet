@@ -93,6 +93,25 @@ State lives in three places, none of them a database:
   `.fleet/` entries so the marker itself never blocks a reap — a *tracked*
   `.fleet/` path with local edits is real user work and still refuses.
 
+### Ledger state: terminal vs parked (`ledger_terminal` / `ledger_parked`)
+
+Dispatch ledger state is classified in **exactly one place**: `ledger_terminal`
+(`done|failed|cancelled`) and `ledger_parked` (`gate1-wait|gate2-wait`). Three
+consumers hand-rolled this before and diverged, which *was* a bug: `cmd_reconcile`
+skipped only the terminal set, so a sub-orch parked at a human gate looked
+"non-terminal + dead window = stranded" and got respawned — and the fresh sub-orch
+read the instruction and ran straight **past** the gate (4 of 5 dispatches on
+2026-07-19; one self-merged to main). Meanwhile `gate_waiting`, which `cmd_reap`
+consults, already treated those states as parked-leave-alone. **parked != terminal
+!= stranded.** `cmd_reconcile` now skips revival for both sets; a parked dispatch
+whose sub-orch pane is **dead** is never revived *and* never silently dropped —
+`gate_orphan_escalate` surfaces it once (system-origin `--from -` inbox message →
+⚙ system row + desktop notify, plus a dashboard alert), one-shot via a
+`gate_orphan` ledger flag that re-arms when the pane comes back. The wake path's
+`suborch_ledger_active` shares `ledger_terminal` but deliberately **not**
+`ledger_parked`: a gate-parked sub-orch losing its pane is exactly when the human
+most needs the nudge. Locked in by `test/reconcile-gate-park-proof.sh` (9 cases).
+
 ### Reap is atomic (`cmd_reap`)
 
 `cmd_reap` is split into **DECIDE** (pure reads: the ready marker, target match,
