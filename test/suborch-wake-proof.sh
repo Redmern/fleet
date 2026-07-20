@@ -26,7 +26,35 @@ FLEET="$HERE/bin/fleet"
 
 # --- isolation ----------------------------------------------------------------
 TMPROOT=$(mktemp -d)
-export TMUX_TMPDIR="$TMPROOT/tmuxsock"; mkdir -p "$TMUX_TMPDIR"
+# Socket isolation is INTRINSIC, never inherited. Ambient `export TMUX_TMPDIR` is
+# NOT enough on its own: any step running in a shell that did not inherit it falls
+# back to /tmp/tmux-$(id -u)/default — the REAL server — and then a bare
+# `tmux kill-server` in cleanup() tears down the live fleet. (That happened: the
+# real server went down and pc/techweb2 had to be recreated.) So resolve the socket
+# HERE, assert it lives under TMPROOT, and inject it with -S on every tmux call via
+# the wrapper below. TMUX_TMPDIR is still exported, but only so CHILD processes
+# ($FLEET -> tmux) reach the SAME private server; correctness no longer rests on it.
+export TMUX_TMPDIR="$TMPROOT/tmuxsock"
+mkdir -p "$TMUX_TMPDIR/tmux-$(id -u)"; chmod 700 "$TMUX_TMPDIR/tmux-$(id -u)"
+# FLEET_HARNESS_SOCK exists ONLY so the guard below can be proven to fire; it is
+# itself guarded, so it can never be used to escape to the real socket.
+SOCK="${FLEET_HARNESS_SOCK:-$TMUX_TMPDIR/tmux-$(id -u)/default}"
+
+# --- fail-fast guard: runs BEFORE any tmux call -------------------------------
+if [ "$SOCK" = "/tmp/tmux-$(id -u)/default" ]; then
+  echo "REFUSE: harness resolved to the real tmux socket ($SOCK)" >&2
+  rm -rf "$TMPROOT"; exit 1
+fi
+case "$SOCK" in
+  "$TMPROOT"/*) ;;
+  *) echo "REFUSE: harness socket is not under TMPROOT ($SOCK not under $TMPROOT)" >&2
+     rm -rf "$TMPROOT"; exit 1 ;;
+esac
+
+# Every tmux call in THIS FILE routes through here — defined in the same file as the
+# calls, so -S can be neither forgotten nor lost across a subshell. `command tmux`
+# avoids recursing into this function.
+tmux() { command tmux -S "$SOCK" "$@"; }
 export XDG_CONFIG_HOME="$TMPROOT/config"; mkdir -p "$XDG_CONFIG_HOME/fleet/sessions"
 unset TMUX
 export FLEET_SESSION="wake_t"
@@ -34,7 +62,9 @@ export FLEET_ROOT="$TMPROOT/root"; mkdir -p "$FLEET_ROOT/.fleet"
 # Fast timings so a failing-confirm retry budget runs in seconds, not ~30s.
 export FLEET_WAKE_RETRIES=3 FLEET_WAKE_INTERVAL=0 FLEET_WAKE_CONFIRM=1
 
-cleanup() { tmux kill-server 2>/dev/null; rm -rf "$TMPROOT"; }
+# kill-server is EXPLICITLY socket-scoped, not just wrapper-scoped: this is the one
+# call that destroys a whole server, so it states its target literally.
+cleanup() { command tmux -S "$SOCK" kill-server 2>/dev/null; rm -rf "$TMPROOT"; }
 trap cleanup EXIT
 
 U276F=$'❯'   # ❯  prompt marker
@@ -85,7 +115,7 @@ if "$FLEET" deliver-wake "$P" "resume — gate ready" normal so-d1 >/dev/null 2>
 else
   fail i "deliver-wake returned nonzero on a clean confirmable wake"
 fi
-tmux kill-window -t "=$FLEET_SESSION:so-d1" 2>/dev/null
+command tmux -S "$SOCK" kill-window -t "=$FLEET_SESSION:so-d1" 2>/dev/null
 
 # ============================================================================ #
 # ii. occupied (draft) input -> retries exhaust -> ONE escalation msg
@@ -109,7 +139,7 @@ if [ "$n" = 1 ]; then
 else
   fail ii "expected exactly ONE escalation msg, got $n"
 fi
-tmux kill-window -t "=$FLEET_SESSION:so-d2" 2>/dev/null
+command tmux -S "$SOCK" kill-window -t "=$FLEET_SESSION:so-d2" 2>/dev/null
 
 # ============================================================================ #
 # iii. MAIN pane -> oob only: no inbox msg, alerts.log appended, input untouched
@@ -137,7 +167,7 @@ if [ "$n" = 1 ]; then
 else
   fail v "F1 gate: a generating-but-never-working stub must NOT count as woken; expected 1 escalation, got $n"
 fi
-tmux kill-window -t "=$FLEET_SESSION:so-d5" 2>/dev/null
+command tmux -S "$SOCK" kill-window -t "=$FLEET_SESSION:so-d5" 2>/dev/null
 
 # ============================================================================ #
 # vi. (F3) two concurrent watchers, one so-<id> -> exactly ONE escalation msg
@@ -150,7 +180,7 @@ tmux set -w -t "$P" @agent_state idle 2>/dev/null
 wait
 n=$(inbox_count)
 [ "$n" = 1 ] && pass vi || fail vi "F3 dedup: two concurrent watchers must collapse to ONE msg, got $n"
-tmux kill-window -t "=$FLEET_SESSION:so-d6" 2>/dev/null
+command tmux -S "$SOCK" kill-window -t "=$FLEET_SESSION:so-d6" 2>/dev/null
 
 # ============================================================================ #
 # iv. bash -n + fleet doctor must not crash

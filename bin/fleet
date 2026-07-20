@@ -365,7 +365,11 @@ cmd_ls() {
       # (header, prompt, info), mirroring cmd_sessions --measure. No fzf.
       [ -n "$prows" ] && printf '%s\n' "$prows" | cut -f3-
       printf '%s\n' "$hdr"
-      printf 'agent> \n\n'
+      # +2 NON-BLANK chrome lines: fzf prompt + info/count. They MUST be
+      # non-blank — popup_fit_content captures this via `$(...)`, which strips
+      # trailing newlines, so a blank final line is eaten, the popup comes up one
+      # row short and the last agent is clipped. Same rule as sessions --measure.
+      printf 'agent> \n  --\n'
       return 0
     fi
 
@@ -1947,12 +1951,31 @@ gate_post() { # post <1|2> --slug S [--target T] [--summary "…"] [--plan FILE]
     esac
   done
   [ -n "$slug" ] || die "fleet gate post: --slug required"
+  # Re-orientation pointer (W6). The sub-orch that POPS this may be ALIVE but
+  # CONTEXT-COMPACTED — and crash recovery can't see it (`cmd_reconcile` only
+  # respawns a DEAD pane), so the manual + §3.0.5 role-phase cross-check are
+  # bypassed exactly when they matter. The body is the only thing that reaches a
+  # compacted sub-orch, so it carries the pointer itself. Manual path resolved via
+  # $FLEET_DIR (same as the sub-orch spawn prompt) — never hardcoded. Kept to 2
+  # lines: the body is pasted verbatim into the sub-orch's input.
+  # NEVER print a path that does not resolve: `disp` defaults to "-" when -d is
+  # omitted, and `.fleet/dispatch/-/meta.tsv` is a lie aimed at exactly the reader
+  # least able to catch it. With no id, drop the ledger clause and keep the
+  # artifacts cross-check — degrading is strictly better than misdirecting.
+  local reorient="⟳ RE-ORIENT FIRST (your context may have been compacted): re-read your manual $FLEET_DIR/FLEET_SUBORCH.md"
+  case "$disp" in
+    ""|-) reorient="$reorient
+⟳ then cross-check the _reports/$slug/ artifacts on disk against your ledger role-phase BEFORE acting." ;;
+    *)    reorient="$reorient
+⟳ then cross-check .fleet/dispatch/$disp/meta.tsv role-phase against the _reports/$slug/ artifacts on disk BEFORE acting." ;;
+  esac
   local sentinel title body
   if [ "$gate" = 1 ]; then
     sentinel="[FLEET-GATE:1 slug=$slug action=implement]"
     [ -n "$plan" ] || plan="_reports/$slug/PLAN-PLAIN.md"
     title="GATE 1 — plan ready: ${summary:-$slug}"
     body="$sentinel
+$reorient
 Plain plan: $plan
 In one paragraph: ${summary:-<see plan>}.
 ▸ POP this message to APPROVE and start test-first implementation.
@@ -1963,6 +1986,7 @@ In one paragraph: ${summary:-<see plan>}.
     [ -n "$plan" ] || plan="_reports/$slug/DONE-PLAIN.md"
     title="GATE 2 — $slug done, tests green: ready to merge → $target"
     body="$sentinel
+$reorient
 Details: $plan
 HOW THE TESTS PROVE IT: ${summary:-<see details>}.
 ▸ POP this message = \"merge + push to $target\".
@@ -1985,6 +2009,19 @@ gate_park() { # park <dispatch-id> <1|2>
   echo "parked $id at gate${gate}-wait"
 }
 
+# ---- ledger state classification (THE single source) --------------------------
+# Three consumers used to hand-roll this predicate: cmd_reconcile's skip set,
+# gate_waiting, and suborch_ledger_active's terminal check. Their DIVERGENCE was the
+# gate-park bug: reap (via gate_waiting) treated gate1-wait/gate2-wait as "parked, leave
+# alone" while reconcile saw them as non-terminal-and-stranded and respawned the sub-orch,
+# which then ran straight PAST the human gate. Keep both predicates here, once.
+#   TERMINAL — the work concluded. Never revive, nothing to surface.
+#   PARKED   — deliberately halted awaiting a HUMAN. Never revive; NOT concluded, so a
+#              parked dispatch whose pane died must be SURFACED, not silently dropped.
+# parked != terminal != stranded.
+ledger_terminal() { case "${1:-}" in done|failed|cancelled) return 0 ;; *) return 1 ;; esac; }
+ledger_parked()   { case "${1:-}" in gate1-wait|gate2-wait) return 0 ;; *) return 1 ;; esac; }
+
 # List the sub-orch window names (so-<id>) currently parked at a gate. `fleet reap`
 # consults this set and skips any matching worktree/window (unless --force).
 gate_waiting() {
@@ -1997,8 +2034,34 @@ gate_waiting() {
     # bare so-$id — so the reap-skip match (cmd_reap, by live window name) hits a renamed
     # parked sub-orch instead of tearing it down and orphaning its gate message.
     local wn; wn=$(meta_get "$d" window); [ -n "$wn" ] || wn="so-$id"
-    case "$st" in gate1-wait|gate2-wait) printf '%s\n' "$wn" ;; esac
+    ledger_parked "$st" && printf '%s\n' "$wn"
   done
+}
+
+# A dispatch PARKED at a human gate whose sub-orch pane has DIED. Reviving it would run
+# past the gate (the bug); silently skipping it strands the gate forever — nobody can pop
+# it and nobody is told. So: never revive, but surface it ONCE, durably, in the shape of
+# wake_escalate — system-origin (`--from -`) so inbox_route sends it to the dashboard's
+# ⚙ system row + a desktop notify without looping back into the dead pane, plus a
+# dashboard alert. One-shot per death via a ledger flag (reconcile runs on every prompt;
+# without the flag this would spam), cleared the moment the pane is live again.
+gate_orphan_escalate() { # <id> <dispatch-dir> <wname> <state>
+  local id="$1" d="$2" wn="$3" st="$4"
+  [ "$(meta_get "$d" gate_orphan)" = 1 ] && return 0
+  meta_set "$d" gate_orphan 1
+  local title="gate-parked $id has no live sub-orch — its gate can no longer be popped"
+  local body="[FLEET-GATE-ORPHAN soid=$wn]
+Dispatch $id is parked at $st but its sub-orch window ($wn) is gone. reconcile will NOT
+respawn it — a fresh sub-orch would run straight PAST the human gate — so the pipeline is
+halted until you act.
+▸ Handle/pop this dispatch's gate message, then close the ledger with
+  \`fleet dispatch done|fail|cancel $id\` — or \`fleet dispatch $id\` to deliberately
+  re-animate it (that resumes the work you were gating)."
+  if ! inbox_put --from - --sev warn -t "$title" -m "$body" >/dev/null 2>&1; then
+    local mp; mp=$(cmd_main_pane 2>/dev/null)   # belt: inbox write failed -> OOB to the human
+    [ -n "$mp" ] && cmd_notify "$mp" "$title" oob normal 2>/dev/null || true
+  fi
+  append_dashboard_alert "reconcile: $title"
 }
 
 # `fleet reconcile` — one-shot sweep: re-animate stranded dispatches (unfinished
@@ -2015,11 +2078,25 @@ cmd_reconcile() {
     id=$(basename "$d")
     meta_compact "$d"   # collapse legacy stacked meta.tsv before reading state
     state=$(meta_get "$d" state)
-    case "$state" in done|failed|cancelled) continue ;; esac
+    ledger_terminal "$state" && continue
     # Resolve the LIVE window name (slugged by `dispatch rename`), fallback bare so-$id —
     # so the name-search liveness fallback (suborch_find_wid, used when no window_id was
     # captured) finds a renamed window instead of false-dead → double-spawn.
     local wn; wn=$(meta_get "$d" window); [ -n "$wn" ] || wn="so-$id"
+    # PARKED AT A GATE — never revive. A parked sub-orch is halted ON PURPOSE waiting for
+    # a human; respawning it produces a fresh sub-orch that reads the instruction and runs
+    # straight past the gate (the bug: 4 of 5 dispatches re-animated, one self-merged to
+    # main). `gate_waiting`/`fleet reap` already treat these states this way — reconcile
+    # now agrees. If the pane is also DEAD the gate is unpoppable, so surface it (once)
+    # instead of dropping it silently: never silently strand, never silently revive.
+    if ledger_parked "$state"; then
+      if suborch_live "$d" "$sess" "$wn"; then
+        meta_set "$d" gate_orphan 0      # alive again — re-arm the one-shot escalation
+      else
+        gate_orphan_escalate "$id" "$d" "$wn" "$state"
+      fi
+      continue
+    fi
     if ! suborch_live "$d" "$sess" "$wn"; then
       # Layer 3 — respawn cap / generation guard. Without this, a sub-orch that
       # crashed BEFORE writing a terminal state (Layer 1) and was never torn down via
@@ -2200,8 +2277,12 @@ wake_confirmed() { # <pane>
 
 # rc 0 iff the dispatch ledger entry for this sub-orch id is NON-TERMINAL (work not
 # already done/failed/cancelled) — the Q5/F5 gate for PANE-DEATH escalation (a sub-orch
-# that already wrote a terminal state needs no human nudge). Uses the EXACT terminal set
-# cmd_reconcile uses, so the two can never disagree about a dispatch's liveness. soid may
+# that already wrote a terminal state needs no human nudge). Uses `ledger_terminal`, the
+# SINGLE shared predicate cmd_reconcile also uses, so the two can never disagree about a
+# dispatch's liveness. Note it deliberately shares only TERMINAL, not `ledger_parked`: a
+# GATE-PARKED sub-orch is still active here — its pane dying is exactly when the human
+# most needs the nudge — whereas reconcile skips parked because reviving would run the
+# gate. Same ledger, two different questions, one definition of "concluded". soid may
 # be the so-d<N>[-slug] window name or a bare d<N>; normalize to the ledger id either way.
 suborch_ledger_active() { # <soid>
   local soid="${1:-}" did root st d
@@ -2211,7 +2292,8 @@ suborch_ledger_active() { # <soid>
   d="$root/.fleet/dispatch/$did"
   [ -d "$d" ] || return 1                        # no ledger -> not an active dispatch
   st=$(meta_get "$d" state 2>/dev/null)
-  case "$st" in done|failed|cancelled) return 1 ;; *) return 0 ;; esac
+  ledger_terminal "$st" && return 1
+  return 0
 }
 
 # F3 dedup scan: is an UNREAD (live, un-archived) system-origin wake escalation naming
