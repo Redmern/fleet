@@ -209,9 +209,73 @@ has "$MANUAL" '## Corrections' && pass "names the ## Corrections section" \
   || fail "names the ## Corrections section" "PLAN.md's mandatory Corrections section is not specified"
 hasre "$MANUAL" '## Corrections.{0,600}(MUST|mandatory|required|always)|( MUST|mandatory|required|always).{0,600}## Corrections' \
   && pass "Corrections is mandatory" || fail "Corrections is mandatory" "Corrections is not stated as required"
-if hasi "$MANUAL" 'Corrections.{0,400}(none|nothing)|(none|nothing).{0,400}## Corrections'; then
+# Flattened: the contract wraps, so a line-based grep cannot see `## Corrections` and
+# the empty-case wording together. Under P2a the empty case is "every row reads
+# confirmed" rather than a `None —` sentinel.
+if awk '/^\*\*The handoff contract/{f=1} f&&/^### 3\.0\.2 /{f=0} f' "$MANUAL" \
+   | tr '\n' ' ' | tr -s ' ' \
+   | grep -qEi 'every row reading .?confirmed|every row reads .?confirmed|none —|nothing to correct'; then
   pass "empty-case spelled out"
 else fail "empty-case spelled out" "no instruction for the nothing-to-correct case"; fi
+
+# --- P2a: Corrections accounts for EVERY RECON claim, not just the wrong ones --
+# The original wording listed only claims "found wrong, missing, or misleading", which
+# makes a claim nobody checked indistinguishable from a claim checked and found correct —
+# so `unchecked` was not measurable and the section was not an audit. Ratified P2a
+# replacement (_reports/plan-agent-role/P2-REPLACEMENT.md §4).
+echo "[7a] P2a — Corrections is a per-claim audit table"
+# Flatten AND squeeze runs of spaces: a wrapped sentence rejoins as "rather   than"
+# (continuation-line indent), which silently kills any multi-word pattern.
+CFLAT=$(tr '\n' ' ' < "$MANUAL" | tr -s ' ')
+# SCOPED to §3.0.1b, then flattened. Two reasons this is a section extract and not a
+# grep over the whole flattened file: (a) an unscoped 'every claim' is satisfied by the
+# trust-direction sentence a few lines above ("treat every claim in it as a lead to
+# verify") — the residual-match weakness this harness has now hit three times; (b) a
+# bounded-quantifier `grep -o` against one 40KB line backtracks badly enough to hang.
+CORR=$(awk '/^\*\*The handoff contract/{f=1} f&&/^### 3\.0\.2 /{f=0} f' "$MANUAL" | tr '\n' ' ' | tr -s ' ')
+printf '%s' "$CORR" | grep -qEi 'account for \*\*every\*\* claim|one row per RECON claim' \
+  && pass "Corrections must account for EVERY RECON claim" \
+  || fail "Corrections must account for EVERY RECON claim" \
+          "only the wrong claims are required, so 'unchecked' is unmeasurable"
+printf '%s' "$CORR" | grep -qEi 'not only the ones that turned out wrong|not only the wrong' \
+  && pass "states WHY every claim, not just the wrong ones" \
+  || fail "states WHY every claim, not just the wrong ones" \
+          "without the rationale the next editor trims it back to wrong-only"
+printf '%s' "$CFLAT" | grep -qE 'RECON claim.{0,40}verdict.{0,40}settled by' \
+  && pass "Corrections table columns specified (claim | verdict | settled by)" \
+  || fail "Corrections table columns specified (claim | verdict | settled by)" "no table schema given"
+for v in confirmed wrong missing misleading unverifiable; do
+  has "$MANUAL" "$v" && pass "verdict vocabulary: $v" || fail "verdict vocabulary: $v" "missing"
+done
+printf '%s' "$CFLAT" | grep -qEi 'fewer rows than|row count lower than' \
+  && pass "under-filled table is stated as a failure" \
+  || fail "under-filled table is stated as a failure" \
+          "nothing says a short table means the PLAN role did not check"
+
+# --- P2b: explorer scopes recorded by the ASSIGNER, before spawning -----------
+# Partitioning cannot be recovered from report text after the fact (P2-REPLACEMENT §3:
+# overlap-by-mention is dominated by document length, n=4, does not discriminate). So the
+# decision is recorded at spawn time by the PLAN role, which is a different actor from the
+# explorer being judged — PROOF DESIGN forbids verifying this by asking the agent.
+echo "[7b] P2b — explorer scopes recorded at spawn"
+has "$MANUAL" 'SCOPES.md' && pass "manual names SCOPES.md" \
+  || fail "manual names SCOPES.md" "no assigned-scope artifact"
+printf '%s' "$CFLAT" | grep -qE '\$reports/SCOPES\.md' \
+  && pass "SCOPES.md pinned to absolute \$reports/" \
+  || fail "SCOPES.md pinned to absolute \$reports/" "relative path would scatter it (§3.0.1)"
+printf '%s' "$CFLAT" | grep -qEi 'before spawning them|before .{0,30}spawns? its explorer' \
+  && pass "written BEFORE the explorers are spawned" \
+  || fail "written BEFORE the explorers are spawned" "no ordering stated — a scope written after the fact is a post-hoc rationalisation"
+printf '%s' "$CFLAT" | grep -qEi 'should not overlap|must not overlap|non-overlapping' \
+  && pass "non-overlap is the stated intent" || fail "non-overlap is the stated intent" "missing"
+# Must name the ACTOR. The rationale alone ("a decision rather than a compliance claim")
+# is not enough — it does not say who writes it, and a scope self-declared by the explorer
+# is exactly the self-report PROOF DESIGN forbids. Verified by mutation: with the actor
+# removed but the rationale intact, the looser pattern still passed.
+printf '%s' "$CFLAT" | grep -qEi 'assigner|PLAN role (records|writes|assigns)|not the (explorer|assignee)' \
+  && pass "recorded by the assigner, not the assignee" \
+  || fail "recorded by the assigner, not the assignee" \
+          "nothing states WHO writes it — a self-reported scope is the thing PROOF DESIGN forbids"
 
 # --- 8. harness-neutral wording + degradation clause -------------------------
 echo "[8] harness-neutral fan-out + degradation"
@@ -243,6 +307,20 @@ if [ -f "$SKILL" ]; then
   for f in PLAN.md SYNTHESIS.md PLAN-PLAIN.md; do
     has "$SKILL" "$f" && pass "SKILL.md names $f" || fail "SKILL.md names $f" "artifact filename lost"
   done
+  # P2a/P2b must land in BOTH docs — a sub-orch reads both, and [11] is the only
+  # thing standing between it and two contradictory sets of instructions.
+  SFLAT=$(tr '\n' ' ' < "$SKILL")
+  printf '%s' "$SFLAT" | grep -qE 'RECON claim.{0,40}verdict.{0,40}settled by' \
+    && pass "SKILL.md carries the P2a Corrections table schema" \
+    || fail "SKILL.md carries the P2a Corrections table schema" "the two docs disagree on Corrections"
+  # Distinctive phrasing, not bare 'every claim': SKILL.md's own trust sentence says
+  # "treat every claim as a lead to verify", which satisfied the loose pattern even with
+  # the P2a rule deleted. Third instance of this residual-match trap in this harness.
+  printf '%s' "$SFLAT" | grep -qEi 'account for \*\*every\*\* claim|not only the wrong ones|one row per RECON claim' \
+    && pass "SKILL.md requires EVERY claim accounted for" \
+    || fail "SKILL.md requires EVERY claim accounted for" "the two docs disagree"
+  has "$SKILL" 'SCOPES.md' && pass "SKILL.md names SCOPES.md" \
+    || fail "SKILL.md names SCOPES.md" "P2b landed in only one of the two docs"
   # The two docs must agree on the DIRECTION of the trust asymmetry, not merely both
   # mention trust. A sub-orch reads both; opposite directions is the worst outcome.
   if tr '\n' ' ' < "$SKILL" \
@@ -261,19 +339,31 @@ fi
 # symlinks it, so the correct state is "same file"; a real file there means
 # someone edited in place again and the two can silently disagree.
 if [ -e "$SKILL_INSTALLED" ]; then
+  # Compare against the INTEGRATED copy (main), not the working tree. On a feature
+  # branch the tracked copy is legitimately ahead of what is installed, and grading
+  # that as drift would paint every doc change red for a reason the author cannot
+  # fix — which is how a check gets disabled. Real drift is: installed differs from
+  # what was actually integrated.
+  MAIN_SKILL=$(mktemp)
+  if (cd "$HERE" && git show "main:$SKILL_REL" > "$MAIN_SKILL" 2>/dev/null) && [ -s "$MAIN_SKILL" ]; then
+    REF="$MAIN_SKILL"; REFNAME="main's tracked copy"
+  else
+    REF="$SKILL"; REFNAME="the tracked copy"
+  fi
   if [ "$(readlink -f "$SKILL_INSTALLED")" = "$(readlink -f "$SKILL")" ]; then
     pass "installed SKILL.md resolves to the tracked copy (no drift possible)"
-  elif cmp -s "$SKILL_INSTALLED" "$SKILL"; then
+  elif cmp -s "$SKILL_INSTALLED" "$REF"; then
     # Expected transient: this branch tracks the file but install.sh has not yet
     # relinked the profile. Content agrees, so nothing is broken — but the
     # drift-proof mechanism is not in place yet, so this is NOT a pass.
     skip "installed SKILL.md drift check" \
-         "content matches, but it is still a COPY not the symlink — run install.sh from the canonical checkout after merge"
+         "matches $REFNAME but is still a COPY not the symlink — run install.sh from the canonical checkout after merge"
     SKIPPED=1
   else
     fail "installed SKILL.md resolves to the tracked copy (no drift possible)" \
-         "installed copy has DRIFTED from the tracked one: $SKILL_INSTALLED"
+         "installed copy has DRIFTED from $REFNAME: $SKILL_INSTALLED"
   fi
+  rm -f "$MAIN_SKILL"
 else
   skip "installed SKILL.md drift check" "$SKILL_INSTALLED not present (install.sh not run here)"
   SKIPPED=1
