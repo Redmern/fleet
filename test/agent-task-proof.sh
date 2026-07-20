@@ -371,6 +371,10 @@ tmux set -g window-status-format '#I:#W' 2>/dev/null
 tmux set -g window-status-current-format '#I:#W' 2>/dev/null
 "$FLEET" inject-status-format >/dev/null 2>&1
 gfmt=$(tmux show -g -v window-status-format 2>/dev/null)
+# research is the ONLY fixture that discriminates tag from enum word (see below)
+spawn repo feat/bar-rsch --task research >/dev/null 2>&1
+WRS=$(wid_of "repo/feat_bar-rsch")
+e_rsch=$(tmux display-message -p -t "$WRS" '#{E:window-status-format}' 2>/dev/null)
 e_tagged=$(tmux display-message -p -t "$W1" '#{E:window-status-format}' 2>/dev/null)
 e_plain=$(tmux display-message -p -t "$WBASE" '#{E:window-status-format}' 2>/dev/null)
 if ! printf '%s' "$gfmt" | grep -q '@fleet_task_tag'; then
@@ -378,11 +382,44 @@ if ! printf '%s' "$gfmt" | grep -q '@fleet_task_tag'; then
 elif [ "$(printf '%s' "$gfmt" | grep -o '@fleet_task_tag' | grep -c .)" != 2 ]; then
   # exactly one token — which itself names the option twice (test + value)
   fail 16b "the task token was appended more than once: $gfmt"
-elif ! printf '%s' "$e_tagged" | grep -q 'impl'; then
-  fail 16b "an impl-tagged window's status bar does not show its tag: '$e_tagged'"
+elif ! printf '%s' "$e_rsch" | grep -q 'rsch'; then
+  fail 16b "a research-tagged window's status bar does not show its tag: '$e_rsch'"
+elif printf '%s' "$e_rsch" | grep -q 'research'; then
+  # THE DISCRIMINATING ASSERTION. The bar must expand the RENDERED 4-char tag, not
+  # the enum word. `impl`/`plan`/`test` are useless as fixtures here — the enum
+  # value and its tag are byte-identical, so pointing the status token at
+  # @fleet_task instead of @fleet_task_tag passes unnoticed. Only research->rsch
+  # (and scratch->'scr ') can tell them apart, and the fixed-4-cell guarantee is
+  # the entire design rationale for the closed enum (fit_left/hrule count
+  # codepoints, not cells, with no ASCII fallback).
+  fail 16b "the status bar expanded the RAW ENUM WORD, not the 4-char tag: '$e_rsch'"
 elif printf '%s' "$e_plain" | grep -qE 'rsch|impl|test|scr'; then
   fail 16b "an untagged window's status bar shows a tag: '$e_plain'"
 else pass 16b; fi
+# 16d — fleetd's heal_status_format is a SECOND, INDEPENDENT implementation of the
+# same injection (Python, run on the daemon's sweep — it is what actually re-heals
+# the bar after a theme switch wipes the format). It had NO functional coverage:
+# deleting its task branch outright, or pointing it at @fleet_task instead of
+# @fleet_task_tag, left the whole suite green. Two implementations of one rule can
+# drift silently, which is the same defect class as 16b's original vacuity.
+# Invoke the real method directly rather than waiting out the 60s sweep.
+tmux set -g window-status-format '#I:#W' 2>/dev/null
+tmux set -g window-status-current-format '#I:#W' 2>/dev/null
+python3 - "$FLEETD" <<'PYHEAL' >/dev/null 2>&1
+import importlib.util, sys
+spec = importlib.util.spec_from_loader("fleetd_mod",
+        importlib.machinery.SourceFileLoader("fleetd_mod", sys.argv[1]))
+m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
+m.Fleet().heal_status_format()
+PYHEAL
+hfmt=$(tmux show -g -v window-status-format 2>/dev/null)
+if ! printf '%s' "$hfmt" | grep -q '@fleet_task_tag'; then
+  fail 16d "fleetd.heal_status_format did not re-append the task token: $hfmt"
+elif printf '%s' "$hfmt" | grep -q '@fleet_task[^_]'; then
+  # must point at the RENDERED tag option, exactly as the bash twin does
+  fail 16d "fleetd healed to @fleet_task, not @fleet_task_tag (drift from bin/fleet): $hfmt"
+else pass 16d; fi
+
 # second run must be a no-op (fleetd's heal_status_format re-runs this forever)
 "$FLEET" inject-status-format >/dev/null 2>&1
 [ "$(tmux show -g -v window-status-format 2>/dev/null)" = "$gfmt" ] \
@@ -411,6 +448,22 @@ hdr_nf=$(printf '%s' "$hdr" | awk -F'\t' '{print NF}')
 odd=$(printf '%s' "$ls_out" | awk -F'\t' -v n="$hdr_nf" 'NF && NF!=n{c++} END{print c+0}')
 [ "$odd" = 0 ] && pass 18b || fail 18b "$odd row(s) do not match the header's $hdr_nf fields"
 
+# 18c — `fleet ls | column -t` ALIGNMENT. This is a documented pipe, and it was
+# broken: column -t splits on RUNS of whitespace, so an EMPTY task field collapsed
+# and every later column on that row shifted one left. Asserting field COUNT (18b)
+# cannot catch it — an empty tab-delimited field still counts, so 18b was green
+# both before and after the fix. Assert on the RENDERED columns instead: after
+# column -t, every row must have as many whitespace-separated fields as the header.
+# Requires >=1 UNTAGGED row to be meaningful — that is the row that collapses.
+lsc=$("$FLEET" ls 2>/dev/null | column -t)
+lsc_hdr=$(printf '%s\n' "$lsc" | head -1 | awk '{print NF}')
+lsc_bad=$(printf '%s\n' "$lsc" | awk -v n="$lsc_hdr" 'NR>1 && NF && NF!=n{c++} END{print c+0}')
+untagged=$("$FLEET" ls 2>/dev/null | awk -F'\t' 'NR>1 && $2=="-"{c++} END{print c+0}')
+if [ "${untagged:-0}" -lt 1 ]; then
+  fail 18c "no untagged row present — 18c cannot observe the collapse it exists to catch"
+elif [ "$lsc_bad" = 0 ]; then pass 18c
+else fail 18c "$lsc_bad row(s) misalign under \`column -t\` (header has $lsc_hdr columns)"; fi
+
 # -------------------------------------------------------------------------- 19
 # The width-degradation ladder must shed the task field FIRST — before cost /
 # mode / ✉ — so a narrow pane never squeezes the label.
@@ -421,10 +474,12 @@ odd=$(printf '%s' "$ls_out" | awk -F'\t' -v n="$hdr_nf" 'NF && NF!=n{c++} END{pr
 # `LW < 1`, while fit_left elides as soon as the label exceeds LW — so the ladder
 # was in the correct order and still truncated the identity to keep a 4-char
 # badge. That is what 19b measures, by RENDERING.
-lad=$(grep -n 'LW < LBLMIN' "$DASH" | head -1 | cut -d: -f1)
+lad=$(grep -n 'LW < ${#label}' "$DASH" | head -1 | cut -d: -f1)
 tdrop=$(grep -n 'task_show=0' "$DASH" | head -1 | cut -d: -f1)
 cdrop=$(grep -n 'cost_show=0' "$DASH" | head -1 | cut -d: -f1)
-if [ -n "$tdrop" ] && [ -n "$cdrop" ] && [ "$tdrop" -lt "$cdrop" ]; then pass 19a
+if [ -z "$lad" ]; then
+  fail 19a "the task shed gate is not label-aware; a CONSTANT floor cannot express tag-XOR-ellipsis"
+elif [ -n "$tdrop" ] && [ -n "$cdrop" ] && [ "$tdrop" -lt "$cdrop" ]; then pass 19a
 else fail 19a "task must be dropped before cost in the dash width ladder (task@${tdrop:-none} cost@${cdrop:-none}, ladder gate @${lad:-none})"; fi
 
 # 19b FUNCTIONAL — the real invariant, measured on rendered output across the
@@ -434,14 +489,35 @@ else fail 19a "task must be dropped before cost in the dash width ladder (task@$
 # one at a time because the failure lives INSIDE it: sampling 100 then 60 steps
 # straight over the point where the tag is still held and the label has already
 # been eaten.
-bad=""
-for W in 120 110 100 95 90 85 80; do
+#
+# TWO fixtures, and the LONG one is load-bearing: with only the harness's own
+# `repo/feat_one` (13 cells) this test cannot observe the defect at all, because a
+# label shorter than any plausible constant floor always sheds before it elides.
+# The 43-cell label is what makes the gate's label-awareness observable.
+spawn repo feature/very-long-branch-name-here --task impl >/dev/null 2>&1
+WLONG=$(wid_of "repo/feature_very-long-branch-name-here")
+tmux set -w -t "$WLONG" @agent_state idle 2>/dev/null
+bad=""; blind=""
+for W in 120 115 113 110 105 100 95 91 90 85 80; do
   tmux kill-window -t "=$FLEET_SESSION:dashw" 2>/dev/null
   tmux new-window -d -t "=$FLEET_SESSION" -n dashw -c "$FLEET_ROOT" "$DASH $FLEET_SESSION" 2>/dev/null
   tmux set -w -t "=$FLEET_SESSION:dashw" window-size manual 2>/dev/null
   tmux resize-window -t "=$FLEET_SESSION:dashw" -x "$W" -y 24 2>/dev/null
   sleep 0.8
   cap=$(tmux capture-pane -p -t "=$FLEET_SESSION:dashw" 2>/dev/null)
+  # POSITIVE CONTROL, checked BEFORE the assertion. `bad` only ever GROWS on a
+  # matching line, so an EMPTY capture is indistinguishable from a clean render:
+  # if the dash fails to paint (slow machine, crash, wrong args — a bare `$DASH`
+  # with no session prints usage and exits) this test reports PASS having measured
+  # nothing. That is precisely how it passed vacuously when first written. So
+  # require the fixture row to be present at every width before believing a PASS.
+  # match the label's TAIL: fit_left is a LEFT-ellipsis, so the head is what gets
+  # eaten and any head-anchored substring vanishes at exactly the narrow widths
+  # this test cares about (which is how this control caught its own first draft).
+  case "$cap" in
+    *name-here*) ;;
+    *) blind="$blind w=$W" ;;
+  esac
   # a squeezed row is one carrying the left-ellipsis fit_left inserts
   while IFS= read -r ln; do
     case "$ln" in
@@ -453,8 +529,28 @@ for W in 120 110 100 95 90 85 80; do
   done <<< "$cap"
 done
 tmux kill-window -t "=$FLEET_SESSION:dashw" 2>/dev/null
-[ -z "$bad" ] && pass 19b \
-  || fail 19b "a task tag survived while its label was squeezed (tag must shed first):$bad"
+if [ -n "$blind" ]; then
+  fail 19b "the dashboard never rendered the fixture row at:$blind — this test measured NOTHING"
+elif [ -n "$bad" ]; then
+  fail 19b "a task tag survived while its label was squeezed (tag must shed first):$bad"
+else pass 19b; fi
+
+# 19c — the OTHER direction, which the LBLMIN constant broke while fixing the
+# first: the tag must NOT be shed while there is room for it. A gate that sheds
+# too eagerly makes --task render nothing on a fleet with short names at any width
+# under ~91, which is indistinguishable from the feature not working.
+tmux kill-window -t "=$FLEET_SESSION:dashw" 2>/dev/null
+tmux new-window -d -t "=$FLEET_SESSION" -n dashw -c "$FLEET_ROOT" "$DASH $FLEET_SESSION" 2>/dev/null
+tmux set -w -t "=$FLEET_SESSION:dashw" window-size manual 2>/dev/null
+tmux resize-window -t "=$FLEET_SESSION:dashw" -x 100 -y 24 2>/dev/null
+sleep 0.8
+cap=$(tmux capture-pane -p -t "=$FLEET_SESSION:dashw" 2>/dev/null)
+shortrow=$(printf '%s\n' "$cap" | grep -m1 'feat_one' || true)
+tmux kill-window -t "=$FLEET_SESSION:dashw" 2>/dev/null
+if [ -z "$shortrow" ]; then fail 19c "no feat_one row rendered at cw=100 — measured nothing"
+elif printf '%s' "$shortrow" | grep -q '…'; then fail 19c "the short label was elided at cw=100: $shortrow"
+elif printf '%s' "$shortrow" | grep -q 'impl'; then pass 19c
+else fail 19c "the tag was shed at cw=100 with room to spare (over-shedding): $shortrow"; fi
 
 # -------------------------------------------------------------------------- 20
 # THE CODEPOINT-VS-CELL GUARD: every tag is 4 ASCII bytes AND 4 characters. This
@@ -533,10 +629,15 @@ rows=$("$FLEET" ls 2>/dev/null | tail -n +2 | grep -c .)
 # rendered on no surface, while still flipping HAS_TASKS — so it cost every label
 # 4+G columns fleet-wide to display nothing, which is the precise harm the
 # "--scratch does not default to task=scratch" decision was taken to avoid.
-spawn repo feat/generic --task generic >/dev/null 2>&1
+# HARD reject: non-zero exit + an error on stderr + NO spawn. A warning with
+# exit 0 is invisible to a script — it cannot tell "tag applied" from "tag
+# silently dropped", which is why warn-and-drop was ruled insufficient here.
+gout=$(spawn repo feat/generic --task generic 2>&1); grc=$?
 WG=$(wid_of "repo/feat_generic")
-if [ -n "$WG" ] && [ -z "$(opt_of "$WG")" ]; then pass 26a
-else fail 26a "--task generic must be rejected; got '$(opt_of "$WG")'"; fi
+if [ "$grc" = 0 ]; then fail 26a "--task generic exited 0; a script cannot detect the rejection"
+elif [ -n "$WG" ]; then fail 26a "--task generic must not spawn an agent (window $WG exists)"
+elif ! printf '%s' "$gout" | grep -qi 'generic'; then fail 26a "no error naming 'generic' on stderr: $gout"
+else pass 26a; fi
 # …and the rejection must leave NOTHING behind that could flip HAS_TASKS: no
 # @fleet_task_tag, no durable sidecar. The dash derives HAS_TASKS from the tag, so
 # a stored-but-unrenderable value is exactly the failure being closed here.
@@ -545,12 +646,16 @@ if [ -z "$gtag" ] && [ ! -e "$(task_file 'repo/feat_generic')" ]; then pass 26b
 else fail 26b "rejected 'generic' left state behind: tag='$gtag' file=$(task_file 'repo/feat_generic')"; fi
 # the warning must name the CLOSED enum, so the message can't advertise a value
 # the write site rejects
-gmsg=$(spawn repo feat/generic2 --task generic 2>&1 | grep -i 'unknown --task' | head -1)
+gmsg=$(spawn repo feat/generic2 --task bogus2 2>&1 | grep -i 'unknown --task' | head -1)
 case "$gmsg" in
-  *generic*want*research*plan*impl*test*scratch*)
-    case "$gmsg" in *"|generic"*) fail 26c "the warning still advertises 'generic': $gmsg" ;;
-                    *) pass 26c ;; esac ;;
-  *) fail 26c "no closed-enum warning for --task generic: '$gmsg'" ;;
+  *want:*)
+    # Compare the WHOLE enum string, not a positional substring: `*"|generic"*`
+    # only matched when generic was NOT first in the list, so re-advertising it in
+    # first position slipped straight through.
+    want=$(printf '%s' "$gmsg" | sed -n 's/.*want: \([a-z|]*\).*/\1/p')
+    if [ "$want" = 'research|plan|impl|test|scratch' ]; then pass 26c
+    else fail 26c "the warning does not advertise exactly the closed enum: got '$want'"; fi ;;
+  *) fail 26c "no closed-enum warning for an unknown --task: '$gmsg'" ;;
 esac
 
 echo "== tail: syntax ============================================================"

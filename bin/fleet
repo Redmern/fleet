@@ -1035,6 +1035,18 @@ cmd_new() {
   #     .fleet/roles / @fleet_role brakes (fork-bomb gate, merge/push gate,
   #     is_main_pane), and this namespace must stay unable to touch them.
   # Anything else: warn, drop, continue (fail-silent house style, CLAUDE.md).
+  # `generic` is HARD-REJECTED, not warn-and-dropped: it is a value a caller can
+  # reasonably believe is supported (it WAS, and it is still spelled out in older
+  # docs and prompts), and a warning on stderr is invisible to a script — exit 0
+  # tells it the tag was applied. So this one fails loudly and spawns nothing.
+  # Unknown/garbage values keep the fail-silent warn-and-drop of the house style:
+  # a typo (or an injection attempt, which must never become a crash surface) must
+  # not cost the caller its agent.
+  case "$task" in
+    generic)
+      printf 'fleet: --task generic is not supported (want: research|plan|impl|test|scratch)\n' >&2
+      return 2 ;;
+  esac
   case "$task" in
     ""|research|plan|impl|test|scratch) ;;
     *) printf 'fleet: unknown --task %s (ignored; want: research|plan|impl|test|scratch)\n' "$task" >&2; task="" ;;

@@ -958,12 +958,6 @@ render() {
     # every pill is the same display width (PW); the label is the flexible filler.
     # PILL_GAP-wide gaps separate the items.
     local PW=$(( PILL_W + 4 )) G=$PILL_GAP CF=12    # CF = cost field width
-    # Label floor for the task-field shed gate. Agent labels are "<repo>/<branch>";
-    # below ~20 cells the left-ellipsis eats the repo AND most of the branch, so
-    # the row no longer identifies which agent it is — the one thing the label
-    # exists to do. The task tag is worth 4+G cells, so it is shed to stay above
-    # this rather than defended down to LW<1.
-    local LBLMIN=20
     local gap; gap=$(printf '%*s' "$G" '')
     local state label pane mode g gt content lblsgr LW git_show mode_show cost_show
     local age sdisp scol cost
@@ -1051,14 +1045,18 @@ render() {
       # DROP THE TASK FIELD FIRST — before cost/mode/✉. The badge is a convenience;
       # the label is the identity, and it must never be squeezed by the badge.
       #
-      # The gate is LBLMIN, NOT `LW < 1`: fit_left elides as soon as the label is
-      # longer than LW, which happens LONG before LW hits zero. Gating on `< 1`
-      # therefore kept a 4-char tag while truncating the identity it labels —
-      # precisely inverting the rule above (at cw=85: "…r/worker-none" while
-      # `rsch` still held its 5 columns). Shedding the tag returns 4+G columns to
-      # the label, so trade it away while the label is still cramped rather than
-      # only once it has been squeezed out of existence.
-      (( LW < LBLMIN )) && (( task_show )) && { task_show=0; TFW=0; LW=$(( cw - np*PW - CF - (np+1)*G )); }
+      # The gate is the ELISION POINT OF THIS ROW'S LABEL, not a constant. fit_left
+      # elides exactly when LW < ${#label}, so that — and only that — is the
+      # condition under which the tag is squeezing the identity. Two earlier gates
+      # were both wrong because neither read the label they were protecting:
+      #   `LW < 1`      held the tag while the label was truncated (the original bug);
+      #   `LW < LBLMIN` fixed it only for labels shorter than the constant, so the
+      #                 defect returned for every label >= 20 cells (measured: a tag
+      #                 held across the whole 113..91 band on a 43-cell label) AND
+      #                 over-shed at cw<=90 on short labels with ~30 columns spare.
+      # A constant cannot express a per-row invariant. The rule is tag XOR ellipsis:
+      # if this row's label is being elided, the tag must already be gone.
+      (( LW < ${#label} )) && (( task_show )) && { task_show=0; TFW=0; LW=$(( cw - np*PW - CF - (np+1)*G )); }
       (( LW < 1 )) && { cost_show=0; LW=$(( cw - np*PW - np*G )); }                 # drop cost
       (( LW < 1 )) && (( mode_show )) && { mode_show=0; np=$((np-1)); LW=$(( cw - np*PW - np*G )); }  # drop mode
       (( LW < 1 )) && (( ibx_show )) && { ibx_show=0; np=$((np-1)); LW=$(( cw - np*PW - np*G )); }    # drop ✉
