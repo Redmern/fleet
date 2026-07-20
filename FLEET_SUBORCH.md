@@ -165,12 +165,30 @@ escape valve in §3.0.3 (`fleet new --scratch <slug>-…` sibling agents) is sti
 cross-check behind it. Hand it to the PLAN role explicitly framed that way — *"here is a
 cheap orientation; treat every claim in it as a lead to verify, not as a fact"* — and the
 asymmetry runs one way only: **the PLAN role overrules RECON, never the reverse.** To make
-that visible instead of silent, **`PLAN.md` MUST carry a `## Corrections` section** listing
-every RECON claim the PLAN role checked and found wrong, missing, or misleading, with the
-`file:line` that settles it. It is **required, not optional** — when the recon turns out to
-have been accurate, the section still ships, reading exactly `## Corrections` followed by
-`None — RECON verified accurate.` An absent `## Corrections` means the PLAN role did not
-check, which is the failure this contract exists to surface.
+that visible instead of silent, **`PLAN.md` MUST carry a `## Corrections` section.**
+
+It must account for **every** claim `RECON.md` made — not only the ones that turned out
+wrong. A claim checked and found correct is the evidence that recon paid for itself; a
+claim nobody checked is the failure this contract exists to surface. If only the wrong ones
+are listed, those two cases are indistinguishable from the artifact, and the section stops
+being an audit. Write it as a table, one row per RECON claim:
+
+```
+## Corrections
+
+| RECON claim                        | verdict      | settled by        |
+|------------------------------------|--------------|-------------------|
+| reap teardown lives in cmd_reap    | confirmed    | `bin/fleet:1904`  |
+| four non-converging "done" channels| wrong — three| `bin/fleet:212`   |
+| dashboard polls the daemon         | misleading   | `bin/fleet-dash:88`|
+```
+
+`verdict` is one of **confirmed / wrong / missing / misleading / unverifiable**, and
+`settled by` carries the `file:line` that settles it (`—` only for `unverifiable`, with the
+reason in the claim cell). It is **required, not optional** — when the recon was accurate
+throughout, the section still ships with every row reading `confirmed`. An absent
+`## Corrections`, or a row count lower than the number of claims in `RECON.md`, means the
+PLAN role did not check.
 
 ### 3.0.2 The three roles (one fleet agent each; breadth lives INSIDE)
 
@@ -210,6 +228,13 @@ Seed its prompt with `$reports/RECON.md` (absolute, §3.0.1) under the handoff c
 (cheap, unverified, overruled by this role; `## Corrections` is mandatory in `PLAN.md`).
 The role agent fans out via harness sub-agents:
 - 1–N **explorer** sub-agents (scope-scaled), each maps a subsystem and cites `file:line`.
+  **Before spawning them, write `$reports/SCOPES.md`** — one line per explorer: its name and
+  the RECON territory it owns. Use RECON's territory list to carve these, which is the one
+  thing recon is *for* on this axis. Scopes should not overlap; where two genuinely must,
+  say so on the line and why. You are the **assigner**, so this records a decision rather
+  than a compliance claim — that is what makes the partition checkable from artifacts alone,
+  without a transcript and without asking an explorer whether it stayed in its lane (asking
+  it would be worthless: a sub-agent has every reason to say yes).
 - **≥2 adviser** sub-agents with distinct lenses — minimum **pro / con**; bigger scope
   adds alternatives, security/abuse, UX, cost. This IS the debate, now in-agent.
 - a **synthesis** pass producing the verdict.

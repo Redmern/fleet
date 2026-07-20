@@ -96,9 +96,22 @@ for what it produces, not for the reading it does on the way there:
 **The RECON handoff contract.** Seed the prompt with `RECON.md`, framed as *cheap and
 **unverified** — treat every claim as a lead to verify, not a fact*. The trust runs one way:
 **the PLAN agent overrules RECON, never the reverse.** So `PLAN.md` **MUST** carry a
-`## Corrections` section listing each RECON claim it found wrong or misleading with the
-`file:line` that settles it — required even when the recon was right, in which case it
-reads `None — RECON verified accurate.` An absent section means nobody checked.
+`## Corrections` section — a **table with one row per RECON claim**, columns
+`RECON claim | verdict | settled by`, where verdict is one of
+**confirmed / wrong / missing / misleading / unverifiable** and `settled by` is the
+`file:line` that settles it. It must account for **every** claim RECON made, not only the
+wrong ones: a claim checked and found correct is the evidence recon paid off, and a claim
+nobody checked is the failure the contract exists to surface — list only the wrong ones and
+those two become indistinguishable. Required even when the recon was right, in which case
+every row reads `confirmed`. An absent section, or fewer rows than RECON has claims, means
+nobody checked.
+
+**Explorer scopes.** Before the PLAN agent spawns its explorer sub-agents, it writes
+`_reports/<slug>/SCOPES.md` — one line per explorer: its name and the RECON territory it
+owns, carved from RECON's territory list. Scopes should not overlap; where two must, say so
+and why. The **assigner** records it, so it is a decision rather than a compliance claim —
+which is what makes the partition checkable from artifacts, without a transcript and without
+asking a sub-agent whether it stayed in its lane.
 
 `fleet new --scratch <slug>-plan -p "PLAN ONLY … write _reports/<slug>/PLAN.md …"`
 → `fleet watch <slug>-plan -m "review the plan, then start the adviser debate"` → end turn.
