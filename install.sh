@@ -37,6 +37,40 @@ mapfile -t PROFILES < <(claude_profiles)
 
 HOOK_CMD="$BIN_DIR/fleet-hook"
 
+# The implementation-pipeline skill is CONTENT rather than infrastructure, but it
+# is read by the same sub-orchestrator that reads FLEET_SUBORCH.md, and the two
+# must agree or the agent is holding contradictory instructions. Keeping the only
+# copy under ~/.claude*/ left it unversioned and unrevertable: d28 shipped a doc
+# change across both files and the skill half could not have been rolled back.
+# Track it in the repo and symlink it into each profile, so there is exactly one
+# source of truth and drift is structurally impossible rather than merely watched.
+SKILL_REL="skills/fleet-implementation-pipeline/SKILL.md"
+
+link_skill() { # link_skill <profile-dir>
+  # Declared separately on purpose: within ONE `local` statement bash does not
+  # see the vars it is assigning, so `dest="$p/…"` would silently resolve to
+  # "/…" — an absolute path outside the profile.
+  local p="$1"
+  local src="$FLEET_DIR/$SKILL_REL"
+  local dest="$p/$SKILL_REL"
+  [ -f "$src" ] || return 0
+  mkdir -p "$(dirname "$dest")"
+  # Never clobber a real file: park it first, so a local edit made before this
+  # change shipped survives and stays diffable against the tracked copy.
+  if [ -e "$dest" ] && [ ! -L "$dest" ]; then
+    mv "$dest" "$dest.pre-fleet.$(date +%Y%m%d-%H%M%S)"
+    echo "  backed up pre-existing $dest"
+  fi
+  if ln -sf "$src" "$dest"; then
+    echo "  linked $dest"
+  else
+    # Not fail-silent: a skill that did not land leaves the sub-orch reading a
+    # stale copy, which is exactly the drift this whole change exists to remove.
+    echo "  WARNING: could not link $dest — sub-orch may read a stale skill" >&2
+    return 1
+  fi
+}
+
 # --no-systemd: skip the systemd user unit. The daemon is then started on demand
 # by `fleet up` (ensure_daemon falls back to `nohup fleetd &`). Auto-detected
 # when `systemctl --user` isn't usable (no systemd, no user bus, containers).
@@ -127,6 +161,12 @@ if [ "${1:-}" = "--uninstall" ]; then
   systemctl --user daemon-reload 2>/dev/null || true
   for p in "${PROFILES[@]}"; do
     [ -f "$p/settings.json" ] && unwire_hooks "$p/settings.json"
+    # Remove ONLY our own symlink. A real file there is the user's (or a parked
+    # pre-fleet backup) and must survive an uninstall untouched.
+    d="$p/$SKILL_REL"
+    if [ -L "$d" ] && [ "$(readlink -f "$d")" = "$(readlink -f "$FLEET_DIR/$SKILL_REL")" ]; then
+      rm -f "$d"; echo "  unlinked $d"
+    fi
   done
   echo "fleet uninstalled"
   exit 0
@@ -184,6 +224,7 @@ for p in "${PROFILES[@]}"; do
   [ -f "$p/settings.json" ] || echo '{}' > "$p/settings.json"
   wire_hooks "$p/settings.json"
   wire_guard "$p/settings.json"
+  link_skill "$p"
 done
 
 # Vendor the Playwright driver deps for `fleet browser` (playwright-core only —

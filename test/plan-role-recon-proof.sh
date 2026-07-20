@@ -36,10 +36,16 @@ set -u
 HERE=$(cd "$(dirname "$0")/.." && pwd)
 MANUAL="$HERE/FLEET_SUBORCH.md"
 FLEETBIN="$HERE/bin/fleet"
-# SKILL.md lives OUTSIDE this repo (~/.claude_personal/skills/…) and is therefore
-# NOT covered by this repo's commit. Assert on it when present; skip loudly when
-# absent (a fresh clone on another machine has no such file).
-SKILL="${FLEET_SKILL_MD:-$HOME/.claude_personal/skills/fleet-implementation-pipeline/SKILL.md}"
+# SKILL.md is now TRACKED IN THIS REPO and symlinked into the Claude profiles by
+# install.sh. It used to live only under ~/.claude_personal/, which made it
+# unversioned, unrevertable, and free to drift from FLEET_SUBORCH.md — and made
+# these assertions SKIP on any machine that happened not to have the file, so the
+# run printed green with the second half of the change entirely unchecked.
+# The tracked copy is the canonical one and always exists, so this no longer skips.
+SKILL_REL="skills/fleet-implementation-pipeline/SKILL.md"
+SKILL="${FLEET_SKILL_MD:-$HERE/$SKILL_REL}"
+# Where install.sh puts it. Checked separately for DRIFT, not for content.
+SKILL_INSTALLED="${FLEET_SKILL_INSTALLED:-$HOME/.claude_personal/$SKILL_REL}"
 
 pass() { echo "  PASS($1)"; }
 fail() { echo "  FAIL($1): $2"; FAILED=1; }
@@ -236,6 +242,28 @@ if [ -f "$SKILL" ]; then
   fi
 else
   skip "SKILL.md assertions" "$SKILL not present on this machine"
+  SKIPPED=1
+fi
+
+# The installed copy must not have DRIFTED from the tracked one. install.sh
+# symlinks it, so the correct state is "same file"; a real file there means
+# someone edited in place again and the two can silently disagree.
+if [ -e "$SKILL_INSTALLED" ]; then
+  if [ "$(readlink -f "$SKILL_INSTALLED")" = "$(readlink -f "$SKILL")" ]; then
+    pass "installed SKILL.md resolves to the tracked copy (no drift possible)"
+  elif cmp -s "$SKILL_INSTALLED" "$SKILL"; then
+    # Expected transient: this branch tracks the file but install.sh has not yet
+    # relinked the profile. Content agrees, so nothing is broken — but the
+    # drift-proof mechanism is not in place yet, so this is NOT a pass.
+    skip "installed SKILL.md drift check" \
+         "content matches, but it is still a COPY not the symlink — run install.sh from the canonical checkout after merge"
+    SKIPPED=1
+  else
+    fail "installed SKILL.md resolves to the tracked copy (no drift possible)" \
+         "installed copy has DRIFTED from the tracked one: $SKILL_INSTALLED"
+  fi
+else
+  skip "installed SKILL.md drift check" "$SKILL_INSTALLED not present (install.sh not run here)"
   SKIPPED=1
 fi
 
