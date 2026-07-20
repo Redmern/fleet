@@ -115,8 +115,17 @@ if has "$MANUAL" 'RECON.md'; then pass "names RECON.md"; else fail "names RECON.
 # Pinned to the artifacts dir — but that dir is the ABSOLUTE $reports from the ledger
 # (§3.0.1), not a cwd-relative _reports/<slug>/. Relative paths are what scattered d28's
 # artifacts across three trees and produced the false "PLAN artifacts LOST" report.
-if has "$MANUAL" '$reports/RECON.md'; then pass "RECON.md pinned to absolute \$reports/"
-else fail "RECON.md pinned to absolute \$reports/" "RECON.md is not pinned to the artifacts dir"; fi
+# Scoped to §3.0.1b and to the WRITE INSTRUCTION specifically. An unscoped grep for
+# the path is satisfied by the seed-prompt mention in §3.0.2 and the recovery probe in
+# §3.0.5, so reverting THIS line to a relative path — the exact regression the absolute
+# convention exists to prevent — left the assertion green. Verified by mutation.
+RSECT=$(awk '/^### 3\.0\.1b /{f=1} f&&/^### 3\.0\.2 /{f=0} f' "$MANUAL")
+if printf '%s\n' "$RSECT" | grep -qE 'writes[^`]*`\$reports/RECON\.md`'; then
+  pass "RECON.md WRITE instruction pinned to absolute \$reports/"
+else
+  fail "RECON.md WRITE instruction pinned to absolute \$reports/" \
+       "§3.0.1b does not tell the recon sub-agent to write \$reports/RECON.md"
+fi
 # The three numbers the human signed off on.
 hasre "$MANUAL" '15[- ]line|≤ ?15|<= ?15' && pass "15-line digest budget" \
   || fail "15-line digest budget" "no <=15-line digest cap"
