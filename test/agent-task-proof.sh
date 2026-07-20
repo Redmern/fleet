@@ -50,7 +50,38 @@ FLEETD="$HERE/bin/fleetd"
 
 # --- isolation ----------------------------------------------------------------
 TMPROOT=$(mktemp -d)
-export TMUX_TMPDIR="$TMPROOT/tmuxsock";   mkdir -p "$TMUX_TMPDIR"
+# Socket isolation is INTRINSIC, never inherited. Ambient `export TMUX_TMPDIR` is
+# NOT enough on its own: any step running in a shell that did not inherit it falls
+# back to /tmp/tmux-$(id -u)/default — the REAL server — and then a bare
+# `tmux kill-server` in cleanup() tears down the live fleet. (That happened: the
+# real server went down and pc/techweb2 had to be recreated.) So resolve the socket
+# HERE, assert it lives under TMPROOT, and inject it with -S on every tmux call via
+# the wrapper below. TMUX_TMPDIR is still exported, but only so CHILD processes
+# ($FLEET -> tmux) reach the SAME private server; correctness no longer rests on it.
+export TMUX_TMPDIR="$TMPROOT/tmuxsock"
+# The socket dir must exist and be 0700 or every spawn dies and the harness
+# reports FEATURE failures for what is really an environment fault.
+mkdir -p "$TMUX_TMPDIR/tmux-$(id -u)"; chmod 700 "$TMUX_TMPDIR/tmux-$(id -u)"
+# FLEET_HARNESS_SOCK exists ONLY so the guard below can be proven to fire; it is
+# itself guarded, so it can never be used to escape to the real socket.
+SOCK="${FLEET_HARNESS_SOCK:-$TMUX_TMPDIR/tmux-$(id -u)/default}"
+
+# --- fail-fast guard: runs BEFORE any tmux call -------------------------------
+if [ "$SOCK" = "/tmp/tmux-$(id -u)/default" ]; then
+  echo "REFUSE: harness resolved to the real tmux socket ($SOCK)" >&2
+  rm -rf "$TMPROOT"; exit 1
+fi
+case "$SOCK" in
+  "$TMPROOT"/*) ;;
+  *) echo "REFUSE: harness socket is not under TMPROOT ($SOCK not under $TMPROOT)" >&2
+     rm -rf "$TMPROOT"; exit 1 ;;
+esac
+
+# Every tmux call in THIS FILE routes through here — defined in the same file as the
+# calls, so -S can be neither forgotten nor lost across a subshell. `command tmux`
+# avoids recursing into this function.
+tmux() { command tmux -S "$SOCK" "$@"; }
+
 export XDG_CONFIG_HOME="$TMPROOT/config"; mkdir -p "$XDG_CONFIG_HOME/fleet/sessions"
 export XDG_RUNTIME_DIR="$TMPROOT/run";    mkdir -p "$XDG_RUNTIME_DIR"
 unset TMUX
@@ -71,7 +102,7 @@ export PATH="$TMPROOT/bin:$PATH"
 DAEMON_PID=""
 cleanup() {
   [ -n "$DAEMON_PID" ] && kill "$DAEMON_PID" 2>/dev/null
-  tmux kill-server 2>/dev/null
+  command tmux -S "$SOCK" kill-server 2>/dev/null
   rm -rf "$TMPROOT"
 }
 trap cleanup EXIT
@@ -217,7 +248,7 @@ echo "== C. durability =========================================================
 # --------------------------------------------------------------------------- 9
 # tmux server restart: options are gone, the window-name-keyed file survives, and
 # cmd_restore must re-pass --task so the respawned agent comes back tagged.
-tmux kill-server 2>/dev/null; sleep 0.3
+command tmux -S "$SOCK" kill-server 2>/dev/null; sleep 0.3
 tmux new-session -d -s "$FLEET_SESSION" -n base -c "$FLEET_ROOT" sh 2>/dev/null
 tmux set -t "$FLEET_SESSION" @fleet_root "$FLEET_ROOT" 2>/dev/null
 "$FLEET" restore >/dev/null 2>&1

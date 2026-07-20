@@ -20,7 +20,29 @@ HERE=$(cd "$(dirname "$0")/.." && pwd)
 FLEET="$HERE/bin/fleet"
 
 TMPROOT=$(mktemp -d /tmp/wts-proof.XXXXXX)
-cleanup() { rm -rf "$TMPROOT"; }
+# This harness makes no direct tmux calls, but it shells out to $FLEET, and
+# fleet_root() asks tmux for @fleet_root — in a CHILD process, which inherits env
+# and nothing else. Without a private TMUX_TMPDIR that child reaches the REAL
+# server and the harness silently reads/writes live session state. Same intrinsic
+# isolation as the other harnesses; the guard is the load-bearing part.
+export TMUX_TMPDIR="$TMPROOT/tmuxsock"
+mkdir -p "$TMUX_TMPDIR/tmux-$(id -u)"; chmod 700 "$TMUX_TMPDIR/tmux-$(id -u)"
+unset TMUX
+SOCK="${FLEET_HARNESS_SOCK:-$TMUX_TMPDIR/tmux-$(id -u)/default}"
+
+# --- fail-fast guard: runs BEFORE anything can reach tmux ---------------------
+if [ "$SOCK" = "/tmp/tmux-$(id -u)/default" ]; then
+  echo "REFUSE: harness resolved to the real tmux socket ($SOCK)" >&2
+  rm -rf "$TMPROOT"; exit 1
+fi
+case "$SOCK" in
+  "$TMPROOT"/*) ;;
+  *) echo "REFUSE: harness socket is not under TMPROOT ($SOCK not under $TMPROOT)" >&2
+     rm -rf "$TMPROOT"; exit 1 ;;
+esac
+tmux() { command tmux -S "$SOCK" "$@"; }
+
+cleanup() { command tmux -S "$SOCK" kill-server 2>/dev/null; rm -rf "$TMPROOT"; }
 trap cleanup EXIT
 
 # Subshells can't mutate a parent counter, so failures are appended to a marker
