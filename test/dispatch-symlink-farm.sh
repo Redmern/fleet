@@ -29,14 +29,51 @@ HERE=$(cd "$(dirname "$0")/.." && pwd)
 FLEET="$HERE/bin/fleet"
 MANUAL="$HERE/FLEET_SUBORCH.md"
 
+# ---- socket isolation: INTRINSIC, never ambient --------------------------------
+# This harness must be unable to touch the REAL tmux server even if the environment
+# it was launched with is empty or wrong. Ambient isolation (`export TMUX_TMPDIR`
+# + bare `tmux`) is source-dependent: any step running in a shell that did not
+# inherit it silently falls back to /tmp/tmux-$(id -u)/default — the live fleet
+# server — and this file's cleanup runs `kill-server`. That is how a test harness
+# takes down the command center. Two mechanisms, BOTH local to this file:
+#   1. SOCK is derived from our own mktemp TMPROOT, never from inherited env.
+#   2. every tmux call goes through the wrapper below, which pins -S "$SOCK".
+_inherited_tmpdir="${TMUX_TMPDIR:-/tmp}"          # captured before we overwrite it
 TMPROOT=$(mktemp -d)
+# TMUX_TMPDIR still has to be exported: the `fleet` CLI under test calls tmux itself
+# and resolves the server from it. Pin OUR calls to the exact same socket path so
+# both sides talk to one throwaway server — and so a lost export can never redirect
+# us to the real one.
 export TMUX_TMPDIR="$TMPROOT/tmuxsock"; mkdir -p "$TMUX_TMPDIR"
+SOCK="${FLEET_TEST_SOCK:-$TMUX_TMPDIR/tmux-$(id -u)/default}"
+# 0700 is REQUIRED, not tidiness: tmux refuses a socket dir with "unsafe
+# permissions" for any DEFAULT-socket caller — which is what `bin/fleet` (the code
+# under test) is. Left at the umask default 0755, every fleet-side tmux call fails,
+# fail-silently, and the harness proves nothing while still reporting PASS.
+mkdir -p "$(dirname "$SOCK")" 2>/dev/null && chmod 700 "$(dirname "$SOCK")" 2>/dev/null
+tmux() { command tmux -S "$SOCK" "$@"; }   # defined HERE, in the file that calls it
+
+# Fail-fast, BEFORE any tmux call. FLEET_TEST_SOCK exists only so the safety proof
+# can inject a hostile value: it can only ever FAIL these checks, never bypass them.
+_realsock="/tmp/tmux-$(id -u)/default"
+case "$SOCK" in
+  "$_realsock"|"$_inherited_tmpdir/tmux-$(id -u)/default")
+    echo "REFUSE: harness resolved to the real tmux socket ($SOCK)" >&2
+    rm -rf "$TMPROOT"; exit 1 ;;
+esac
+case "$SOCK" in
+  "$TMPROOT"/*) ;;
+  *) echo "REFUSE: socket '$SOCK' is outside the harness TMPROOT ($TMPROOT)" >&2
+     rm -rf "$TMPROOT"; exit 1 ;;
+esac
 export XDG_CONFIG_HOME="$TMPROOT/config"; mkdir -p "$XDG_CONFIG_HOME/fleet/sessions"
 export XDG_RUNTIME_DIR="$TMPROOT/run"; mkdir -p "$XDG_RUNTIME_DIR"
 unset TMUX
 export FLEET_SESSION="farm_t"
 export FLEET_ROOT="$TMPROOT/root"; mkdir -p "$FLEET_ROOT/.fleet/dispatch"
 
+# kill-server is SCOPED: the wrapper above expands this to
+# `command tmux -S "$SOCK" kill-server`, so it can only ever kill our own server.
 cleanup() { tmux kill-server 2>/dev/null; rm -rf "$TMPROOT"; }
 trap cleanup EXIT
 
