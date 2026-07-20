@@ -37,7 +37,36 @@ FLEET="$HERE/bin/fleet"
 
 # --- isolation ----------------------------------------------------------------
 TMPROOT=$(mktemp -d)
-export TMUX_TMPDIR="$TMPROOT/tmuxsock";      mkdir -p "$TMUX_TMPDIR"
+# Socket isolation is INTRINSIC, never inherited. Ambient `export TMUX_TMPDIR` is
+# NOT enough on its own: any step running in a shell that did not inherit it falls
+# back to /tmp/tmux-$(id -u)/default — the REAL server — and then a bare
+# `tmux kill-server` in cleanup() tears down the live fleet. (That happened: the
+# real server went down and pc/techweb2 had to be recreated, orphaning dispatch
+# gates d24/d25/d26/d28.) So resolve the socket HERE, assert it lives under TMPROOT,
+# and inject it with -S on every tmux call via the wrapper below. TMUX_TMPDIR is
+# still exported, but only so CHILD processes ($FLEET -> tmux) reach the SAME
+# private server; correctness no longer rests on it.
+export TMUX_TMPDIR="$TMPROOT/tmuxsock"
+mkdir -p "$TMUX_TMPDIR/tmux-$(id -u)"; chmod 700 "$TMUX_TMPDIR/tmux-$(id -u)"
+# FLEET_HARNESS_SOCK exists ONLY so the guard below can be proven to fire; it is
+# itself guarded, so it can never be used to escape to the real socket.
+SOCK="${FLEET_HARNESS_SOCK:-$TMUX_TMPDIR/tmux-$(id -u)/default}"
+
+# --- fail-fast guard: runs BEFORE any tmux call -------------------------------
+if [ "$SOCK" = "/tmp/tmux-$(id -u)/default" ]; then
+  echo "REFUSE: harness resolved to the real tmux socket ($SOCK)" >&2
+  rm -rf "$TMPROOT"; exit 1
+fi
+case "$SOCK" in
+  "$TMPROOT"/*) ;;
+  *) echo "REFUSE: harness socket is not under TMPROOT ($SOCK not under $TMPROOT)" >&2
+     rm -rf "$TMPROOT"; exit 1 ;;
+esac
+
+# Every tmux call in THIS FILE routes through here — defined in the same file as the
+# calls, so -S can be neither forgotten nor lost across a subshell. `command tmux`
+# avoids recursing into this function.
+tmux() { command tmux -S "$SOCK" "$@"; }
 export XDG_CONFIG_HOME="$TMPROOT/config";    mkdir -p "$XDG_CONFIG_HOME/fleet/sessions"
 export XDG_RUNTIME_DIR="$TMPROOT/run";       mkdir -p "$XDG_RUNTIME_DIR"
 unset TMUX
@@ -52,7 +81,9 @@ mkdir -p "$TMPROOT/bin"
 cp "$(command -v sleep)" "$TMPROOT/bin/claude" 2>/dev/null
 CLAUDE_BIN="$TMPROOT/bin/claude"
 
-cleanup() { tmux kill-server 2>/dev/null; rm -rf "$TMPROOT"; }
+# kill-server is EXPLICITLY socket-scoped, not just wrapper-scoped: this is the one
+# call that destroys a whole server, so it states its target literally.
+cleanup() { command tmux -S "$SOCK" kill-server 2>/dev/null; rm -rf "$TMPROOT"; }
 trap cleanup EXIT
 
 pass() { echo "  PASS($1)"; }
@@ -207,7 +238,7 @@ if [ "$st" = gate2-wait ] && [ "$n" = 0 ] && [ "$nmsg" = 0 ]; then
 else
   fail 7 "parked+live: state='$st' respawns='$n' inbox=$nmsg (want gate2-wait/0/0)"
 fi
-tmux kill-window -t "=$FLEET_SESSION:so-d7" 2>/dev/null
+command tmux -S "$SOCK" kill-window -t "=$FLEET_SESSION:so-d7" 2>/dev/null
 
 # ============================================================================ #
 # 8. bash -n

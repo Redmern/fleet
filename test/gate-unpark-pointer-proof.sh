@@ -34,7 +34,22 @@ export XDG_CONFIG_HOME="$TMPROOT/config"; mkdir -p "$XDG_CONFIG_HOME/fleet/sessi
 # fake gate messages into the LIVE project inbox. Point TMUX_TMPDIR at an empty
 # dir (no server there) and name a throwaway session, so every tmux lookup fails
 # and $FLEET_ROOT wins.
-export TMUX_TMPDIR="$TMPROOT/tmuxsock"; mkdir -p "$TMUX_TMPDIR"
+export TMUX_TMPDIR="$TMPROOT/tmuxsock"
+mkdir -p "$TMUX_TMPDIR/tmux-$(id -u)"; chmod 700 "$TMUX_TMPDIR/tmux-$(id -u)"
+# Isolation must be INTRINSIC, not inherited: an ambient TMUX_TMPDIR is lost by any
+# step whose shell did not inherit it, which falls back to the REAL socket. Resolve
+# the socket here, assert it lives under TMPROOT, and refuse to start otherwise.
+SOCK="${FLEET_HARNESS_SOCK:-$TMUX_TMPDIR/tmux-$(id -u)/default}"
+if [ "$SOCK" = "/tmp/tmux-$(id -u)/default" ]; then
+  echo "REFUSE: harness resolved to the real tmux socket ($SOCK)" >&2
+  rm -rf "$TMPROOT"; exit 1
+fi
+case "$SOCK" in
+  "$TMPROOT"/*) ;;
+  *) echo "REFUSE: harness socket is not under TMPROOT ($SOCK not under $TMPROOT)" >&2
+     rm -rf "$TMPROOT"; exit 1 ;;
+esac
+tmux() { command tmux -S "$SOCK" "$@"; }
 unset TMUX TMUX_PANE
 export FLEET_SESSION="gatept_t"
 export FLEET_ROOT="$TMPROOT/root"; mkdir -p "$FLEET_ROOT/.fleet"
