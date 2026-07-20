@@ -45,6 +45,7 @@ pass() { echo "  PASS($1)"; }
 fail() { echo "  FAIL($1): $2"; FAILED=1; }
 skip() { echo "  SKIP($1): $2"; }
 FAILED=0
+SKIPPED=0
 
 has()  { grep -qF -- "$2" "$1"; }          # fixed-string
 hasre(){ grep -qE -- "$2" "$1"; }          # regex
@@ -114,6 +115,17 @@ hasre "$MANUAL" '8 read-only|≤ ?8|<= ?8'   && pass "8 read-only call budget" \
   || fail "8 read-only call budget" "no <=8 read-only call fallback cap"
 hasre "$MANUAL" '25[- ]line|≤ ?25|<= ?25'  && pass "25-line RECON.md budget" \
   || fail "25-line RECON.md budget" "no <=25-line RECON.md cap"
+# AUDITABILITY. PLAN.md W1 made `## BUDGET SPENT` a mandatory RECON.md section and
+# PROOF DESIGN P1 calls it "the audit, and the reason that section exists". It was
+# silently dropped from both shipped docs, so the cap cannot be checked from the
+# artifact at all — d28's P1(d) was unrunnable and the measured RECON.mds came in
+# at 33 and 35 lines against the 25 cap with nothing to catch it.
+if has "$MANUAL" '## BUDGET SPENT'; then
+  pass "RECON.md must carry ## BUDGET SPENT (the cap audit)"
+else
+  fail "RECON.md must carry ## BUDGET SPENT (the cap audit)" \
+       "without it the <=25-line / <=8-call budget is unverifiable from the artifact"
+fi
 
 # --- 4. the RECON denylist is stated ------------------------------------------
 echo "[4] RECON denylist (what RECON must NOT do)"
@@ -153,9 +165,28 @@ done
 
 # --- 7. handoff contract: trust asymmetry + mandatory ## Corrections ----------
 echo "[7] handoff contract"
-if hasi "$MANUAL" 'unverified|may be wrong|not authoritative|do not trust|verify before|possibly wrong'; then
-  pass "trust asymmetry stated"
-else fail "trust asymmetry stated" "nothing says RECON is the untrusted side"; fi
+# The trust asymmetry must be DIRECTIONAL. This check used to be a loose OR-list
+# ('unverified|may be wrong|not authoritative|do not trust|verify before') that was
+# satisfied by EITHER direction — so it certified green a manual that had silently
+# INVERTED the rule PLAN.md W3 specified ("TERRITORY/PRIOR ART are trusted, do not
+# re-derive them"), and the d28 proof read ALL PASS while P2 was failing. Assert the
+# direction that actually shipped, and reject the inverse.
+if tr '\n' ' ' < "$MANUAL" \
+   | grep -qEi 'overrules? RECON|never the reverse|RECON is the untrusted|treat every claim[^.]{0,60}lead'; then
+  pass "trust asymmetry stated DIRECTIONALLY (PLAN overrules RECON, never the reverse)"
+else
+  fail "trust asymmetry stated DIRECTIONALLY (PLAN overrules RECON, never the reverse)" \
+       "no one-way statement — a vague 'may be wrong' passes in both directions and hides an inversion"
+fi
+# The inverse rule must NOT also be present. Shipping both leaves the PLAN agent
+# holding contradictory instructions, which is worse than shipping neither.
+if tr '\n' ' ' < "$MANUAL" \
+   | grep -qEi 'do not re-derive|don.t re-derive|territory[^.]{0,40}(is|are) trusted|trusts? the territory'; then
+  fail "no contradictory inverse trust rule" \
+       "the manual states BOTH that RECON is untrusted AND that its territory is trusted"
+else
+  pass "no contradictory inverse trust rule"
+fi
 has "$MANUAL" '## Corrections' && pass "names the ## Corrections section" \
   || fail "names the ## Corrections section" "PLAN.md's mandatory Corrections section is not specified"
 hasre "$MANUAL" '## Corrections.{0,600}(MUST|mandatory|required|always)|( MUST|mandatory|required|always).{0,600}## Corrections' \
@@ -194,8 +225,18 @@ if [ -f "$SKILL" ]; then
   for f in PLAN.md SYNTHESIS.md PLAN-PLAIN.md; do
     has "$SKILL" "$f" && pass "SKILL.md names $f" || fail "SKILL.md names $f" "artifact filename lost"
   done
+  # The two docs must agree on the DIRECTION of the trust asymmetry, not merely both
+  # mention trust. A sub-orch reads both; opposite directions is the worst outcome.
+  if tr '\n' ' ' < "$SKILL" \
+     | grep -qEi 'overrules? RECON|never the reverse|RECON is the untrusted|treat every claim[^.]{0,60}lead'; then
+    pass "SKILL.md states the SAME trust direction as the manual"
+  else
+    fail "SKILL.md states the SAME trust direction as the manual" \
+         "manual says PLAN overrules RECON; SKILL.md does not state that direction"
+  fi
 else
   skip "SKILL.md assertions" "$SKILL not present on this machine"
+  SKIPPED=1
 fi
 
 # --- 11. ZERO bin/fleet edits -------------------------------------------------
@@ -212,4 +253,12 @@ fi
 if bash -n "$FLEETBIN" 2>/dev/null; then pass "bin/fleet parses"; else fail "bin/fleet parses" "syntax error"; fi
 
 echo
-[ "$FAILED" = 0 ] && { echo "ALL PASS"; exit 0; } || { echo "FAILURES"; exit 1; }
+# A skip is NOT a pass. Reporting "ALL PASS" with SKILL.md unchecked is how an
+# unversioned, absent second doc silently stops being covered.
+if [ "$FAILED" != 0 ]; then
+  echo "FAILURES"; exit 1
+elif [ "$SKIPPED" != 0 ]; then
+  echo "PASS (WITH SKIPS — coverage incomplete, see SKIP lines above)"; exit 0
+else
+  echo "ALL PASS"; exit 0
+fi

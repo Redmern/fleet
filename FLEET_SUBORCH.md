@@ -101,8 +101,20 @@ the PLAN role.
 **How.** Spawn **exactly one** read-only sub-agent (your harness's sub-agent tool; claude:
 the Task tool) and have it return a **≤15-line digest**: which files/dirs the feature
 lives in with `file:line` anchors, what already exists that the feature would touch, and
-the one or two facts that would change how the work is framed. Write that digest, verbatim
-or tightened, to **`_reports/<slug>/RECON.md`** — **≤25 lines**, then stop.
+the one or two facts that would change how the work is framed.
+
+**The recon sub-agent writes `_reports/<slug>/RECON.md` itself** — **≤25 lines** — and
+returns only the digest. You do **not** write that file afterwards from the digest. This
+is deliberate and structural: the cap has to be enforced at the sub-agent's own output
+boundary, because a cap you apply to your own writing is a rule you have to remember at
+the exact moment you feel under-informed, and that is when it gets broken. Measured: when
+the sub-orch wrote the file, `RECON.md` came in at 33 and 35 lines against this 25-line
+cap, twice out of two.
+
+`RECON.md` ends with a **`## BUDGET SPENT`** line — the number of read-only calls and
+files the recon actually used. That line is the audit: it is what makes the cap checkable
+from the artifact alone, without reading a transcript. Without it the budget is a claim,
+not a measurement.
 
 **If your harness has no sub-agent mechanism** (the degradation clause in §3.0.2 applies
 here too), do the recon **inline in your own context** instead, capped at **≤8 read-only
