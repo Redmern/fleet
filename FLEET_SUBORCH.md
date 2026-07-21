@@ -221,7 +221,7 @@ says in its report that it degraded. Same artifacts, same minimum lens count, sa
 quietly collapse three lenses into one pass; and it still must **not** `fleet new` (the
 escape valve in §3.0.3 runs through the sub-orch, never through the role agent).
 
-**Role 1 — PLAN** — `fleet new --scratch <slug>-plan -p "<prompt>"` (repo-less, reads code
+**Role 1 — PLAN** — `fleet new --scratch <slug>-plan --task plan -p "<prompt>"` (repo-less, reads code
 in place). Named for what it *produces* — a plan — not for the reading it does on the way
 there; the reading is the means, and §3.0.1b's RECON already did the cheap first pass.
 Seed its prompt with `$reports/RECON.md` (absolute, §3.0.1) under the handoff contract in §3.0.1b
@@ -249,7 +249,7 @@ The role agent fans out via harness sub-agents:
   REJECT/REVISE → handle per §7; **BUILD → GATE 1** (§7).
 
 **Role 2 — IMPLEMENTATION** — after the GATE 1 pop. `fleet new <repo> fleet/<slug>
---no-self-merge`, seeded with `PLAN.md` + `SYNTHESIS.md`. Does **TDD** (proving tests
+--no-self-merge --task impl`, seeded with `PLAN.md` + `SYNTHESIS.md`. Does **TDD** (proving tests
 first → confirm RED → implement to green **without weakening a test**). Implements
 **directly by default**. Parallel implementation is **NOT** a sub-agent job: Task
 sub-agents share the role agent's single cwd (no per-sub-agent worktree), so two writers
@@ -258,8 +258,8 @@ race the same tree. If the feature genuinely needs parallel writers on overlappi
 reviewer sub-agent is fine. `--no-self-merge` because the human gate authorises the merge;
 **YOU** execute it after GATE 2.
 
-**Role 3 — TEST** — after implementation goes idle. One fleet agent on the impl branch,
-fanning out via harness sub-agents:
+**Role 3 — TEST** — after implementation goes idle. One fleet agent on the impl branch
+(`fleet new <repo> fleet/<slug> --task test`), fanning out via harness sub-agents:
 - **≥2 independent tester** sub-agents that do **NOT** share context — the "two
   independent testers" guarantee, realized as two sub-agents. Each exercises the feature
   end-to-end in a throwaway `/tmp` `FLEET_SESSION` (never the live session), and captures

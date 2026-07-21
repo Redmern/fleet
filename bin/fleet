@@ -405,16 +405,46 @@ cmd_ls() {
     return 0
   fi
 
-  printf 'STATE\tAGENT\tWINDOW\tIN-STATE\n'
+  # TASK column. The tag is deliberately NOT in the agents TSV (a 10th field is a
+  # silent-corruption bomb in three positional readers), so resolve it here, in the
+  # shell, and hand awk a window_id<TAB>tag sidecar it reads as its first FILENAME.
+  # The TSV shape passed to awk as $1..$9 is untouched.
+  #
+  # Keyed by WINDOW ID, not window name: ids are server-global-unique, names are
+  # only unique per session, and `fleet ls --all` spans every project on the
+  # server — two projects each with a `scratch` / `so-d1` / `repo/main` window
+  # would otherwise collide and show each other's tag.
+  local _lsroot; _lsroot=$(fleet_root 2>/dev/null) || _lsroot=""
+  # SENTINEL FIRST. The NR==FNR two-file idiom breaks catastrophically on an EMPTY
+  # first file: awk reads zero records from it, so NR==FNR stays true for every
+  # line of stdin and each one hits `next` — `fleet ls` would print its header and
+  # nothing else. One unmatchable line makes that impossible.
+  local _tagmap=$'\037\t\n'
+  local _wn _wid
+  # US (\037) rather than TAB as IFS: a non-whitespace IFS preserves EMPTY columns,
+  # so an empty earlier field can't shift $4/$5 left (the same defence at :742).
+  while IFS=$'\037' read -r _ _ _ _wid _wn _; do
+    [ -n "$_wid" ] || continue
+    _tagmap+="$_wid"$'\t'"$(task_tag_trim "$(task_of "$_wid" "$_lsroot" "$_wn")")"$'\n'
+  done < <(printf '%s\n' "$out" | tr '\t' '\037')
+  printf 'STATE\tTASK\tAGENT\tWINDOW\tIN-STATE\n'
   # $9 is the "ready for deletion" flag (reason text, or empty). When set, show
   # the state as "done" — but only when the agent is not actively live: a stale or
   # inherited marker on a working/blocked agent must not mask its real state.
-  echo "$out" | sort -t$'\t' -k1,1 | awk -F'\t' '{
-    st=$1; extra=""
-    if ($9 != "" && $1 != "working" && $1 != "blocked") { st="done"; extra="  (ready: " $9 ")" }
-    else if ($9 != "")                                  { extra="  (ready? " $9 " — but " $1 ")" }
-    printf "%s\t%s\t%s:%s\t%s%s\n", st, $2, $3, $5, $6, extra
-  }'
+  echo "$out" | sort -t$'\t' -k1,1 | awk -F'\t' '
+    NR==FNR { if (NF >= 2) tag[$1]=$2; next }
+    {
+      st=$1; extra=""; tg=($4 in tag) ? tag[$4] : ""
+      # `fleet ls | column -t` is a documented pipe, and column -t splits on RUNS
+      # of whitespace: an EMPTY tag field collapses, so every later column on that
+      # row shifts one left (worst case: a fleet that never used --task, where
+      # EVERY row shifts). A placeholder keeps the field present. It must not be a
+      # space — that is what collapses — so an untagged row reads "-".
+      if (tg == "") tg = "-"
+      if ($9 != "" && $1 != "working" && $1 != "blocked") { st="done"; extra="  (ready: " $9 ")" }
+      else if ($9 != "")                                  { extra="  (ready? " $9 " — but " $1 ")" }
+      printf "%s\t%s\t%s\t%s:%s\t%s%s\n", st, tg, $2, $3, $5, $6, extra
+    }' <(printf '%s' "$_tagmap") -
   if [ "$hold" -eq 1 ]; then hold_wait; fi
 }
 
@@ -604,6 +634,15 @@ cmd_forget() { # forget <dir> — drop a saved agent (called by the dashboard on
   local dir="${1:-}"; [ -n "$dir" ] || return 0
   local sess; sess=$(session_name) || return 0
   local f; f=$(agents_file "$sess"); [ -f "$f" ] || return 0
+  # Drop the durable task tag for this agent's window BEFORE the line goes: col 8
+  # is the persisted final window name, the key the tasks file uses. cmd_forget
+  # runs at the TAIL of cmd_reap's MUTATE phase — after `git worktree remove` has
+  # already succeeded — so this stays inside the atomic contract and can never
+  # turn into a refusal (CLAUDE.md, "Reap is atomic").
+  local _root _wn
+  _root=$(fleet_root 2>/dev/null) || _root=""
+  _wn=$(awk -F'\t' -v d="$dir" '$1==d{print $8; exit}' "$f" 2>/dev/null)
+  [ -n "$_root" ] && [ -n "$_wn" ] && forget_task "$_root" "$_wn"
   awk -F'\t' -v d="$dir" '$1!=d' "$f" >"$f.tmp" 2>/dev/null && mv "$f.tmp" "$f"
 }
 
@@ -761,6 +800,7 @@ cmd_restore() { # respawn saved agents whose windows are gone
   # match by window name (<repo>/<branchdir>, as cmd_new names them) — precise,
   # unlike pane cwd which the dashboard/other panes can share.
   local openwins; openwins=$(tmux list-windows -t "$sess" -F '#{window_name}' 2>/dev/null)
+  local root; root=$(fleet_root 2>/dev/null) || root=""   # for the durable task tag
   local dir repo branch bare base harness self_merge wname owner n=0
   # Translate field-separating TABs to US (\037) so `read` with a NON-whitespace
   # IFS preserves EMPTY columns (e.g. an empty base, col 5). `IFS=$'\t' read`
@@ -779,6 +819,11 @@ cmd_restore() { # respawn saved agents whose windows are gone
     # Re-apply the EXACT persisted grant explicitly (default is now 1, and a
     # project marker could flip it) so a restored agent keeps what it had.
     if [ "$self_merge" = 1 ]; then args+=(--self-merge); else args+=(--no-self-merge); fi
+    # Re-pass the task tag from the DURABLE file (the window option died with the
+    # tmux server; nothing is read from the .agents line, so old files are fine).
+    # task_of re-validates, so a garbage file just omits the flag.
+    local _task; _task=$(task_of '' "$root" "$matchname")
+    [ -n "$_task" ] && args+=(--task "$_task")
     echo "restoring $matchname..."
     # Re-export the saved bare owner so cmd_new re-derives the d<N>- window prefix AND
     # re-stamps @fleet_owner — restore runs in main with no FLEET_SUBORCH_ID, so without
@@ -983,10 +1028,11 @@ inject_secrets() { # <repo> <dir>
 # ---- new ----------------------------------------------------------------------
 
 cmd_new() {
-  local repo="" branch="" prompt="" bare=0 base="" harness="" scratch=0 switch=0 mode="" self_merge=1 sm_flag=""
+  local repo="" branch="" prompt="" bare=0 base="" harness="" scratch=0 switch=0 mode="" self_merge=1 sm_flag="" task=""
   while [ $# -gt 0 ]; do
     case "$1" in
       -p) prompt="$2"; shift 2 ;;
+      --task|-T) task="$2"; shift 2 ;;   # what KIND of work this agent does (display only) — see task_of
       --bare) bare=1; shift ;;
       --scratch) scratch=1; shift ;;
       --switch|-s) switch=1; shift ;;
@@ -1002,6 +1048,43 @@ cmd_new() {
   [ -n "$harness" ] || harness=$(harness_select)
   harness_load "$harness"
   [ -n "$mode" ] && H_START_MODE="$mode"   # --mode overrides the harness default start mode
+
+  # THE SINGLE WRITE SITE for the task tag — a HARD closed enum, deliberately not
+  # a pattern match. Two things depend on this being exhaustive:
+  #   * @fleet_task's CONTENTS are format-expanded by tmux (the status-bar token in
+  #     inject_status_format), so a value carrying '#[' or an unbalanced '#{' would
+  #     corrupt window-status-format for the WHOLE tmux server, not one window;
+  #   * `main` must never be storable — it is the vocabulary of the FLEET_ROLE /
+  #     .fleet/roles / @fleet_role brakes (fork-bomb gate, merge/push gate,
+  #     is_main_pane), and this namespace must stay unable to touch them.
+  # Two values are HARD-REJECTED — error on stderr, non-zero exit, NO spawn — rather
+  # than warn-and-dropped, because for both a silent drop with exit 0 is a lie the
+  # caller cannot detect:
+  #   * `main` is the vocabulary of the FLEET_ROLE / .fleet/roles / @fleet_role role
+  #     brakes (fork-bomb gate, merge/push gate, is_main_pane). A worker asking for
+  #     `--task main` is either confused about the namespaces or probing to
+  #     self-promote; either way it must fail LOUDLY, not spawn a worker whose
+  #     operator believes it is a main. (It never could promote — task and role are
+  #     separate namespaces and the task value is never written to any role surface
+  #     — but "rejected quietly" and "granted" must not look identical to a script.)
+  #   * `generic` WAS a supported member and is still spelled out in older docs and
+  #     prompts, so a caller can reasonably believe it works; exit 0 would tell it
+  #     the tag was applied when it was dropped.
+  # Everything else unknown keeps the fail-silent warn-and-drop of the house style:
+  # a typo (or an injection attempt, which must never become a crash surface) must
+  # not cost the caller its agent.
+  case "$task" in
+    main)
+      printf 'fleet: --task main is not a task (main is a ROLE, not a work kind; want: research|plan|impl|test|scratch)\n' >&2
+      return 2 ;;
+    generic)
+      printf 'fleet: --task generic is not supported (want: research|plan|impl|test|scratch)\n' >&2
+      return 2 ;;
+  esac
+  case "$task" in
+    ""|research|plan|impl|test|scratch) ;;
+    *) printf 'fleet: unknown --task %s (ignored; want: research|plan|impl|test|scratch)\n' "$task" >&2; task="" ;;
+  esac
 
   local root; root=$(fleet_root) || die "not inside tmux"
   local sess; sess=$(session_name) || die "not inside tmux"
@@ -1020,6 +1103,12 @@ cmd_new() {
     # first positional, if any, is just a window label.
     bare=1
     dir="$root"
+    # NOTE: deliberately NO `task="${task:-scratch}"` default here. Every sub-orch
+    # is spawned through this path (resolve_or_spawn_suborch → cmd_new --scratch),
+    # so defaulting would give a task to every fleet that has ever used the
+    # dispatch layer — flipping the dashboard's HAS_TASKS on and shrinking every
+    # label by the task field for users who never typed --task. An agent spawned
+    # without the flag must behave exactly as it did before the flag existed.
     wname=$(scratch_wname "$sess" "${repo:-scratch}")
     # Repo-less, so no worktree/info-exclude — give it a sane scratch-docs dir
     # under the shared root anyway, so $FLEET_DOCS is always a real dir.
@@ -1228,6 +1317,30 @@ $(ready_instructions)"
     return 0   # tmux absent: degrade silently, as elsewhere
   fi
   tmux set -w -t "$win_id" @fleet_harness "$H_NAME"
+  # Task tag: live window option + durable window-name-keyed file. Only ever an
+  # enum member (validated above), so the status-bar format token that expands
+  # @fleet_task cannot be made to inject. Empty task → neither is written, and the
+  # agent behaves exactly as before the flag existed.
+  # SPAWN IS AUTHORITATIVE, both ways. The durable file is keyed by window NAME,
+  # and window names are recycled — a window killed by hand (plain tmux
+  # kill-window, a crash: neither routes through cmd_forget) leaves its file
+  # behind, and a later agent reusing that name would inherit the dead agent's tag
+  # via task_of's file fallback. So an EMPTY task actively clears both stores
+  # rather than leaving them alone.
+  if [ -z "$task" ]; then
+    tmux set -w -t "$win_id" -u @fleet_task 2>/dev/null || true
+    tmux set -w -t "$win_id" -u @fleet_task_tag 2>/dev/null || true
+    forget_task "$root" "$wname"
+  else
+    tmux set -w -t "$win_id" @fleet_task "$task" 2>/dev/null || true
+    # …plus the rendered tag as its own option. The status-bar format expands an
+    # option's VALUE verbatim and cannot map research->rsch itself, so the bar
+    # would otherwise print the full enum word. Derived from the same validated
+    # value, so it is exactly as injection-proof; @fleet_task stays the canonical
+    # machine-readable one that task_of / the dash / `fleet ls` read.
+    tmux set -w -t "$win_id" @fleet_task_tag "$(task_tag_trim "$task")" 2>/dev/null || true
+    record_task "$root" "$wname" "$task"
+  fi
   # Hand the freshly-spawned window_id back to a caller that asked for it (the
   # dispatch layer: resolve_or_spawn_suborch records it in the ledger so the
   # sub-orch can be resolved session-independently — a scratch sub-orch lives in
@@ -1615,6 +1728,65 @@ record_pane_role() { # <root> <pane_id> <role>
   [ -n "$1" ] && [ -n "$2" ] && [ -n "$3" ] || return 0
   mkdir -p "$1/.fleet/roles" 2>/dev/null || return 0
   printf '%s\n' "$3" > "$1/.fleet/roles/$2" 2>/dev/null || true
+}
+
+# ---- task tag -----------------------------------------------------------------
+# WHAT KIND OF WORK an agent is doing (research/plan/impl/test/scratch),
+# purely for display. Deliberately a SEPARATE namespace from `role`: FLEET_ROLE,
+# .fleet/roles/<pane> and @fleet_role all mean "orchestrator vs worker" and all
+# three gate something (fork-bomb, merge/push, is_main_pane). Nothing here may
+# ever write into those, and `main` is not in this enum.
+#
+# Stored twice at spawn, never in either TSV (the .agents line and `fleet agents`
+# are both positionally read as exactly 9 fields by three independent readers that
+# all fail SILENTLY-WRONG on a 10th column — see CLAUDE.md):
+#   * @fleet_task window option — live, fast, what the dash and status bar read;
+#   * <root>/.fleet/tasks/<window-name> — durable, survives a tmux server restart.
+# Keyed by WINDOW NAME, not pane id: tmux reassigns pane ids across a server
+# restart, which is why .fleet/roles/<pane-id> silently accumulates dead entries.
+
+task_file() { printf '%s/.fleet/tasks/%s' "$1" "$2"; }   # <root> <wname>
+
+record_task() { # <root> <wname> <task>  (validated caller-side; no-op when empty)
+  [ -n "${1:-}" ] && [ -n "${2:-}" ] && [ -n "${3:-}" ] || return 0
+  local f; f=$(task_file "$1" "$2")
+  mkdir -p "$(dirname "$f")" 2>/dev/null || return 0
+  printf '%s\n' "$3" >"$f" 2>/dev/null || true
+}
+
+forget_task() { # <root> <wname> — drop the durable copy (window is gone)
+  [ -n "${1:-}" ] && [ -n "${2:-}" ] || return 0
+  rm -f "$(task_file "$1" "$2")" 2>/dev/null || true
+}
+
+task_of() { # <win_id> <root> <wname> -> validated task, or "" — option wins, file falls back
+  local t=""
+  [ -n "${1:-}" ] && t=$(tmux show -wqv -t "$1" @fleet_task 2>/dev/null)
+  [ -n "$t" ] || t=$(cat "$(task_file "${2:-}" "${3:-}")" 2>/dev/null)
+  # RE-VALIDATE ON READ. The write site is not the only way a value can arrive
+  # here: the file is a plain file a human (or a stray script) can edit, and its
+  # contents end up inside a tmux format string. Unknown → blank, never rendered.
+  case "$t" in research|plan|impl|test|scratch) printf '%s' "$t" ;; esac
+}
+
+task_tag() { # <task> -> a FIXED-WIDTH 4-char pure-ASCII tag ("    " when unset/unknown)
+  # ASCII and exactly 4 cells by construction: popup_fit_content, fit_left and
+  # hrule all measure CODEPOINTS rather than display cells, and there is no
+  # ASCII-fallback ladder anywhere to degrade to. Blank (not "gen") for unset — a
+  # missing tag is honest, a wrong one misroutes the human's attention.
+  case "${1:-}" in
+    research) printf 'rsch' ;; plan) printf 'plan' ;; impl) printf 'impl' ;;
+    test)     printf 'test' ;; scratch) printf 'scr ' ;;
+    *)        printf '    ' ;;   # unset + unknown all render as nothing
+  esac
+}
+
+task_tag_trim() { # <task> -> the same tag with padding stripped ("" when unset)
+  # For the TAB-separated / free-flowing surfaces (`fleet ls`, the tmux status
+  # bar) where nothing needs a fixed column: a padded 4-space field there makes
+  # `fleet ls | column -t` mis-align the row, and puts a stray space in the bar.
+  # The padded form (task_tag) is only for the dashboard's fixed-width row.
+  local t; t=$(task_tag "$1"); printf '%s' "${t%% *}"
 }
 
 # Find a sub-orch window's id by NAME across both the visible session and its
@@ -4268,6 +4440,15 @@ inject_status_format() { # append agent glyph to window-status formats.
     fmt=$(tmux show -g -v "$opt" 2>/dev/null)
     [ -n "$fmt" ] || continue
     case "$fmt" in *@agent_glyph*) ;; *) tmux set -g "$opt" "$fmt#{?@agent_glyph, #{@agent_glyph},}" ;; esac
+    # Task tag: a SECOND, independent token. @agent_glyph is fleetd-owned and
+    # rewritten on every state transition, so we never write into it. Re-read the
+    # value — the glyph append above may have just changed it. Safe to expand the
+    # option's contents ONLY because cmd_new hard-validates it against a closed
+    # enum: tmux format-expands what is in there, and a stray '#[' would corrupt
+    # window-status-format for the entire server.
+    fmt=$(tmux show -g -v "$opt" 2>/dev/null)
+    [ -n "$fmt" ] || continue
+    case "$fmt" in *@fleet_task_tag*) ;; *) tmux set -g "$opt" "$fmt#{?@fleet_task_tag, #{@fleet_task_tag},}" ;; esac
   done
   # (The ambient inbox unread badge is gone — unread now lives per-agent in the
   # dashboard rows + the agents-view title summary, not on the status bar.)
@@ -5287,7 +5468,7 @@ fleet — agent fleet manager (tmux + nvim + Claude Code)
   fleet up [name|path]   boot project session + daemon + command center (auto-restores saved agents; --no-restore for main only, --tmuxinator to load a same-named tmuxinator layout)
   fleet save [name]      save the current session as a reusable project alias (fleet up <name>)
   fleet restore          respawn saved agents from a previous session
-  fleet new <repo> <br>  spawn agent (worktree + window + claude) [-p prompt] [--bare] [--switch|-s] [--base br] [-h harness] [--self-merge|--no-self-merge]  (workers may merge/push by default)
+  fleet new <repo> <br>  spawn agent (worktree + window + claude) [-p prompt] [--bare] [--switch|-s] [--base br] [-h harness] [--self-merge|--no-self-merge] [--task|-T research|plan|impl|test|scratch]  (workers may merge/push by default)
   fleet new --scratch    spawn a repo-less agent (no repo/branch/worktree) [label] [-p prompt] [-h harness]
   fleet ls               list THIS project's agents and states (--all|-a = every project on the server; --pick = fzf jump-to-agent popup, Enter jumps)
   fleet pick             fzf jump-to-agent
@@ -5379,6 +5560,9 @@ case "${1:-}" in
   attach-viewer)  shift; suborch_attach_viewer "$@" ;;      # internal: sub-orch nvim viewer pane (also driven by the proof harness)
   suborch-live)   shift; suborch_live "$@" ;;               # internal: liveness probe (proof harness)
   suborch-prune)  shift; suborch_prune_orphan_window "$@" ;; # internal: drop a harness-less sub-orch husk (proof harness)
+  inject-status-format) shift; inject_status_format "$@" ;;  # internal: status-bar token injection, for the proof harness (also called by fleet up / fleetd)
+  task-of)  shift; task_of "$@" ;;                    # internal: <win_id> <root> <wname> -> validated task (proof harness / dash)
+  task-tag) shift; task_tag "$@" ;;                   # internal: <task> -> 4-char ASCII tag (proof harness)
   dash-new)   shift; cmd_dash_new "$@" ;;             # internal: leader 'new' -> dash's own form
   dash-triage) shift; cmd_dash_triage "$@" ;;         # internal: leader 'triage' -> dash's cross-agent triage view
   apply-keybinds) shift; apply_keybinds ;;            # internal: re-apply runtime keybinds live

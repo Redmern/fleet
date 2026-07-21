@@ -139,6 +139,62 @@ worktree at `<repo>/<branch-with-slashes-as-underscores>`, anchored off the
 container's bare repo or first worktree, cut from `--base` (or the remote default
 branch). Branches with `/` become `_` in directory and window names.
 
+### Task tag (`--task`, `@fleet_task`) — NOT `role`
+
+`fleet new --task <research|plan|impl|test|scratch>` tags what KIND of work
+an agent does, for display only. Three load-bearing constraints:
+
+1. **It is never a TSV column.** The `.agents` line and `fleet agents` are both
+   read positionally as exactly **9** fields by three independent readers that all
+   fail *silently wrong* on a 10th: `bin/fleet-dash`'s `while IFS=$'\t' read …
+   ready` (tab is IFS-whitespace → an empty col 9 collapses, col 10 lands in
+   `$ready` → **every** agent renders the `done` pill → a human reaps live work),
+   `bin/fleetd`'s hard `len(parts) == 9` (blank dashboard), and `cmd_restore`'s
+   `IFS=$'\037' read … owner` (last var absorbs extras → mangled owner → mangled
+   `d<N>-` window prefix). There is no schema/version/migration mechanism here and
+   a pacman copy runs alongside the dev symlink, so version skew is live. Storage
+   is the **`@fleet_task` window option** (live) plus a **window-name-keyed**
+   `<root>/.fleet/tasks/<wname>` file (durable across a tmux server restart;
+   window name, not pane id — tmux reassigns pane ids, which is why
+   `.fleet/roles/<pane-id>` accumulates dead entries). `cmd_restore` re-passes
+   `--task` from the file; `cmd_forget` removes it, inside reap's MUTATE phase.
+2. **`task` is a separate namespace from `role`.** `FLEET_ROLE`, `.fleet/roles/<pane>`
+   and `@fleet_role` all mean orchestrator-vs-worker and all three gate something
+   (fork-bomb, merge/push, `is_main_pane`). `main` is not in the task enum, so a
+   worker cannot self-promote through this surface.
+3. **The enum is closed, validated at the single write site AND re-validated on
+   read** (`task_of`). `@fleet_task`'s *contents* are format-expanded by tmux via
+   the `window-status-format` token, so an unvalidated value carrying `#[` would
+   corrupt the status bar for the **whole tmux server**. Tags are 4 pure-ASCII
+   chars (`rsch`/`plan`/`impl`/`test`/`scr `, blank otherwise) because
+   `popup_fit_content`, `fit_left` and `hrule` all count **codepoints, not display
+   cells**, and there is no ASCII-fallback ladder to degrade to.
+
+Rendered in three places:
+
+- **the tmux status bar** — a second token appended beside `@agent_glyph`, never
+  *into* it (`@agent_glyph` is fleetd-owned and rewritten on every state
+  transition). Healed by both `inject_status_format` and fleetd's
+  `heal_status_format`. It expands a companion **`@fleet_task_tag`** option
+  holding the already-rendered tag: a tmux format expands an option's value
+  verbatim and cannot map `research`→`rsch` itself, so pointing the token at
+  `@fleet_task` would print the full enum word. Both options are stamped at the
+  same validated write site; `@fleet_task` stays the canonical machine-readable
+  one that `task_of` / the dash / `fleet ls` read.
+- **the dashboard row** — a 4-char text field (not a pill: a pill costs `PW+4`=11
+  columns), shed **first** in the width ladder so the label is never squeezed, and
+  hidden entirely when no visible agent has a task (`HAS_TASKS`), so a task-less
+  fleet renders byte-identically to before the flag.
+- **`fleet ls`'s TASK column** — resolved in the shell into a `wname<TAB>tag`
+  sidecar that awk reads as its first FILENAME; the TSV shape is untouched. The
+  tab-separated surfaces use `task_tag_trim` (unset → *empty*, not 4 spaces),
+  because a padded field makes `fleet ls | column -t` mis-align that row; the
+  padded `task_tag` is only for the dashboard's fixed-width row.
+
+Locked in by `test/agent-task-proof.sh` (22 cases / 36 assertions; the regression
+group asserting the 9-field shapes and the absent `done` pill is the highest-value
+part).
+
 ### Worktree secrets (`inject_secrets`)
 
 `inject_secrets <repo> <dir>` runs inside `cmd_new` right after the worktree is
@@ -238,7 +294,7 @@ this project with the `fleet` CLI.
 > agent-neutral. Capabilities only some harnesses support are noted inline.
 
 - `fleet ls` — list THIS project's agents: state (working/blocked/idle), repo/branch, window. `--all`/`-a` lists every project on the server.
-- `fleet new <repo> <branch> [-p "task"] [--bare] [--base <branch>] [--harness|-h <name>] [--self-merge|--no-self-merge]`
+- `fleet new <repo> <branch> [-p "task"] [--bare] [--base <branch>] [--harness|-h <name>] [--self-merge|--no-self-merge] [--task|-T <kind>]`
   — spawn an agent: creates a git worktree for `<branch>` if needed, opens a tmux
   window (editor + agent split by default, `--bare` for a plain agent pane), and
   seeds it with the `-p` prompt. `<repo>` is a repo name/alias in this project
@@ -246,7 +302,12 @@ this project with the `fleet` CLI.
   …; see `fleet harnesses`). By **default** a worker **may** `git merge`/`git push`
   its branch (fleet-guard allows it). Flip the whole project to *blocked* with
   `fleet selfmerge off`; override a single spawn either way with `--self-merge`
-  (force allow) or `--no-self-merge` (force block).
+  (force allow) or `--no-self-merge` (force block). **`--task <kind>`** tags what
+  KIND of work this agent does — one of `research|plan|impl|test|scratch`
+  — shown as a 4-char tag (`rsch`/`plan`/`impl`/`test`/`scr`) in the tmux window
+  status bar, the dashboard row, and `fleet ls`'s TASK column. Unset (or unknown,
+  which warns and drops) renders blank. Display only: it is a separate namespace
+  from the orchestrator/worker *role*, and `--task main` and `--task generic` are hard-rejected (error + non-zero exit, no spawn).
 - `fleet selfmerge on|off|status` — project-wide worker self-merge toggle. `off`
   drops a `<root>/.fleet/no-self-merge` marker so newly-spawned workers in this
   project (all repos) are blocked from merge/push; `on` removes it (the default,
