@@ -218,12 +218,17 @@ nmsg=$(inbox_count)
 [ "$nmsg" = 1 ] && pass 5b || fail 5b "repeat reconcile duplicated the gate-orphan escalation: $nmsg msgs"
 
 # ============================================================================ #
-# 6. respawn cap / abandon-after-N still works (non-parked, dead, no live workers)
+# 6. respawn abandon still works (non-parked, dead). The runaway-suborch-spawn branch
+#    superseded the old FLEET_RECONCILE_CAP=1 "abandon after 1 respawn" with a per-id
+#    CEILING (FLEET_RESPAWN_MAX, default 5): an id respawned that many times is
+#    pathological (almost always a false-dead read) and is abandoned to `failed`. Same
+#    INTENT — a stranded non-parked dispatch is abandoned, never respawned forever —
+#    new count-based mechanism, so this case now seeds respawns AT the ceiling.
 reset_state
-mkdispatch d6 planning 1
-FLEET_RECONCILE_CAP=1 PATH="$TMPROOT/bin:$PATH" "$FLEET" reconcile >/dev/null 2>&1
+mkdispatch d6 planning 5      # respawns already at the per-id ceiling (FLEET_RESPAWN_MAX)
+FLEET_RESPAWN_MAX=5 PATH="$TMPROOT/bin:$PATH" "$FLEET" reconcile >/dev/null 2>&1
 st=$(meta_get d6 state)
-[ "$st" = failed ] && pass 6 || fail 6 "abandon-after-N regressed: state='$st' (want failed)"
+[ "$st" = failed ] && pass 6 || fail 6 "per-id ceiling abandon regressed: state='$st' (want failed)"
 
 # ============================================================================ #
 # 7. PARKED + LIVE pane -> untouched and NOT escalated (negative control: the

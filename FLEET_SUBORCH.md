@@ -522,11 +522,34 @@ fleet dispatch fail <id>      # gave up / unrecoverable
 
 A crashed sub-orch with unfinished state and a dead window is re-animated by
 `fleet reconcile` (run opportunistically by the next dispatch, or manually) — so calling
-`fleet dispatch done|fail <id>` on completion is the only correct way to stop. Two
-backstops cover a crash that never reaches the verb: tearing the window down in the
-dashboard auto-marks the ledger `cancelled` (never downgrading a clean `done`), and after
-`FLEET_RECONCILE_CAP` (default 1) unattended respawns with no live workers, reconcile
-marks the ledger `failed` and logs a dashboard alert — so nothing loops forever.
+`fleet dispatch done|fail <id>` on completion is the only correct way to stop. Backstops
+cover a crash that never reaches the verb, and bound resurrection so it can never storm:
+
+- **Per-sweep spawn budget** (`FLEET_RECONCILE_SWEEP`, default 1): one reconcile sweep
+  re-animates at most N stranded sub-orchs no matter how many corpses the ledger holds —
+  so one prompt can never fan out a burst of windows. (`FLEET_RECONCILE_SWEEP=99 fleet
+  reconcile` for an explicit full recovery.)
+- **Death sentinel** (`FLEET_RECONCILE_GRACE`, default 30s): a dead window that owns NO
+  live worker and has aged past the grace is a corpse — reconcile marks it `failed` on
+  first sight (not respawned), so the zombie pool drains instead of accumulating. A dead
+  pane that still owns live workers (a pipeline that merely lost its orchestrator pane),
+  or one still within grace (mid-boot), is re-animated, never killed.
+- **Per-id ceiling** (`FLEET_RESPAWN_MAX`, default 5): an id respawned this many times is
+  pathological (almost always a false-dead read) — reconcile marks it `failed` regardless
+  of live workers and surfaces it, rather than churning forever.
+- **Parked is exempt from all three.** A dispatch `gate1-wait`/`gate2-wait`
+  (`ledger_parked`) is halted ON PURPOSE waiting for a human, so reconcile classifies it
+  *before* the guards run and never touches it — the budget never spends on it, the
+  sentinel never marks it `failed`, the ceiling never abandons it. Reviving a parked
+  dispatch would run a fresh sub-orch straight past the gate (the §8 bug). A parked pane
+  that has *died* is instead surfaced once via `gate_orphan_escalate` (system-origin inbox
+  message + desktop notify + dashboard alert), never silently revived and never silently
+  dropped. So the two concerns compose: the runaway guards bound HOW MANY live dispatches
+  are re-animated; the parked-skip decides WHICH dispatches are eligible at all.
+- Tearing the window down in the dashboard auto-marks the ledger `cancelled` (never
+  downgrading a clean `done`).
+
+Every abandon logs a dashboard alert; `failed` stays hand-recoverable (re-dispatch).
 
 ## 7. GATED MODE — stop at a gate, wait for the human's POP
 

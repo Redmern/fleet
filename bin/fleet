@@ -1948,6 +1948,21 @@ suborch_has_live_workers() { # <id> <sess>
   return 1
 }
 
+# Seconds since a dispatch's `created` timestamp (the ISO-8601 stamp written by
+# cmd_dispatch_alloc). Used by the reconcile death-sentinel to honour a short grace
+# so a just-spawned sub-orch mid-boot is never false-killed. Fail-silent: an
+# unparseable / missing `created` reads as age 0 (= "young" => within grace =>
+# re-animate, never sentinel-killed by a missing field) — bias is conservative.
+dispatch_age_secs() { # <dispatch-dir> -> integer seconds (>=0)
+  local d="$1" c ct now age
+  c=$(meta_get "$d" created); [ -n "$c" ] || { printf '0'; return 0; }
+  ct=$(date -d "$c" +%s 2>/dev/null) || { printf '0'; return 0; }
+  [ -n "$ct" ] || { printf '0'; return 0; }
+  now=$(date +%s 2>/dev/null) || { printf '0'; return 0; }
+  age=$((now - ct)); [ "$age" -lt 0 ] && age=0
+  printf '%s' "$age"
+}
+
 # Resolve-or-spawn the sub-orch for an id, under a stale-reaped spawn lock. Spawning
 # goes through cmd_new --scratch, which tags the new pane FLEET_ROLE=worker (so its
 # seed prompt can never re-enter the dispatch branch — the fork-bomb gate, §1).
@@ -2373,6 +2388,21 @@ cmd_reconcile() {
   root=$(fleet_root)   || return 0
   led="$root/.fleet/dispatch"
   [ -d "$led" ] || return 0
+  # Layer 1 — per-sweep spawn BUDGET. The load-bearing fix: bound how many sub-orch
+  # respawns a SINGLE sweep performs, regardless of how many zombies the ledger holds.
+  # cmd_reconcile runs opportunistically on EVERY dispatch prompt (fleet-dispatch.sh),
+  # so without this one prompt could fan out K windows (one per stranded corpse) — the
+  # reported runaway. The budget gates the SPAWN (allocating) path only; the abandon
+  # arms below FREE corpses and stay un-budgeted so a backlog still drains. Operator
+  # full-recovery: `FLEET_RECONCILE_SWEEP=99 fleet reconcile`.
+  local sweep_budget="${FLEET_RECONCILE_SWEEP:-1}" sweep_spawned=0 sweep_deferred=0
+  # Coerce all three numeric knobs to a sane default if an operator exports garbage —
+  # an unsanitized value would leak `[: integer expression expected` to stderr and
+  # silently disable its layer (violating the fail-silent contract).
+  local respawn_max="${FLEET_RESPAWN_MAX:-5}" grace="${FLEET_RECONCILE_GRACE:-30}"
+  case "$sweep_budget" in ''|*[!0-9]*) sweep_budget=1 ;; esac
+  case "$respawn_max"  in ''|*[!0-9]*) respawn_max=5 ;; esac
+  case "$grace"        in ''|*[!0-9]*) grace=30 ;; esac
   for d in "$led"/d*/; do
     [ -d "$d" ] || continue
     id=$(basename "$d")
@@ -2398,22 +2428,22 @@ cmd_reconcile() {
       continue
     fi
     if ! suborch_live "$d" "$sess" "$wn"; then
-      # Layer 3 — respawn cap / generation guard. Without this, a sub-orch that
-      # crashed BEFORE writing a terminal state (Layer 1) and was never torn down via
-      # the dashboard (Layer 2) is respawned on EVERY prompt forever — the zombie. Cap
-      # the unattended respawns: after FLEET_RECONCILE_CAP (default 1) re-animations
-      # with no live workers left, give up and mark `failed`.
       local n; n=$(meta_get "$d" respawns); case "$n" in ''|*[!0-9]*) n=0 ;; esac
-      # Only abandon when (a) we are over the cap, (b) tmux is demonstrably responsive
-      # — else a transient blip (or a server restart mid-reconcile) makes every liveness
-      # probe false-dead and would mass-fail live pipelines; reconcile exists to RESTORE
-      # them — and (c) this sub-orch owns no live worker (a real pipeline that merely lost
-      # its orchestrator pane must be re-animated, never killed).
-      if [ "$n" -ge "${FLEET_RECONCILE_CAP:-1}" ] \
-         && tmux info >/dev/null 2>&1 \
-         && ! suborch_has_live_workers "$id" "$sess"; then
+      # tmux-responsiveness gate, shared by every abandon arm below: if tmux is wedged
+      # (or mid server-restart) EVERY liveness probe reads false-dead, and reconcile
+      # exists to RESTORE pipelines, not mass-fail them. When unresponsive, never
+      # abandon — fall through to the (budgeted) re-animate path.
+      local tmux_ok=0; tmux info >/dev/null 2>&1 && tmux_ok=1
+      local has_workers=0; suborch_has_live_workers "$id" "$sess" && has_workers=1
+
+      # Layer 3 — ABSOLUTE per-id ceiling. A pane respawned FLEET_RESPAWN_MAX (default
+      # 5) times is pathological — almost always a false-dead read (uncaptured
+      # window_id / hidden session / slugged name) whose `suborch_has_live_workers`
+      # escape hatch lets it climb forever. Fire the ceiling REGARDLESS of live workers
+      # so a single id can never churn unbounded; surface it to the human instead.
+      if [ "$tmux_ok" = 1 ] && [ "$n" -ge "$respawn_max" ]; then
         meta_set "$d" state failed
-        append_dashboard_alert "reconcile: abandoned $id (state=failed) after $n respawn(s) — dead window, no live workers"
+        append_dashboard_alert "reconcile: abandoned $id (state=failed) — per-id respawn ceiling $respawn_max hit (likely false-dead)"
         # Abandoning is the path that produces the most husks (it fires on every
         # further sweep and never reaches resolve_or_spawn_suborch), and a husk here
         # is INVISIBLE: every row producer filters @fleet_viewer, so an orphan nvim
@@ -2423,10 +2453,39 @@ cmd_reconcile() {
         suborch_prune_orphan_window "$(meta_get "$d" window_id)" "$wn"
         continue
       fi
+
+      # Layer 2 — DEATH SENTINEL. A dead pane that owns NO live worker and has aged
+      # past a short grace is a corpse: mark it `failed` on FIRST sight and DON'T
+      # resurrect work the user abandoned. This drains the zombie pool before it can
+      # grow to K, so the budgeted burst above never has fuel. Conservative bias —
+      # re-animate (fall through) when it still owns live workers (a real pipeline that
+      # merely lost its orchestrator pane) OR is within grace (a just-spawned orch
+      # mid-boot must not be false-killed). `failed` stays hand-recoverable.
+      if [ "$tmux_ok" = 1 ] && [ "$has_workers" = 0 ]; then
+        local age; age=$(dispatch_age_secs "$d"); case "$age" in ''|*[!0-9]*) age=0 ;; esac
+        if [ "$age" -ge "$grace" ]; then
+          meta_set "$d" state failed
+          append_dashboard_alert "reconcile: abandoned $id (state=failed) — dead window, no live workers, age ${age}s"
+          # Same husk-pruning as the ceiling arm: a sentinel-failed dead pane leaves
+          # the same invisible orphan window, so drop it here too.
+          suborch_prune_orphan_window "$(meta_get "$d" window_id)" "$wn"
+          continue
+        fi
+      fi
+
+      # --- ALLOCATING path: re-animate (owns live workers, or within grace) ---
+      # Subject to the per-sweep budget so a sweep can never spawn more than N windows.
+      if [ "$sweep_spawned" -ge "$sweep_budget" ]; then
+        sweep_deferred=$((sweep_deferred+1)); continue
+      fi
       meta_set "$d" respawns "$((n+1))"
       resolve_or_spawn_suborch "$sess" "$wn" "$id" "$root"
+      sweep_spawned=$((sweep_spawned+1))
     fi
   done
+  [ "$sweep_deferred" -gt 0 ] && append_dashboard_alert \
+    "reconcile: spawned $sweep_spawned, deferred $sweep_deferred (per-sweep budget $sweep_budget)"
+  return 0
 }
 
 # `fleet slug <text...>` — deterministic kebab slug. Pins worker-key/branch
