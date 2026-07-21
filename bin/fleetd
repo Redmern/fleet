@@ -37,6 +37,23 @@ IDLE_FLAP_GUARD = 2.0
 SYNTH_STALE_AFTER = 45
 
 
+def notify_suppressed(hidden, state):
+    """Should a block/done notification be SWALLOWED for this @fleet_hidden value?
+
+    3-value @fleet_hidden marker (kept in sync with bin/fleet hide/unhide + dash):
+      unset/"0" — normal worker / surfaced scratch / main → always notify
+      "1"       — machine-parked scratch / sub-orch        → FULLY silent
+      "2"       — USER-hidden agent (any type)             → silent on done,
+                  but STILL alert on `blocked` (a hidden worker's needs-human
+                  signal must never go deaf).
+    """
+    if hidden == "1":
+        return True                              # machine-parked: never notify
+    if hidden == "2" and state != "blocked":
+        return True                              # user-hidden: silent unless blocked
+    return False
+
+
 def dispatch_pill(root):
     # Precomputed colored status pill for a project's dispatch mode (+ hook
     # marker). Mirror of bin/fleet's dispatch_pill() — KEEP THE TWO IN SYNC.
@@ -162,12 +179,15 @@ class Fleet:
             focus, _, hidden = info.strip().partition("\t")
             if focus.startswith("11"):
                 return  # window active in an attached session — user is looking at it
-            # Parked/hidden agents (scratch helpers, dispatch sub-orchs) live in a
-            # detached <sess>_hidden session — never focused, so they would notify on
-            # EVERY block/finish. They're an internal mechanism the user usually
-            # can't act on; stay quiet. Surfaced scratch (move-in sets @fleet_hidden
-            # 0) and all main/worker agents (unset) still notify.
-            if hidden not in ("", "0"):
+            # Parked/hidden agents live in a detached <sess>_hidden session — never
+            # focused, so they would notify on EVERY block/finish. Machine-parked
+            # scratch/sub-orchs (@fleet_hidden 1) are an internal mechanism the user
+            # can't act on → stay fully quiet. A USER-hidden worker (@fleet_hidden 2)
+            # is silenced for routine "done" pings but MUST still alert on `blocked`
+            # — hiding it can't be allowed to swallow its only needs-human signal.
+            # Surfaced scratch (move-in sets 0) and all main/worker agents (unset)
+            # notify normally.
+            if notify_suppressed(hidden, state):
                 return
         self.last_notify[key] = now
         label = agent_label(cur.get("cwd") or pane)
@@ -218,15 +238,22 @@ class Fleet:
         self.last_scrape = now
         out = tmux(
             "list-panes", "-a", "-F",
-            "#{pane_id}\t#{@fleet_state_src}\t#{@fleet_busy_re}\t#{pane_current_path}",
+            "#{pane_id}\t#{@fleet_state_src}\t#{@fleet_busy_re}\t#{pane_current_path}"
+            "\t#{@fleet_viewer}",
         )
         if not out:
             return
         for line in out.splitlines():
             parts = line.split("\t")
-            if len(parts) != 4:
+            if len(parts) != 5:
                 continue
-            pane, src, busy_re, path = parts
+            pane, src, busy_re, path, viewer = parts
+            # @fleet_state_src / @fleet_busy_re are WINDOW options, so tmux inherits
+            # them onto a sub-orch's nvim VIEWER pane too. Scraping it would report a
+            # state for a pane that is not an agent, putting it into self.panes and
+            # emitting a second row for the window. @fleet_viewer is a pane option.
+            if viewer == "1":
+                continue
             if src != "scrape" or not busy_re:
                 continue
             cap = tmux("capture-pane", "-p", "-t", pane)
@@ -255,7 +282,13 @@ class Fleet:
                 continue
             fmt = fmt.rstrip("\n")
             if fmt and "@agent_glyph" not in fmt:
-                tmux("set", "-g", opt, fmt + "#{?@agent_glyph, #{@agent_glyph},}")
+                fmt = fmt + "#{?@agent_glyph, #{@agent_glyph},}"
+                tmux("set", "-g", opt, fmt)
+            # Second, independent token: the task tag (@fleet_task, written only by
+            # `fleet new` from a closed enum). Mirrors inject_status_format so a
+            # theme switch re-heals both. Never touches @agent_glyph.
+            if fmt and "@fleet_task_tag" not in fmt:
+                tmux("set", "-g", opt, fmt + "#{?@fleet_task_tag, #{@fleet_task_tag},}")
         # status-left ship glyph used to be re-healed off the (now-deleted) inbox
         # poll; ride the same theme-switch healing as the window-status glyphs.
         self.heal_status_left()
@@ -306,12 +339,12 @@ class Fleet:
             "list-panes", "-a", "-F",
             "#{pane_id}\t#{window_id}\t#{session_name}\t#{window_name}"
             "\t#{pane_current_path}\t#{pane_active}\t#{@fleet_harness}"
-            "\t#{window_activity}",
+            "\t#{window_activity}\t#{@fleet_role}\t#{@fleet_viewer}",
         ) or ""
         meta = {}
         for line in out.splitlines():
             parts = line.split("\t")
-            if len(parts) == 8:
+            if len(parts) == 10:
                 meta[parts[0]] = parts[1:]
         agents = []
         covered = set()  # window_ids that already have a real reported pane
@@ -320,7 +353,20 @@ class Fleet:
             if not cur:
                 continue
             m = meta.get(pane)
+            # Belt to scrape_harnesses' braces: a sub-orch VIEWER pane is never an
+            # agent, so it must not surface a row even if something managed to report
+            # a state for it. NB meta holds parts[1:], so the indices are shifted by
+            # one against the format string: m[7] is @fleet_role (used just below),
+            # m[8] is @fleet_viewer.
+            if m and len(m) > 8 and m[8] == "1":
+                continue
             window_id, session, window_name, path = (m[0], m[1], m[2], m[3]) if m else ("", "", "", "")
+            # Exclude the orchestrator by ROLE (@fleet_role main) or name — a drifted
+            # "main" name must still be hidden so it can't surface as a reapable row.
+            if window_name == "main" or (m and m[7] == "main"):
+                if window_id:
+                    covered.add(window_id)   # still mark covered so the synth pass skips it too
+                continue
             if window_id:
                 covered.add(window_id)
             agents.append(
@@ -343,17 +389,23 @@ class Fleet:
         now = time.time()
         synth = {}  # window_id -> chosen meta row
         for pane, m in meta.items():
-            window_id, session, window_name, path, pane_active, harness, activity = m
+            window_id, session, window_name, path, pane_active, harness, activity, role, viewer = m
+            # A sub-orch's nvim VIEWER pane is not an agent. @fleet_harness is a window
+            # option so tmux inherits it onto the viewer too, and the "prefer the active
+            # pane" rule below would hand `fleet send`/`fleet mode` the file browser the
+            # moment the human focuses it. @fleet_viewer is a pane option — skip it.
+            if viewer == "1":
+                continue
             if not harness or not window_id or window_id in covered:
                 continue
-            if window_name == "main":
+            if window_name == "main" or role == "main":   # exclude orchestrator by role or name
                 continue
             prev = synth.get(window_id)
             # prefer the active pane as the window's representative agent pane
             if prev is None or (pane_active == "1" and prev[5] != "1"):
                 synth[window_id] = (pane,) + tuple(m)
         for window_id, row in synth.items():
-            pane, _wid, session, window_name, path, _pa, harness, activity = row
+            pane, _wid, session, window_name, path, _pa, harness, activity, _role, _viewer = row
             try:
                 since = float(activity)
             except (TypeError, ValueError):

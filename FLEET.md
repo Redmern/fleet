@@ -9,7 +9,7 @@ this project with the `fleet` CLI.
 > agent-neutral. Capabilities only some harnesses support are noted inline.
 
 - `fleet ls` — list THIS project's agents: state (working/blocked/idle), repo/branch, window. `--all`/`-a` lists every project on the server.
-- `fleet new <repo> <branch> [-p "task"] [--bare] [--base <branch>] [--harness|-h <name>] [--self-merge|--no-self-merge]`
+- `fleet new <repo> <branch> [-p "task"] [--bare] [--base <branch>] [--harness|-h <name>] [--self-merge|--no-self-merge] [--task|-T <kind>]`
   — spawn an agent: creates a git worktree for `<branch>` if needed, opens a tmux
   window (editor + agent split by default, `--bare` for a plain agent pane), and
   seeds it with the `-p` prompt. `<repo>` is a repo name/alias in this project
@@ -17,7 +17,12 @@ this project with the `fleet` CLI.
   …; see `fleet harnesses`). By **default** a worker **may** `git merge`/`git push`
   its branch (fleet-guard allows it). Flip the whole project to *blocked* with
   `fleet selfmerge off`; override a single spawn either way with `--self-merge`
-  (force allow) or `--no-self-merge` (force block).
+  (force allow) or `--no-self-merge` (force block). **`--task <kind>`** tags what
+  KIND of work this agent does — one of `research|plan|impl|test|scratch`
+  — shown as a 4-char tag (`rsch`/`plan`/`impl`/`test`/`scr`) in the tmux window
+  status bar, the dashboard row, and `fleet ls`'s TASK column. Unset (or unknown,
+  which warns and drops) renders blank. Display only: it is a separate namespace
+  from the orchestrator/worker *role*, and `--task main` and `--task generic` are hard-rejected (error + non-zero exit, no spawn).
 - `fleet selfmerge on|off|status` — project-wide worker self-merge toggle. `off`
   drops a `<root>/.fleet/no-self-merge` marker so newly-spawned workers in this
   project (all repos) are blocked from merge/push; `on` removes it (the default,
@@ -49,17 +54,34 @@ this project with the `fleet` CLI.
 - `fleet watch <agent>... -m "message"` — **don't busy-poll.** Returns
   immediately and arms a background watcher; when every named agent goes idle it
   delivers `"message"` into your pane, waking you. Use this to wait on agents
-  without burning your own turn in a `sleep`/`fleet ls` loop.
+  without burning your own turn in a `sleep`/`fleet ls` loop. **Sub-orch wake
+  guarantee:** when the waiting pane is a **sub-orch** (or any non-main pane), the
+  watcher retries the in-band wake and **confirms it actually landed** (the
+  sub-orch must go `working`); if it can't be delivered (input busy, pane parked,
+  or the agent never resumes) the wake is **escalated to a durable inbox message**
+  (a sev=warn **⚙ system** ✉ naming `so-<id>`, desktop-notified) instead of being
+  silently dropped — pop it to resume that sub-orch. The **main** (human) pane is
+  unchanged: it is never send-keys'd, its wake stays out-of-band (toast + bell +
+  dashboard alert).
 - `fleet ready [<agent>] [-m "reason"]` — signal that a work item is **done and
-  its worktree is ready for deletion.** A worker runs bare `fleet ready` from
-  inside its own worktree; you flag someone else's with `fleet ready <agent>`.
-  This drops a `.fleet/ready` marker, so the agent shows as `done` in `fleet ls`
-  and the dashboard. `--clear` removes the flag.
+  its worktree is ready for deletion.** **Workers: run bare `fleet ready` from
+  inside your own worktree when the task you were spawned for is complete AND
+  committed — not when you are pausing, blocked, or asking a question.** (Every
+  spawned worker is seeded this instruction on its first prompt and again in
+  `<worktree>/.fleet/ready-instructions`, which survives a `/clear`.) You flag
+  someone else's with `fleet ready <agent>`, or press **`y`** on its row in the
+  dashboard. This drops a `.fleet/ready` marker, so the agent shows as `done` in
+  `fleet ls` and the dashboard. `--clear` removes the flag.
 - `fleet reap [<target>] [--force]` — remove every worktree flagged ready (close
   its window, delete the worktree and its merged branch). Refuses any worktree
   with uncommitted changes, a branch not merged into its base, or a worker that
   still has an **unread needs-human message** (sev warn/blocked) in the inbox —
-  pop/handle that message first so reaping can never orphan it — unless `--force`.
+  pop/handle that message first so reaping can never orphan it — a **locked**
+  worktree is refused too — unless `--force`. **Reap is atomic:** every refusal,
+  early or late, leaves the worktree, its window, its saved-agents line and its
+  `.fleet/ready` marker untouched, so a plain **re-run is the retry** — reach for
+  `--force` only to genuinely discard dirty or unmerged work, never as the generic
+  remedy (it disables the dirty *and* unmerged guards together).
 
 ## Leader menu (which-key)
 
@@ -68,8 +90,8 @@ one-key actions. Open it with **prefix+F** or **prefix+Space** (both work from
 any pane, including this orchestrator pane — both are prefix-table bindings, so
 plain Space typing in panes is untouched), or by pressing **bare Space while the
 dashboard pane is focused**. Press the shown key to run an action;
-**Esc/q/Space** closes. Actions are grouped **+Agents** (pick `a`, new `n`, ready
-`y`, reap `x`, orchestrator `m`, pop oldest message `p`, triage messages `t`,
+**Esc/q/Space** closes. Actions are grouped **+Agents** (pick `a`, new `n`,
+reap `x`, orchestrator `m`, pop oldest message `p`, triage messages `t`,
 rebuild `M`), **+Session**
 (save `s`, sessions `o`, reload `R`, dispatch mode `d`, quit `Q`), and **+Info** (ls `l`, keys `?`,
 rebind `c`). Those single keys are pressed **inside** the popup — fleet binds
@@ -79,7 +101,12 @@ prefix default (`n`, `x`, `s`, … ) stays intact; the only default it reclaims 
 (`fleet rebind` → `menu`); the `prefix+Space` alias is set/disabled via
 `menu-alt=` in `keybinds.conf`. `fleet keys` lists every action and its in-menu
 key; `fleet rebind` (or the menu's `c`) changes one. Per-agent verbs (msgs `e`,
-send, mode, diff, close) stay on the dashboard's selected row, not in the leader.
+ready `y`, send, mode, diff, close) stay on the dashboard's selected row, not in
+the leader — mark-ready moved off the leader menu entirely, because a leader key
+cannot know which row you mean. In the dashboard's agents view
+**`y`** toggles the ready flag on the selected agent — no confirm modal, because
+the same key undoes it, and a flagged row carries a **⚑** glyph whatever its
+live state (the `done` pill stays idle-only, so it never lies about a live agent).
 
 **Two jump actions — `a` vs `l`.** Both `pick` (`a`) and `ls` (`l`) are now
 **interactive fzf jumpers** that land you on an agent's window (Enter jumps,
@@ -212,3 +239,39 @@ Exceptional events (a dispatch hard-failed, a worker is BLOCKED on the human) ar
 **out-of-band only** — a tmux toast, a terminal bell, and a row in the dashboard alerts
 strip — never injected into your input. When pinged, check the dashboard /
 `.fleet/dispatch/` ledger; recover stranded work with `fleet reconcile`.
+
+## Worktree secrets (per-repo auto-injection)
+
+Keep per-repo secret files in one place and have fleet drop them into **every** new
+worktree it creates — so a fresh debug worktree already has its `.env.local` / DSN at
+the right path, no pasting into a prompt.
+
+**Setup (default mechanism — a mirrored folder, no schema):**
+```sh
+mkdir -p ~/.config/fleet/secrets/<repo>
+$EDITOR ~/.config/fleet/secrets/<repo>/.env.local      # lay files out exactly as the worktree wants them
+```
+On `fleet new <repo> <branch>`, fleet mirror-copies that tree into the worktree (the
+file's path **relative to** `secrets/<repo>/` IS its destination), `chmod 600`s each
+file, and appends each dest to the worktree's `.git/info/exclude` so a secret can never
+be accidentally committed. Re-running is idempotent (overwrites, no duplicate ignore
+lines). `--scratch` agents and repos with no `secrets/<repo>/` dir are untouched.
+
+**Optional `pass` sugar (encryption-at-rest):** if a file's content is exactly
+`pass:<entry>` (e.g. `pass:fleet/myapp/db-url`), fleet resolves it with `pass show` at
+injection and writes the decrypted value instead (value streamed straight to the file —
+never on a command line, never logged). Store the secret encrypted with
+`pass insert fleet/myapp/db-url` once.
+
+**Fail-silent:** a missing source, locked gpg, or absent `pass` only warns — it never
+aborts `fleet new` and never hangs on a pinentry prompt. Every placement is recorded in
+an append-only audit log (`~/.config/fleet/secrets/audit.log`, timestamp/repo/dest/outcome,
+**never the value**). `fleet doctor` reports `pass` state and whether referenced entries
+resolve (no decrypt).
+
+**Honest threat model — read this.** On a single-user box the agent runs as the **same
+uid** as you, so it **CAN** `cat` an injected file or run `pass show` itself. This feature
+buys **auto-injection + accidental-commit protection + encryption-at-rest** — it does
+**NOT** make the secret unreadable by the agent, and is not documented as such. Genuine
+"the AI cannot read it" is impossible same-uid and would need a separate uid for both
+placement and the consuming process (a much larger, separate project).

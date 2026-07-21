@@ -199,6 +199,46 @@ owner_of() { # window_id -> owning sub-orch window name (so-<id>), or "" (prints
   fi
   printf '%s' "${OWN_RAW[$wid]}"
 }
+
+# --- task tag ----------------------------------------------------------------
+# WHAT KIND of work an agent does (research/plan/impl/test/scratch), set by
+# `fleet new --task`. NOT the same thing as ROW_ROLE above (card header vs worker)
+# and NOT @fleet_role (orchestrator vs worker, a security gate) — separate
+# namespace on purpose. Read from the @fleet_task window option, falling back to
+# the durable <root>/.fleet/tasks/<wname> file, and re-validated here because the
+# file is hand-editable. Cached PROCESS-LIFETIME: the tag is stamped once at spawn
+# and never mutates, exactly like OWN_RAW.
+declare -A TASK_RAW                         # window_id -> validated task ("" = unset)
+HAS_TASKS=0                                 # 1 when >=1 visible row carries a task
+TASK_ROOT=""                                # dash_root, resolved once per load_rows
+
+prime_task() { # <window_id> <window_name> — fill TASK_RAW[wid]. Prints NOTHING on
+               # purpose: it MUST be called bare, never as $(…). A command
+               # substitution runs in a subshell, so the cache write would be
+               # discarded — the trap owner_of documents at :192-195. load_rows
+               # calls this directly (its while-loop is not a subshell), so by the
+               # time the row printer runs, every visible window is already cached.
+  local wid="$1"
+  [ -z "${TASK_RAW[$wid]+x}" ] || return 0
+  local t; t=$(tmux show -wqv -t "$wid" @fleet_task 2>/dev/null)
+  [ -n "$t" ] || t=$(cat "$TASK_ROOT/.fleet/tasks/$2" 2>/dev/null)
+  case "$t" in research|plan|impl|test|scratch) ;; *) t="" ;; esac
+  TASK_RAW[$wid]="$t"
+}
+
+task_of_win() { # <window_id> -> the cached validated task, or "" (prints to stdout)
+  printf '%s' "${TASK_RAW[$1]:-}"
+}
+
+task_tag() { # <task> -> a fixed 4-char PURE-ASCII tag. fit_left/hrule/popup_fit_content
+             # all count codepoints, not display cells, so width-1-only is the house
+             # rule (see the glyph note below) and 4 ASCII bytes is the safe form.
+  case "${1:-}" in
+    research) printf 'rsch' ;; plan) printf 'plan' ;; impl) printf 'impl' ;;
+    test)     printf 'test' ;; scratch) printf 'scr ' ;;
+    *)        printf '    ' ;;   # unset + unknown render as nothing
+  esac
+}
 # Sub-orch window-name shape: bare so-d<N> OR slugged so-d<N>-<slug> (display name set by
 # `fleet dispatch rename`). The optional suffix group keeps a bare name matching, and the
 # `d[0-9]+` anchor still rejects a worker (d<N>-repo/branch — no so- prefix, has a '/').
@@ -403,12 +443,21 @@ load_rows() {
   (( ${#ROWS[@]} > 0 )) && (( sel < ${#ROWS[@]} )) && prev_wid=$(field "$sel" 3)
 
   ROWS=()
-  local line state label sess win wname since pane age order
+  HIDDEN_N=0                               # parked-agent count, threaded into the title
+  HAS_TASKS=0                              # no task anywhere => rows render byte-identically to before the flag
+  TASK_ROOT=$(dash_root)                   # once per refresh, not once per row
+  local line state label sess win wname since pane age order hid
   while IFS=$'\t' read -r state label sess win wname since pane age ready; do
     [ -n "$pane" ] || continue
     [ "$sess" = "$SESS" ] || [ "$sess" = "${SESS}_hidden" ] || continue   # this project + its parked scratch
-    [ "$wname" = "main" ] && continue     # skip the orchestrator itself
-    ROWS+=("$state"$'\t'"$label"$'\t'"$win"$'\t'"$wname"$'\t'"$since"$'\t'"$pane"$'\t'"${age:-0}"$'\t'"$ready")
+    [ "$wname" = "main" ] && continue     # skip the orchestrator itself (fast-path name)
+    # …and by ROLE, so a drifted "main" window can't surface as a selectable/closable row.
+    [ "$(tmux show -w -t "$win" -v @fleet_role 2>/dev/null)" = main ] && continue
+    # A window parked in <sess>_hidden is hidden (authoritative — physical
+    # location beats a possibly-stale @fleet_hidden marker). Field 9 of ROWS[].
+    hid=0; [ "$sess" = "${SESS}_hidden" ] && { hid=1; HIDDEN_N=$((HIDDEN_N+1)); }
+    prime_task "$win" "$wname"; [ -n "${TASK_RAW[$win]}" ] && HAS_TASKS=1
+    ROWS+=("$state"$'\t'"$label"$'\t'"$win"$'\t'"$wname"$'\t'"$since"$'\t'"$pane"$'\t'"${age:-0}"$'\t'"$ready"$'\t'"$hid")
   done < <("$FLEET_BIN" agents 2>/dev/null | sort -t$'\t' -k1,1 \
             | awk -F'\t' '
                 $1=="blocked"{o=0} $1=="idle"{o=1} $1=="working"{o=2} $1!~/blocked|idle|working/{o=3}
@@ -872,6 +921,7 @@ render() {
   dm="${dm#"${dm%%[![:space:]]*}"}"; dm="${dm%"${dm##*[![:space:]]}"}"
   case "$dm" in all|off|sigil) ;; *) dm=sigil ;; esac
   local title="FLEET · $SESS · $N agent$([ "$N" = 1 ] || echo s) · d:$dm"
+  (( ${HIDDEN_N:-0} > 0 )) && title+=" · ${HIDDEN_N} hidden"
   (( IBX_TOTAL > 0 )) && { title+=" · ✉$IBX_TOTAL"; (( IBX_WARN > 0 )) && title+=" ⚠$IBX_WARN"; }
   printf '\033[2m%s\033[0m\033[K\n' \
     "$(hrule '╭' '╮' "$inner" "$title")"
@@ -969,6 +1019,10 @@ render() {
           label="$label  $cannot"
         fi
       fi
+      # parked agents (field 9) carry a plain " (hidden)" tag so a hidden worker is
+      # visually distinct from a live one — the surrounding label sgr (dim when
+      # unselected) styles it; keep it plain text so fit_left's width math holds.
+      [ "$(field "$i" 9)" = 1 ] && label="$label (hidden)"
       g=$(git_cached "$pane"); gt=$(gitfmt "$g")
       # mode pill only for harnesses with a runtime permission-mode cycle (claude)
       local hmode np
@@ -980,11 +1034,39 @@ render() {
       local iunread=${UNREAD[$wname]:-0} ibx_show=0
       (( iunread > 0 )) && ibx_show=1
       np=$(( 1 + git_show + mode_show + ibx_show ))   # state always + git/mode/✉ optional
-      LW=$(( cw - np*PW - CF - (np+1)*G ))         # np pills + cost + gaps
-      (( LW < 1 )) && { cost_show=0; LW=$(( cw - np*PW - np*G )); }                 # drop cost
-      (( LW < 1 )) && (( mode_show )) && { mode_show=0; np=$((np-1)); LW=$(( cw - np*PW - np*G )); }  # drop mode
-      (( LW < 1 )) && (( ibx_show )) && { ibx_show=0; np=$((np-1)); LW=$(( cw - np*PW - np*G )); }    # drop ✉
-      (( LW < 1 )) && { git_show=0; ibx_show=0; mode_show=0; LW=$(( cw - PW - G )); }                 # state+label only
+      # Reserve the ready-glyph's 2 columns UP FRONT, before the drop-cost/mode/✉
+      # cascade below reasons about the remaining width — taking them afterwards
+      # would both mis-inform the cascade and push the row 2 columns past $cw at
+      # the widths where LW clamps to 0 (content is printed between two │ with no
+      # truncation, so the right rail would shift/wrap).
+      local cwg=$(( cw - 2 ))
+      # Task tag: a plain 4-char TEXT field (not a pill — a pill costs PW+4=11
+      # columns, and the ladder below already sheds cost/mode/✉ on the narrow panes
+      # a fleet actually runs in). Shown only when SOME visible agent has a task, so
+      # a fleet that never uses --task renders exactly as it did before the flag;
+      # once any row has one, every row reserves the 4 cells so the column aligns.
+      local task_show=$HAS_TASKS TFW=0
+      (( task_show )) && TFW=$(( 4 + G ))
+      LW=$(( cwg - np*PW - CF - (np+1)*G - TFW ))   # np pills + cost + task field + gaps
+      # DROP THE TASK FIELD FIRST — before cost/mode/✉. The badge is a convenience;
+      # the label is the identity, and it must never be squeezed by the badge.
+      #
+      # The gate is the ELISION POINT OF THIS ROW'S LABEL, not a constant. fit_left
+      # elides exactly when LW < ${#label}, so that — and only that — is the
+      # condition under which the tag is squeezing the identity. Two earlier gates
+      # were both wrong because neither read the label they were protecting:
+      #   `LW < 1`      held the tag while the label was truncated (the original bug);
+      #   `LW < LBLMIN` fixed it only for labels shorter than the constant, so the
+      #                 defect returned for every label >= 20 cells (measured: a tag
+      #                 held across the whole 113..91 band on a 43-cell label) AND
+      #                 over-shed at cw<=90 on short labels with ~30 columns spare.
+      # A constant cannot express a per-row invariant. The rule is tag XOR ellipsis:
+      # if this row's label is being elided, the tag must already be gone.
+      (( LW < ${#label} )) && (( task_show )) && { task_show=0; TFW=0; LW=$(( cwg - np*PW - CF - (np+1)*G )); }
+      (( LW < 1 )) && { cost_show=0; LW=$(( cwg - np*PW - np*G )); }                 # drop cost
+      (( LW < 1 )) && (( mode_show )) && { mode_show=0; np=$((np-1)); LW=$(( cwg - np*PW - np*G )); }  # drop mode
+      (( LW < 1 )) && (( ibx_show )) && { ibx_show=0; np=$((np-1)); LW=$(( cwg - np*PW - np*G )); }    # drop ✉
+      (( LW < 1 )) && { git_show=0; ibx_show=0; mode_show=0; LW=$(( cwg - PW - G )); }                 # state+label only
       (( LW < 0 )) && LW=0
       # stall: an agent stuck "working" too long shows a red 'stalled' pill
       sdisp="$state"; scol=$(state_pcol "$state")
@@ -997,9 +1079,18 @@ render() {
         working|blocked) ;;
         *) [ -n "$(field "$i" 8)" ] && { sdisp="done"; scol=5; } ;;
       esac
+      # State-independent ready glyph. The `done` pill above is idle-only BY
+      # DESIGN (a `done` pill on a live agent would make the reap scan lie), so a
+      # flagged working/blocked row would otherwise show NOTHING — and `status` is
+      # wiped by the read timeout after ~one tick. This is the second, permanent
+      # feedback channel. Reserve the 2 columns unconditionally so the layout
+      # never shifts between a flagged and an unflagged row.
+      local rglyph="  "
+      [ -n "$(field "$i" 8)" ] && rglyph=$'⚑ '
       (( i == sel )) && lblsgr='\033[1m' || lblsgr='\033[2m'
       content=$(pill "$sdisp" "$scol")
-      content+=$(printf "%s${lblsgr}%b\033[22m" "$gap" "$(fit_left "$label" "$LW")")
+      (( task_show )) && content+=$(printf "%s\033[2m%s\033[0m" "$gap" "$(task_tag "$(task_of_win "$(field "$i" 3)")")")
+      content+=$(printf "%s\033[35m%s\033[0m${lblsgr}%b\033[22m" "$gap" "$rglyph" "$(fit_left "$label" "$LW")")
       (( git_show )) && content+="$gap$(pill "$gt" "$(git_pcol "$g")")"
       (( mode_show )) && content+="$gap$(pill "$(mode_short "$mode")" "$(mode_pcol "$mode")")"
       (( ibx_show )) && content+="$gap$(pill "✉$iunread" "$(sev_pcol "${MAXSEV[$wname]:-}")")"
@@ -1085,7 +1176,11 @@ render() {
   # bottom border with key hints (or a transient status)
   local hint
   if [ -n "$status" ]; then hint="$status"
-  else hint="Spc leader · j/k · Ent jump · e msgs · h hide · v diff · m mode · s send · n new · d close · r/R refresh"; fi
+  # `hrule` hard-truncates at inner-1, and the right-hand pane already clipped the
+  # old 104-char string. Gains `y ready` and is still 7 columns CHEAPER: `r`/`R`
+  # drop out of the legend (R is in the leader menu, r is redundant under the ~1s
+  # auto-refresh). Both keys still work — they are just no longer advertised.
+  else hint="Spc ldr · j/k · Ent jump · e msgs · h hide · v diff · m mode · s send · n new · y ready · d close"; fi
   tput cup $(( rows - 1 )) 0 2>/dev/null
   printf '\033[2m%s\033[0m\033[K' "$(hrule '╰' '╯' "$inner" "$hint")"
 }
@@ -1643,7 +1738,7 @@ confirm_teardown() {
         fi
         case "${acts[mi]}" in
           cancel) return ;;
-          close) tmux kill-window -t "$win" 2>/dev/null
+          close) "$FLEET_BIN" safe-kill-window "$win" 2>/dev/null   # brake: refuse main/last/empty
                  [ -n "$_did" ] && "$FLEET_BIN" dispatch cancel "$_did" 2>/dev/null || true
                  "$FLEET_BIN" forget "$dir" 2>/dev/null
                  status="closed $label"; return ;;
@@ -1652,7 +1747,7 @@ confirm_teardown() {
             [ "${acts[mi]}" = force ] && force="--force"
             # main working tree (or bare container) to run `worktree remove` from
             main=$(git -C "$dir" worktree list --porcelain 2>/dev/null | awk '/^worktree /{print $2; exit}')
-            tmux kill-window -t "$win" 2>/dev/null
+            "$FLEET_BIN" safe-kill-window "$win" 2>/dev/null   # brake: refuse main/last/empty
             [ -n "$_did" ] && "$FLEET_BIN" dispatch cancel "$_did" 2>/dev/null || true
             "$FLEET_BIN" forget "$dir" 2>/dev/null
             if git -C "${main:-$dir}" worktree remove $force "$dir" 2>/dev/null; then
@@ -1700,6 +1795,49 @@ drain_nav() {
       *) PENDING="$k2"; return ;;        # non-nav: stash, stop draining
     esac
   done
+}
+
+# Agents view `y`: TOGGLE the ready flag on the selected agent. Ready = "this
+# worktree is done and safe for `fleet reap` to delete". Normally the worker
+# self-flags when its task completes (cmd_new seeds it that instruction); this is
+# the manual override for when it doesn't. A TOGGLE, not one-way, so a mis-press
+# is undone with the same key — cheapest-possible-undo is exactly what lets this
+# skip a confirm modal, and it keeps a mis-flag from becoming a mis-reap. (The
+# other half of that bargain is cmd_reap's live-state guard, which refuses to
+# delete a worktree whose agent is still working/blocked.)
+# A function, not an inline key branch, so the proof harness can drive it under
+# the DASH_LIB seam below.
+toggle_ready() {
+  [ "$MODE" = agents ] || return 0
+  (( N == 0 )) && return 0
+  (( sel < N )) || { status="orphans row — press e for messages"; return 0; }
+  local lbl win rdy st out
+  lbl=$(field "$sel" 2); win=$(field "$sel" 4); rdy=$(field "$sel" 8); st=$(field "$sel" 1)
+  # Pass the WINDOW NAME (field 4), never the label (field 2): cmd_ready's target
+  # match is a SUBSTRING match, first hit wins, so a repo/branch label that is a
+  # substring of another agent's would flag the wrong worktree.
+  # Report only what actually happened — a status line that claims a flag landed
+  # when the marker write failed is worse than no feedback at all.
+  if [ -n "$rdy" ]; then
+    if out=$("$FLEET_BIN" ready "$win" --clear 2>&1); then status="ready cleared → $lbl"
+    else status="clear FAILED → $lbl: $(printf '%s' "$out" | tail -1)"; fi
+  else
+    if ! out=$("$FLEET_BIN" ready "$win" 2>&1); then
+      status="flag FAILED → $lbl: $(printf '%s' "$out" | tail -1)"
+    else
+      case "$out" in
+        # A scratch/root agent has no worktree; cmd_ready's bleed guard refuses
+        # rather than dropping a marker into the SHARED project root. Surface it.
+        *"no worktree"*) status="scratch agent — nothing to reap" ;;
+        *) case "$st" in
+             # The `done` pill is idle-only by design, so say why nothing changed.
+             working|blocked) status="flagged ready → $lbl (still $st — shows done when idle)" ;;
+             *) status="flagged ready → $lbl" ;;
+           esac ;;
+      esac
+    fi
+  fi
+  return 0
 }
 
 # --- main loop ---------------------------------------------------------------
@@ -1755,6 +1893,9 @@ while :; do
       # — nvim/claude/shell Space stays untouched. Same popup as prefix+Space.
       "$FLEET_BIN" menu-popup 2>/dev/null   # fit-to-content frame; blocks until the popup closes
       clear; status="" ;;
+    y)             # agents view: toggle the READY flag on the selected agent (no confirm)
+      [ "$MODE" = agents ] || continue
+      toggle_ready; load_rows; last_load=$SECONDS ;;
     t)             # agents view: open the cross-agent message triage (all queued msgs)
       [ "$MODE" = agents ] || continue
       open_triage; last_load=$SECONDS ;;
@@ -1810,35 +1951,18 @@ while :; do
     J)             # inbox: jump to the message's source agent (no-op in agents view)
       [ "$MODE" = inbox ] || continue
       inbox_jump; load_inbox; last_load=$SECONDS ;;
-    h)             # hide the selected scratch agent back off the bar (into <sess>_hidden)
+    h)             # hide the selected agent off the bar (into <sess>_hidden); refuses main
       [ "$MODE" = inbox ] && continue
       (( N == 0 )) && continue
       (( sel >= N )) && { status="orphans row — press e for messages"; continue; }
-      win=$(field "$sel" 3); wname=$(field "$sel" 4)
-      # Gate on the @fleet_hidden marker so ONLY scratch agents are hideable —
-      # worker windows must never be yanked off the bar. (Unset on workers; 0/1 on
-      # scratch depending on surfaced/parked.)
-      if [ -z "$(tmux show -w -t "$win" -v @fleet_hidden 2>/dev/null)" ]; then
-        status="$wname is not a scratch agent"; continue
-      fi
-      hidden="${SESS}_hidden"; ph=""
-      if ! tmux has-session -t "=$hidden" 2>/dev/null; then
-        # tmux cannot create an EMPTY session: spin a throwaway placeholder window,
-        # move the scratch window in, then drop the placeholder. _hold is a plain
-        # sh with no @agent_state, so it never flickers into the dashboard.
-        ph=$(tmux new-session -d -P -F '#{window_id}' -s "$hidden" -n _hold sh 2>/dev/null)
-        # set-option on a SESSION rejects the "=" prefix (unlike move-window/etc.),
-        # so plain "$hidden" — exact anyway, no glob chars in a session name.
-        tmux set -t "$hidden" @fleet_root "$(tmux show -t "$SESS" -v @fleet_root 2>/dev/null)" 2>/dev/null
-      fi
-      tmux move-window -s "$win" -t "=$hidden:" 2>/dev/null
-      tmux set -w -t "$win" @fleet_hidden 1 2>/dev/null
-      # LOAD-BEARING guard: do NOT drop the [ -n "$ph" ] test. Under a concurrent 'h'
-      # the loser's new-session fails and $ph is EMPTY; `kill-window -t ""` falls
-      # through to the CURRENT window and would kill a live scratch agent. The
-      # loser's move-window still succeeds (the winner created the session).
-      [ -n "$ph" ] && tmux kill-window -t "$ph" 2>/dev/null
-      status="hid $wname"; load_rows; last_load=$SECONDS ;;
+      win=$(field "$sel" 3)
+      # Delegate to `fleet hide` so dash + CLI share ONE hide path: the main-guard,
+      # the user-hidden marker (@fleet_hidden 2), and the LOAD-BEARING concurrent-
+      # create placeholder kill all live once in cmd_hide/ensure_hidden_session.
+      # Pass the exact window id (resolver's top tier) for an unambiguous match;
+      # surface cmd_hide's one-line status (success on stdout, refusal on stderr).
+      status=$("$FLEET_BIN" hide "$win" 2>&1 | tail -1)
+      load_rows; last_load=$SECONDS ;;
     m)             # permission-mode pick-list for the selected agent (sets status)
       [ "$MODE" = inbox ] && continue
       (( N == 0 )) && continue

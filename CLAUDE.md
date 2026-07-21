@@ -89,8 +89,46 @@ State lives in three places, none of them a database:
 - **Done markers** — `<worktree>/.fleet/ready` (written by `fleet ready` when a
   work item is finished). Read by `agents_tsv`/the dashboard to show the agent as
   `done`, and consumed by `fleet reap`, which removes flagged worktrees (skipping
-  unmerged/dirty ones). The dirty check ignores `.fleet/` so the marker itself
-  never blocks a reap.
+  unmerged/dirty ones). The dirty check ignores only **untracked** (`??`)
+  `.fleet/` entries so the marker itself never blocks a reap — a *tracked*
+  `.fleet/` path with local edits is real user work and still refuses.
+
+### Ledger state: terminal vs parked (`ledger_terminal` / `ledger_parked`)
+
+Dispatch ledger state is classified in **exactly one place**: `ledger_terminal`
+(`done|failed|cancelled`) and `ledger_parked` (`gate1-wait|gate2-wait`). Three
+consumers hand-rolled this before and diverged, which *was* a bug: `cmd_reconcile`
+skipped only the terminal set, so a sub-orch parked at a human gate looked
+"non-terminal + dead window = stranded" and got respawned — and the fresh sub-orch
+read the instruction and ran straight **past** the gate (4 of 5 dispatches on
+2026-07-19; one self-merged to main). Meanwhile `gate_waiting`, which `cmd_reap`
+consults, already treated those states as parked-leave-alone. **parked != terminal
+!= stranded.** `cmd_reconcile` now skips revival for both sets; a parked dispatch
+whose sub-orch pane is **dead** is never revived *and* never silently dropped —
+`gate_orphan_escalate` surfaces it once (system-origin `--from -` inbox message →
+⚙ system row + desktop notify, plus a dashboard alert), one-shot via a
+`gate_orphan` ledger flag that re-arms when the pane comes back. The wake path's
+`suborch_ledger_active` shares `ledger_terminal` but deliberately **not**
+`ledger_parked`: a gate-parked sub-orch losing its pane is exactly when the human
+most needs the nudge. Locked in by `test/reconcile-gate-park-proof.sh` (9 cases).
+
+### Reap is atomic (`cmd_reap`)
+
+`cmd_reap` is split into **DECIDE** (pure reads: the ready marker, target match,
+linked-worktree, dirty, merged, inbox, gate-wait, worktree-**lock**, plus resolving
+the window to kill) and **MUTATE**. Nothing destructive happens until
+`git worktree remove` has *succeeded*; only then does it run `branch -D` →
+`safe_kill_window` → `cmd_forget`. Scratch docs are archived by **`cp -a` into a
+freshly-made stage dir, never `mv`** — moving a *tracked* note deletes it from the
+worktree, which dirties the tree and makes removal refuse: reap dirtying the tree
+and then refusing because the tree is dirty (the orphan bug). The only pre-remove
+deletion is on an **exclude-less** worktree (`git check-ignore -q .fleet/` fails),
+where fleet's own untracked markers would block removal; that path — and only that
+path — carries a rollback that restores the notes and the marker and, if the
+marker cannot be restored, prints the exact `touch` recovery to stderr. Net
+contract: **any refusal leaves worktree + window + agents line + marker intact, so
+a plain re-run is the retry.** Locked in by `test/reap-tracked-notes-proof.sh`
+(19 cases) and `test/reap-teardown-safety.sh` (8).
 
 ### Worktree / repo layout (`cmd_new`)
 
@@ -100,6 +138,125 @@ resolves the repo then picks a layout: a **plain working repo** is used in place
 worktree at `<repo>/<branch-with-slashes-as-underscores>`, anchored off the
 container's bare repo or first worktree, cut from `--base` (or the remote default
 branch). Branches with `/` become `_` in directory and window names.
+
+### Task tag (`--task`, `@fleet_task`) — NOT `role`
+
+`fleet new --task <research|plan|impl|test|scratch>` tags what KIND of work
+an agent does, for display only. Three load-bearing constraints:
+
+1. **It is never a TSV column.** The `.agents` line and `fleet agents` are both
+   read positionally as exactly **9** fields by three independent readers that all
+   fail *silently wrong* on a 10th: `bin/fleet-dash`'s `while IFS=$'\t' read …
+   ready` (tab is IFS-whitespace → an empty col 9 collapses, col 10 lands in
+   `$ready` → **every** agent renders the `done` pill → a human reaps live work),
+   `bin/fleetd`'s hard `len(parts) == 9` (blank dashboard), and `cmd_restore`'s
+   `IFS=$'\037' read … owner` (last var absorbs extras → mangled owner → mangled
+   `d<N>-` window prefix). There is no schema/version/migration mechanism here and
+   a pacman copy runs alongside the dev symlink, so version skew is live. Storage
+   is the **`@fleet_task` window option** (live) plus a **window-name-keyed**
+   `<root>/.fleet/tasks/<wname>` file (durable across a tmux server restart;
+   window name, not pane id — tmux reassigns pane ids, which is why
+   `.fleet/roles/<pane-id>` accumulates dead entries). `cmd_restore` re-passes
+   `--task` from the file; `cmd_forget` removes it, inside reap's MUTATE phase.
+2. **`task` is a separate namespace from `role`.** `FLEET_ROLE`, `.fleet/roles/<pane>`
+   and `@fleet_role` all mean orchestrator-vs-worker and all three gate something
+   (fork-bomb, merge/push, `is_main_pane`). `main` is not in the task enum, so a
+   worker cannot self-promote through this surface.
+3. **The enum is closed, validated at the single write site AND re-validated on
+   read** (`task_of`). `@fleet_task`'s *contents* are format-expanded by tmux via
+   the `window-status-format` token, so an unvalidated value carrying `#[` would
+   corrupt the status bar for the **whole tmux server**. Tags are 4 pure-ASCII
+   chars (`rsch`/`plan`/`impl`/`test`/`scr `, blank otherwise) because
+   `popup_fit_content`, `fit_left` and `hrule` all count **codepoints, not display
+   cells**, and there is no ASCII-fallback ladder to degrade to.
+
+Rendered in three places:
+
+- **the tmux status bar** — a second token appended beside `@agent_glyph`, never
+  *into* it (`@agent_glyph` is fleetd-owned and rewritten on every state
+  transition). Healed by both `inject_status_format` and fleetd's
+  `heal_status_format`. It expands a companion **`@fleet_task_tag`** option
+  holding the already-rendered tag: a tmux format expands an option's value
+  verbatim and cannot map `research`→`rsch` itself, so pointing the token at
+  `@fleet_task` would print the full enum word. Both options are stamped at the
+  same validated write site; `@fleet_task` stays the canonical machine-readable
+  one that `task_of` / the dash / `fleet ls` read.
+- **the dashboard row** — a 4-char text field (not a pill: a pill costs `PW+4`=11
+  columns), shed **first** in the width ladder so the label is never squeezed, and
+  hidden entirely when no visible agent has a task (`HAS_TASKS`), so a task-less
+  fleet renders byte-identically to before the flag.
+- **`fleet ls`'s TASK column** — resolved in the shell into a `wname<TAB>tag`
+  sidecar that awk reads as its first FILENAME; the TSV shape is untouched. The
+  tab-separated surfaces use `task_tag_trim` (unset → *empty*, not 4 spaces),
+  because a padded field makes `fleet ls | column -t` mis-align that row; the
+  padded `task_tag` is only for the dashboard's fixed-width row.
+
+Locked in by `test/agent-task-proof.sh` (22 cases / 36 assertions; the regression
+group asserting the 9-field shapes and the absent `done` pill is the highest-value
+part).
+
+### Worktree secrets (`inject_secrets`)
+
+`inject_secrets <repo> <dir>` runs inside `cmd_new` right after the worktree is
+materialized and before the tmux window spawns (skipped for `--scratch`; no-op when
+`~/.config/fleet/secrets/<repo>/` is absent — full backward compat). It mirror-copies
+that source tree into the worktree (relative path = dest), `chmod 600`s each file,
+**realpath-confines** every dest inside `$dir` (rejects source symlinks and
+parent-symlink escapes — fail-CLOSED, the one place that is not fail-silent), and
+appends each dest to the shared `.git/info/exclude` (idempotent). A file whose first
+line is `pass:<entry>` is resolved via `pass show` with the value streamed straight to
+the dest (never on argv/env, never logged), bounded by `timeout` so pinentry can't
+hang. Every placement is recorded in an append-only audit log
+(`$CONF_DIR/secrets/audit.log`, **never a value**). Exposed as the internal
+`fleet inject-secrets` subcommand for the proof harness
+(`test/worktree-secrets-proof.sh`). **Honest threat model:** same-uid agents CAN read
+injected secrets — this buys auto-injection + accidental-commit protection +
+encryption-at-rest, NOT secrecy from the agent. `doctor_secrets` prints that caveat.
+
+### Sub-orch viewer pane (`suborch_attach_viewer`)
+
+A sub-orch window is **two panes**: pane 0 is the harness (byte-identical to any other
+`--scratch` spawn), pane 1 is an **nvim viewer** rooted at `.fleet/dispatch/<id>/`, the
+per-dispatch **symlink farm** the sub-orch populates itself (`reports ->`, one link per
+worker worktree, one per worker notes dir — `FLEET_SUBORCH.md` §3.0.6). The absolute
+reports path comes from the ledger `reports` key, written by `cmd_dispatch_rename` — the
+only place `d<N>` and `<slug>` are both in hand.
+
+Making nvim the sub-orch's *own* pane instead would be **silent death**: `is_harness_cmd`
+allowlists `nvim`, so the pane would read ALIVE forever after the agent inside it died,
+`cmd_reconcile` would never re-animate, and the dispatch would stall showing green. Hence
+the pane is *added*, `-d` (no focus steal) and **no `-b`** (pane 0 stays the harness), and
+it carries the `@fleet_viewer` **pane** option — never the `@fleet_nvim_sock` *window*
+option, which `cmd_send` keys on to route all delivery over nvim RPC with no fallback.
+
+Two consequences everything else must respect:
+
+- **Liveness may not use `head -1`.** When the harness pane exits the window survives on
+  the viewer and the viewer *becomes* pane 0 → false ALIVE. `suborch_live` resolves through
+  `suborch_harness_pane` (first non-viewer pane) instead, and
+  `suborch_prune_orphan_window` drops the harness-less husk before reconcile respawns.
+- **Row producers enumerate panes and key on WINDOW options, which tmux inherits down to
+  every pane.** Three of them: `agents_tsv`'s daemon-down fallback keys on `@agent_state`
+  (→ a duplicate row per sub-orch, skewing `fleet-dash`'s `HIDDEN_N`); `fleetd`'s
+  synthetic pass keys on `@fleet_harness` and *prefers the active pane* (→ `fleet
+  send`/`mode` targeting nvim the moment the human focuses it); `fleetd.scrape_harnesses`
+  keys on `@fleet_state_src`/`@fleet_busy_re` (→ for a hookless harness like omp it
+  capture-panes the viewer and reports a state for it). All three filter on
+  `@fleet_viewer`, as do `window_pane_for` and `suborch_pane_for`. **Any new pane
+  enumeration must too.** `suborch_has_live_workers` is the documented exception —
+  a sub-orch is excluded from `@fleet_owner` stamping, so its viewer reads an empty owner.
+
+`fleetd`'s tmux format grew a 10th field for this. Note `meta` stores `parts[1:]`, so
+format index *n* is `m[n-1]` — the synth pass unpacks `(pane,) + tuple(m)` (10 names)
+while the reported-pane loop indexes `m[8]`. Both arities were wrong on the first pass and
+`fleetd` has no try/except around method dispatch, so each one exited the daemon;
+`Restart=on-failure` then crash-looped it to permanently `failed` while everything
+silently degraded to the stale tmux-option fallback. Any change here must keep
+`test/suborch-viewer-focus.sh` case **4b** (daemon still alive after serving) green —
+case 4 alone passes just as happily against a corpse.
+
+Proofs: `test/suborch-viewer-{liveness,send,focus,idempotent}.sh` and
+`test/dispatch-symlink-farm.sh`. The liveness one is the critical guard.
 
 ### Permission-mode discovery (notable)
 
@@ -137,7 +294,7 @@ this project with the `fleet` CLI.
 > agent-neutral. Capabilities only some harnesses support are noted inline.
 
 - `fleet ls` — list THIS project's agents: state (working/blocked/idle), repo/branch, window. `--all`/`-a` lists every project on the server.
-- `fleet new <repo> <branch> [-p "task"] [--bare] [--base <branch>] [--harness|-h <name>] [--self-merge|--no-self-merge]`
+- `fleet new <repo> <branch> [-p "task"] [--bare] [--base <branch>] [--harness|-h <name>] [--self-merge|--no-self-merge] [--task|-T <kind>]`
   — spawn an agent: creates a git worktree for `<branch>` if needed, opens a tmux
   window (editor + agent split by default, `--bare` for a plain agent pane), and
   seeds it with the `-p` prompt. `<repo>` is a repo name/alias in this project
@@ -145,7 +302,12 @@ this project with the `fleet` CLI.
   …; see `fleet harnesses`). By **default** a worker **may** `git merge`/`git push`
   its branch (fleet-guard allows it). Flip the whole project to *blocked* with
   `fleet selfmerge off`; override a single spawn either way with `--self-merge`
-  (force allow) or `--no-self-merge` (force block).
+  (force allow) or `--no-self-merge` (force block). **`--task <kind>`** tags what
+  KIND of work this agent does — one of `research|plan|impl|test|scratch`
+  — shown as a 4-char tag (`rsch`/`plan`/`impl`/`test`/`scr`) in the tmux window
+  status bar, the dashboard row, and `fleet ls`'s TASK column. Unset (or unknown,
+  which warns and drops) renders blank. Display only: it is a separate namespace
+  from the orchestrator/worker *role*, and `--task main` and `--task generic` are hard-rejected (error + non-zero exit, no spawn).
 - `fleet selfmerge on|off|status` — project-wide worker self-merge toggle. `off`
   drops a `<root>/.fleet/no-self-merge` marker so newly-spawned workers in this
   project (all repos) are blocked from merge/push; `on` removes it (the default,
@@ -177,17 +339,34 @@ this project with the `fleet` CLI.
 - `fleet watch <agent>... -m "message"` — **don't busy-poll.** Returns
   immediately and arms a background watcher; when every named agent goes idle it
   delivers `"message"` into your pane, waking you. Use this to wait on agents
-  without burning your own turn in a `sleep`/`fleet ls` loop.
+  without burning your own turn in a `sleep`/`fleet ls` loop. **Sub-orch wake
+  guarantee:** when the waiting pane is a **sub-orch** (or any non-main pane), the
+  watcher retries the in-band wake and **confirms it actually landed** (the
+  sub-orch must go `working`); if it can't be delivered (input busy, pane parked,
+  or the agent never resumes) the wake is **escalated to a durable inbox message**
+  (a sev=warn **⚙ system** ✉ naming `so-<id>`, desktop-notified) instead of being
+  silently dropped — pop it to resume that sub-orch. The **main** (human) pane is
+  unchanged: it is never send-keys'd, its wake stays out-of-band (toast + bell +
+  dashboard alert).
 - `fleet ready [<agent>] [-m "reason"]` — signal that a work item is **done and
-  its worktree is ready for deletion.** A worker runs bare `fleet ready` from
-  inside its own worktree; you flag someone else's with `fleet ready <agent>`.
-  This drops a `.fleet/ready` marker, so the agent shows as `done` in `fleet ls`
-  and the dashboard. `--clear` removes the flag.
+  its worktree is ready for deletion.** **Workers: run bare `fleet ready` from
+  inside your own worktree when the task you were spawned for is complete AND
+  committed — not when you are pausing, blocked, or asking a question.** (Every
+  spawned worker is seeded this instruction on its first prompt and again in
+  `<worktree>/.fleet/ready-instructions`, which survives a `/clear`.) You flag
+  someone else's with `fleet ready <agent>`, or press **`y`** on its row in the
+  dashboard. This drops a `.fleet/ready` marker, so the agent shows as `done` in
+  `fleet ls` and the dashboard. `--clear` removes the flag.
 - `fleet reap [<target>] [--force]` — remove every worktree flagged ready (close
   its window, delete the worktree and its merged branch). Refuses any worktree
   with uncommitted changes, a branch not merged into its base, or a worker that
   still has an **unread needs-human message** (sev warn/blocked) in the inbox —
-  pop/handle that message first so reaping can never orphan it — unless `--force`.
+  pop/handle that message first so reaping can never orphan it — a **locked**
+  worktree is refused too — unless `--force`. **Reap is atomic:** every refusal,
+  early or late, leaves the worktree, its window, its saved-agents line and its
+  `.fleet/ready` marker untouched, so a plain **re-run is the retry** — reach for
+  `--force` only to genuinely discard dirty or unmerged work, never as the generic
+  remedy (it disables the dirty *and* unmerged guards together).
 
 ## Leader menu (which-key)
 
@@ -196,8 +375,8 @@ one-key actions. Open it with **prefix+F** or **prefix+Space** (both work from
 any pane, including this orchestrator pane — both are prefix-table bindings, so
 plain Space typing in panes is untouched), or by pressing **bare Space while the
 dashboard pane is focused**. Press the shown key to run an action;
-**Esc/q/Space** closes. Actions are grouped **+Agents** (pick `a`, new `n`, ready
-`y`, reap `x`, orchestrator `m`, pop oldest message `p`, triage messages `t`,
+**Esc/q/Space** closes. Actions are grouped **+Agents** (pick `a`, new `n`,
+reap `x`, orchestrator `m`, pop oldest message `p`, triage messages `t`,
 rebuild `M`), **+Session**
 (save `s`, sessions `o`, reload `R`, dispatch mode `d`, quit `Q`), and **+Info** (ls `l`, keys `?`,
 rebind `c`). Those single keys are pressed **inside** the popup — fleet binds
@@ -207,7 +386,12 @@ prefix default (`n`, `x`, `s`, … ) stays intact; the only default it reclaims 
 (`fleet rebind` → `menu`); the `prefix+Space` alias is set/disabled via
 `menu-alt=` in `keybinds.conf`. `fleet keys` lists every action and its in-menu
 key; `fleet rebind` (or the menu's `c`) changes one. Per-agent verbs (msgs `e`,
-send, mode, diff, close) stay on the dashboard's selected row, not in the leader.
+ready `y`, send, mode, diff, close) stay on the dashboard's selected row, not in
+the leader — mark-ready moved off the leader menu entirely, because a leader key
+cannot know which row you mean. In the dashboard's agents view
+**`y`** toggles the ready flag on the selected agent — no confirm modal, because
+the same key undoes it, and a flagged row carries a **⚑** glyph whatever its
+live state (the `done` pill stays idle-only, so it never lies about a live agent).
 
 **Two jump actions — `a` vs `l`.** Both `pick` (`a`) and `ls` (`l`) are now
 **interactive fzf jumpers** that land you on an agent's window (Enter jumps,
