@@ -303,19 +303,35 @@ elif [ -e "$(task_file 'repo/feat_bogus')" ]; then fail 13 "bogus task was persi
 else pass 13; fi
 
 # -------------------------------------------------------------------------- 14
-# `--task main` — THE SELF-PROMOTION GUARD. Rejected, and every existing role
-# brake still reads `worker` for that pane.
-spawn repo feat/promote --task main >/dev/null 2>&1
-WP=$(wid_of "repo/feat_promote"); PP=$(pane_of "$WP")
-r_opt=$(tmux show -wqv -t "$WP" @fleet_role 2>/dev/null)
-r_env=$(tmux show-environment -t "$FLEET_SESSION" 2>/dev/null | grep '^FLEET_ROLE=' | head -1)
-r_file=$(cat "$FLEET_ROOT/.fleet/roles/$PP" 2>/dev/null)
-if [ -n "$(opt_of "$WP")" ]; then fail 14 "--task main was STORED as '$(opt_of "$WP")'"
-elif [ "$r_opt" = main ]; then fail 14 "--task main promoted @fleet_role to main"
-elif [ "$r_file" = main ]; then fail 14 "--task main promoted the roles file to main (got '$r_file')"
+# `--task main` — THE SELF-PROMOTION GUARD. `main` is HARD-REJECTED exactly like
+# `generic` (loud error, non-zero exit, NO spawn), NOT warn-and-dropped: it is
+# role vocabulary, and "rejected quietly" and "granted" must not look identical to
+# a script probing to self-promote.
+#
+# Snapshot the role namespace across the whole server BEFORE, so 14b can prove the
+# rejected value touched NOTHING — not just this (non-existent) pane. A grep for a
+# post-hoc `main` is not enough on its own: the command-center pane legitimately
+# carries @fleet_role=main, so we assert the set of main-role surfaces is UNCHANGED
+# rather than empty.
+roles_before=$(tmux list-panes -a -F '#{pane_id} #{@fleet_role}' 2>/dev/null | grep ' main$' | sort)
+rolefiles_before=$(grep -rl '^main$' "$FLEET_ROOT/.fleet/roles" 2>/dev/null | sort)
+gout=$(spawn repo feat/promote --task main 2>&1); grc=$?
+WP=$(wid_of "repo/feat_promote")
+if [ "$grc" = 0 ]; then fail 14 "--task main exited 0; a script cannot detect the rejection"
+elif [ -n "$WP" ]; then fail 14 "--task main must not spawn an agent (window $WP exists)"
+elif ! printf '%s' "$gout" | grep -qi 'main'; then fail 14 "no error naming 'main' on stderr: $gout"
 elif [ -e "$(task_file 'repo/feat_promote')" ]; then fail 14 "--task main was persisted to the tasks file"
 else pass 14; fi
-case "$r_file" in worker*) pass 14b ;; *) fail 14b "roles file is '$r_file', expected worker[:so-…]" ;; esac
+# 14b — the role namespace is UNTOUCHED: no new pane carries @fleet_role=main and no
+# new roles file says main. (Task and role are separate namespaces; the rejected
+# value must not have leaked into the role surface by any path.)
+roles_after=$(tmux list-panes -a -F '#{pane_id} #{@fleet_role}' 2>/dev/null | grep ' main$' | sort)
+rolefiles_after=$(grep -rl '^main$' "$FLEET_ROOT/.fleet/roles" 2>/dev/null | sort)
+if [ "$roles_before" != "$roles_after" ]; then
+  fail 14b "the set of @fleet_role=main panes changed: [$roles_before] -> [$roles_after]"
+elif [ "$rolefiles_before" != "$rolefiles_after" ]; then
+  fail 14b "a roles file gained 'main': [$rolefiles_before] -> [$rolefiles_after]"
+else pass 14b; fi
 
 # -------------------------------------------------------------------------- 15
 # tmux format injection, both directions.
