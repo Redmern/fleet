@@ -82,6 +82,28 @@ proof_isolate() {
   export XDG_RUNTIME_DIR="$TMPROOT/run";    mkdir -p "$XDG_RUNTIME_DIR"  # no real fleetd
   unset TMUX TMUX_PANE                                   # never inherit the live server
 
+  # AMBIENT FLEET ENV. A proof is frequently RUN FROM a fleet pane — often a
+  # sub-orchestrator's — and every var that pane carries is inherited by the
+  # `bin/fleet` under test. Each of these changes cmd_new's OBSERVABLE output, so
+  # a leak turns a green proof red in a way indistinguishable from a real spawn
+  # failure ("agent never spawned"). Scrubbed, one reason each:
+  #   FLEET_SUBORCH_ID      cmd_new owner-prefixes the window name (`d32-parked`
+  #                         instead of `parked`) and stamps @fleet_owner, so every
+  #                         `wait_window <name>` in every proof misses.
+  #   FLEET_NEW_SUBORCH_ID  gates that same branch off; leaked, it would MASK the
+  #                         prefix and also inject -e FLEET_SUBORCH_ID into spawns.
+  #   FLEET_NEW_WID_FILE    cmd_new writes the new window id to it — a path outside
+  #                         TMPROOT, i.e. a proof scribbling on the live ledger.
+  #   FLEET_HARNESS         first in harness_select's precedence, so it overrides
+  #                         the default `claude` the PATH shim below stands in for;
+  #                         the real (or a missing) harness would launch instead.
+  # Deliberately NOT scrubbed: FLEET_ROLE, FLEET_DOCS, FLEET_SELF_MERGE,
+  # FLEET_PROMPT, FLEET_AUTOCLAUDE, FLEET_HARNESS_BIN, FLEET_START_MODE,
+  # FLEET_TERM_MATCH — cmd_new only ever WRITES these onto the spawned pane with
+  # `tmux -e`; it never reads the ambient value, so they cannot alter behaviour.
+  # FLEET_SESSION/FLEET_ROOT are not unset but OVERWRITTEN below/by proof_session.
+  unset FLEET_SUBORCH_ID FLEET_NEW_SUBORCH_ID FLEET_NEW_WID_FILE FLEET_HARNESS
+
   export FLEET_ROOT="$TMPROOT/root"; mkdir -p "$FLEET_ROOT/.fleet"
 
   # A fake harness. harness.d/claude.conf's H_BIN is "claude-profile claude" and
