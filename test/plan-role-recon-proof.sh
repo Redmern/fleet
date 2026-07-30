@@ -28,7 +28,9 @@
 #       W5 escape valve; deleting it would remove the only opt-up.
 #  [11] FLEET_SUBORCH.md and SKILL.md ship in ONE commit and AGREE — a sub-orch
 #       reads both; a split would hand it contradictory instructions.
-#  [12] ZERO bin/fleet edits on this branch. Doc-only means doc-only.
+#  [12] ZERO bin/fleet edits on this branch. Doc-only means doc-only — asserted
+#       only while a doc-only change is in flight on its own branch (see the case
+#       for why it is scoped); bin/fleet must parse on every branch regardless.
 #
 # Run before the edit: RED. After: every case PASS.
 set -u
@@ -370,15 +372,44 @@ else
 fi
 
 # --- 11. ZERO bin/fleet edits -------------------------------------------------
+# SCOPED TO THE BRANCH IT DESCRIBES. "This change is doc-only" is a claim about
+# the d28 plan-agent-role branch, but the check ran against WHATEVER branch was
+# checked out — so once d28 merged, every later branch that legitimately touches
+# bin/fleet inherited a failure it could not fix except by deleting the case
+# (d31 no-auto-commit hit exactly this). A proof that fails for correct work is
+# not a proof; it is a tax on the next author.
+#
+# So: run the branch-diff assertion only while the doc-only change is IN FLIGHT
+# on its own branch (name match, or FLEET_PROOF_DOCONLY=1 to force it — use that
+# on any future doc-only branch). Everywhere else it is N/A, not unchecked: the
+# claim was verified when it mattered and the commits are now immutable history.
+# N/A therefore does NOT set SKIPPED — a permanent skip would degrade this
+# harness's own "a skip is NOT a pass" summary to "WITH SKIPS" forever, training
+# the reader to ignore it.
+#
+# What is NOT scoped away, because it is a real invariant on every branch: the
+# doc-to-code coupling this case was protecting is asserted independently by case
+# [3] (the PLAN.md / SYNTHESIS.md / PLAN-PLAIN.md filenames the docs promise must
+# still match what bin/fleet hardcodes into the GATE 1 body), and bin/fleet must
+# still parse. Both run unconditionally.
 echo "[11] doc-only: no bin/fleet diff on this branch"
-BASE=$(cd "$HERE" && git merge-base HEAD main 2>/dev/null)
-if [ -n "$BASE" ]; then
-  changed=$(cd "$HERE" && git diff --name-only "$BASE"..HEAD 2>/dev/null; cd "$HERE" && git diff --name-only HEAD 2>/dev/null)
-  if printf '%s\n' "$changed" | grep -qx 'bin/fleet'; then
-    fail "bin/fleet untouched" "bin/fleet appears in the branch diff"
-  else pass "bin/fleet untouched"; fi
+BRANCH=$(cd "$HERE" && git rev-parse --abbrev-ref HEAD 2>/dev/null)
+DOCONLY=0
+[ "${FLEET_PROOF_DOCONLY:-0}" = 1 ] && DOCONLY=1
+case "$BRANCH" in *plan-agent-role*|*plan-role-recon*) DOCONLY=1 ;; esac
+if [ "$DOCONLY" != 1 ]; then
+  skip "bin/fleet untouched" "N/A on '$BRANCH' — this asserts the d28 doc-only branch's scope, not every branch's (force with FLEET_PROOF_DOCONLY=1)"
 else
-  skip "bin/fleet untouched" "no merge-base with main"
+  BASE=$(cd "$HERE" && git merge-base HEAD main 2>/dev/null)
+  if [ -n "$BASE" ]; then
+    changed=$(cd "$HERE" && git diff --name-only "$BASE"..HEAD 2>/dev/null; cd "$HERE" && git diff --name-only HEAD 2>/dev/null)
+    if printf '%s\n' "$changed" | grep -qx 'bin/fleet'; then
+      fail "bin/fleet untouched" "bin/fleet appears in the branch diff"
+    else pass "bin/fleet untouched"; fi
+  else
+    skip "bin/fleet untouched" "no merge-base with main"
+    SKIPPED=1
+  fi
 fi
 if bash -n "$FLEETBIN" 2>/dev/null; then pass "bin/fleet parses"; else fail "bin/fleet parses" "syntax error"; fi
 
