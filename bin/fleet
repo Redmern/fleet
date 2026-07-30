@@ -262,6 +262,7 @@ agents_tsv() { # state<TAB>label<TAB>session<TAB>window_id<TAB>window_name<TAB>s
   if json=$(rpc fleet.list); then
     python3 - "$json" <<'PY'
 import json, sys, time, os
+import subprocess
 agents = json.loads(sys.argv[1]).get("agents", [])
 # Set of currently-live panes — used to tell a stale marker pane (a server
 # restart reassigned pane ids; the stamped pane matches no live agent) from a
@@ -314,6 +315,21 @@ for a in agents:
                 # siblings. The single-occupant reused-worktree restore case
                 # (count == 1) still falls through and keeps its pill.
                 ready = ""
+    # READY + DIRTY == `review`: the worker's hands are off but a human still owes
+    # a commit. DERIVED, never stored — the TSV is read positionally as exactly 9
+    # fields by three independent readers that fail SILENTLY WRONG on a 10th, so
+    # this reuses field 9 rather than adding a column. Same discriminator
+    # `cmd_reap` uses (status --porcelain, minus fleet's own untracked .fleet/),
+    # so `review` and "reap will refuse" can never disagree. Fail-silent: an
+    # unresolvable git state leaves the plain ready value alone.
+    if ready and cwd:
+        try:
+            _st = subprocess.run(["git", "-C", cwd, "status", "--porcelain"],
+                                 capture_output=True, text=True, timeout=5).stdout
+            if [l for l in _st.splitlines() if l.strip() and not l.startswith("?? .fleet/")]:
+                ready = "review"
+        except Exception:
+            pass
     print("\t".join([a.get("state","?"), label, a.get("session",""),
                      a.get("window_id",""), a.get("window_name",""),
                      f"{age//60}m{age%60:02d}s", a.get("pane_id",""), str(age), ready]))
@@ -349,6 +365,14 @@ PY
           if [ -e "$path/.fleet/ready" ]; then
             rdy=$(sed -n 's/^reason=//p' "$path/.fleet/ready" 2>/dev/null | head -1)
             rdy="${rdy:-ready}"
+            # ready + dirty == `review` (see the daemon-up path above). BOTH emission
+            # paths must derive it or the pill flips whenever fleetd is down.
+            # `timeout` mirrors the daemon-up path's timeout=5: this runs on the
+            # dashboard's render path, and a hung git (NFS, index.lock) must degrade
+            # to the plain ready value rather than freeze the whole TUI.
+            if [ -n "$(timeout 5 git -C "$path" status --porcelain 2>/dev/null | grep -vE '^\?\? \.fleet/')" ]; then
+              rdy=review
+            fi
           fi
           printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t\t%s\n' "$st" "$(agent_label "$path")" "$sess" "$wid" "$wname" "$since" "$pane" "$rdy"
         done
@@ -420,7 +444,8 @@ cmd_ls() {
       $1=="working" { c="\033[34m"; o=2 }
       {
         st=$1; extra=""
-        if ($9 != "" && $1 != "working" && $1 != "blocked") { st="done"; extra="  (ready: " $9 ")" }
+        if ($9 == "review" && $1 != "working" && $1 != "blocked") { st="review"; extra="  (staged work awaits your commit)" }
+        else if ($9 != "" && $1 != "working" && $1 != "blocked") { st="done"; extra="  (ready: " $9 ")" }
         else if ($9 != "")                                  { extra="  (ready? " $9 " — but " $1 ")" }
         printf "%d\t%s\t%s\t%s● %-8s\033[0m %-24s %-16s %s%s\n", o, $3, $4, c, st, $2, $3":"$5, $6, extra
       }' | sort -n | cut -f2-)
@@ -502,7 +527,8 @@ cmd_ls() {
       # EVERY row shifts). A placeholder keeps the field present. It must not be a
       # space — that is what collapses — so an untagged row reads "-".
       if (tg == "") tg = "-"
-      if ($9 != "" && $1 != "working" && $1 != "blocked") { st="done"; extra="  (ready: " $9 ")" }
+      if ($9 == "review" && $1 != "working" && $1 != "blocked") { st="review"; extra="  (staged work awaits your commit)" }
+      else if ($9 != "" && $1 != "working" && $1 != "blocked") { st="done"; extra="  (ready: " $9 ")" }
       else if ($9 != "")                                  { extra="  (ready? " $9 " — but " $1 ")" }
       printf "%s\t%s\t%s\t%s:%s\t%s%s\n", st, tg, $2, $3, $5, $6, extra
     }' <(printf '%s' "$_tagmap") -
@@ -680,7 +706,7 @@ scratch_wname() { # <sess> <label> -> a window name not already open in the sess
   printf '%s' "$name"
 }
 
-persist_agent() { # session dir repo branch bare base harness [self_merge] [wname] [owner]
+persist_agent() { # session dir repo branch bare base harness [self_merge] [wname] [owner] [autocommit]
   local sess="$1" f; f=$(agents_file "$sess"); mkdir -p "$(dirname "$f")" 2>/dev/null
   [ -f "$f" ] && { awk -F'\t' -v d="$2" '$1!=d' "$f" >"$f.tmp" 2>/dev/null && mv "$f.tmp" "$f"; }
   # Trailing fields are optional, read back empty on legacy lines: self_merge (col 7,
@@ -688,7 +714,20 @@ persist_agent() { # session dir repo branch bare base harness [self_merge] [wnam
   # name as cmd_new chose it (carries the d<N>- prefix for a sub-orch-owned worker);
   # owner is the bare so-d<N> @fleet_owner stamp. cmd_restore matches by wname and
   # re-applies owner so a d<N>-prefixed worker round-trips instead of duplicate/orphan.
-  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$2" "$3" "$4" "$5" "$6" "${7:-claude}" "${8:-0}" "${9:-}" "${10:-}" >>"$f"
+  # autocommit (col 10) is APPEND-ONLY AND CONDITIONAL: written only when it is 1
+  # (the non-default). A default agent's line therefore stays EXACTLY 9 fields,
+  # byte-identical to what every previous version wrote — which matters because a
+  # pacman-installed copy of fleet runs alongside the dev symlink, so an older
+  # `cmd_restore` (9 `read` vars, non-whitespace IFS) can be parsing this same file
+  # right now: its last var would absorb a 10th column into `owner` and mangle the
+  # d<N>- window prefix. An empty/absent column reads back as the SAFE default
+  # (no-commit), so the failure mode of any skew is "an autocommit grant is not
+  # restored", never "a worker silently regains commit rights".
+  if [ "${11:-0}" = 1 ]; then
+    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t1\n' "$2" "$3" "$4" "$5" "$6" "${7:-claude}" "${8:-0}" "${9:-}" "${10:-}" >>"$f"
+  else
+    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$2" "$3" "$4" "$5" "$6" "${7:-claude}" "${8:-0}" "${9:-}" "${10:-}" >>"$f"
+  fi
 }
 
 cmd_forget() { # forget <dir> — drop a saved agent (called by the dashboard on teardown)
@@ -857,6 +896,25 @@ cmd_selfmerge() { # on | off | status — project-wide worker self-merge toggle 
   esac
 }
 
+cmd_autocommit() { # on | off | status — project-wide worker commit permission (spawn-time)
+  # POSITIVE polarity, unlike `selfmerge`'s marker: presence of
+  # <root>/.fleet/autocommit means commits are ALLOWED. Absent (the default) means
+  # workers stage and never commit. Positive polarity is deliberate — the safe
+  # state must be the state of an untouched project, so a fleet that has never
+  # heard of this flag gets the new behaviour without a migration step.
+  local sub="${1:-status}" root; root=$(fleet_root 2>/dev/null) || { echo "autocommit: (not inside a fleet session)"; return 0; }
+  local marker="$root/.fleet/autocommit"
+  case "$sub" in
+    on)  mkdir -p "$root/.fleet" 2>/dev/null; : >"$marker" 2>/dev/null || true
+         echo "autocommit: ON for this project (newly-spawned workers may commit)" ;;
+    off) rm -f "$marker" 2>/dev/null || true
+         echo "autocommit: off for this project (newly-spawned workers stage only; the human commits)" ;;
+    *)   if [ -e "$marker" ]; then echo "autocommit: ON for this project (newly-spawned workers may commit)";
+         else echo "autocommit: off (default — workers stage with 'git add -A'; the human reviews and commits)"; fi
+         echo "note: spawn-time only — affects workers spawned from now on; existing panes keep their grant. Override per-agent with: fleet new --autocommit | --no-autocommit" ;;
+  esac
+}
+
 cmd_restore() { # respawn saved agents whose windows are gone
   # project_session: must name the same file cmd_new's persist_agent wrote. Run
   # from a parked pane, session_name would look for "<sess>_hidden.agents" and
@@ -868,11 +926,11 @@ cmd_restore() { # respawn saved agents whose windows are gone
   # unlike pane cwd which the dashboard/other panes can share.
   local openwins; openwins=$(tmux list-windows -t "$sess" -F '#{window_name}' 2>/dev/null)
   local root; root=$(fleet_root 2>/dev/null) || root=""   # for the durable task tag
-  local dir repo branch bare base harness self_merge wname owner n=0
+  local dir repo branch bare base harness self_merge wname owner autocommit n=0
   # Translate field-separating TABs to US (\037) so `read` with a NON-whitespace
   # IFS preserves EMPTY columns (e.g. an empty base, col 5). `IFS=$'\t' read`
   # collapses tab runs and drops empties, shifting every later field one left.
-  while IFS=$'\037' read -r dir repo branch bare base harness self_merge wname owner; do
+  while IFS=$'\037' read -r dir repo branch bare base harness self_merge wname owner autocommit; do
     [ -n "$dir" ] && [ -n "$repo" ] && [ -n "$branch" ] || continue
     # Match by the PERSISTED final window name (carries a d<N>- prefix for a
     # sub-orch-owned worker); fall back to the legacy reconstruction for pre-upgrade
@@ -886,6 +944,9 @@ cmd_restore() { # respawn saved agents whose windows are gone
     # Re-apply the EXACT persisted grant explicitly (default is now 1, and a
     # project marker could flip it) so a restored agent keeps what it had.
     if [ "$self_merge" = 1 ]; then args+=(--self-merge); else args+=(--no-self-merge); fi
+    # Same for the commit grant (col 10, absent on every legacy line). An empty
+    # column MUST map to the safe default, so only an explicit "1" re-grants.
+    if [ "$autocommit" = 1 ]; then args+=(--autocommit); else args+=(--no-autocommit); fi
     # Re-pass the task tag from the DURABLE file (the window option died with the
     # tmux server; nothing is read from the .agents line, so old files are fine).
     # task_of re-validates, so a garbage file just omits the flag.
@@ -1095,7 +1156,7 @@ inject_secrets() { # <repo> <dir>
 # ---- new ----------------------------------------------------------------------
 
 cmd_new() {
-  local repo="" branch="" prompt="" bare=0 base="" harness="" scratch=0 switch=0 mode="" self_merge=1 sm_flag="" task=""
+  local repo="" branch="" prompt="" bare=0 base="" harness="" scratch=0 switch=0 mode="" self_merge=1 sm_flag="" task="" autocommit=0 ac_flag=""
   while [ $# -gt 0 ]; do
     case "$1" in
       -p) prompt="$2"; shift 2 ;;
@@ -1107,6 +1168,8 @@ cmd_new() {
       --harness|-h) harness="$2"; shift 2 ;;
       --self-merge) sm_flag=1; shift ;;      # force merge/push ON for this worker (overrides the project default)
       --no-self-merge) sm_flag=0; shift ;;   # force merge/push OFF for this worker (overrides the project default)
+      --autocommit) ac_flag=1; shift ;;      # force `git commit` ALLOWED for this worker (overrides the project default)
+      --no-autocommit) ac_flag=0; shift ;;   # force `git commit` BLOCKED for this worker (overrides the project default)
       --mode) mode="$2"; shift 2 ;;   # override start --permission-mode (e.g. bypassPermissions) — not reachable via Shift+Tab
       -*) die "unknown flag $1" ;;
       *) if [ -z "$repo" ]; then repo="$1"; elif [ -z "$branch" ]; then branch="$1"; else die "extra arg $1"; fi; shift ;;
@@ -1177,6 +1240,15 @@ cmd_new() {
   [ -e "$root/.fleet/no-self-merge" ] && self_merge=0
   [ -n "$sm_flag" ] && self_merge="$sm_flag"
 
+  # Autocommit default is OFF (workers stage, the human commits). POSITIVE marker
+  # polarity — see cmd_autocommit — so an untouched project gets the safe default
+  # with no migration. An explicit --autocommit / --no-autocommit overrides either
+  # way. Frozen into the pane env at spawn (like FLEET_SELF_MERGE): no live re-read,
+  # so flipping the project marker never changes an already-running pane.
+  autocommit=0
+  [ -e "$root/.fleet/autocommit" ] && autocommit=1
+  [ -n "$ac_flag" ] && autocommit="$ac_flag"
+
   if [ "$scratch" = 1 ]; then
     # repo-less scratch agent: no repo, no branch, no worktree. Always a plain
     # agent pane (nothing to edit in nvim), launched at the project root. The
@@ -1197,7 +1269,7 @@ cmd_new() {
     docs="$root/.fleet/notes/scratch/${repo:-scratch}"
     mkdir -p "$docs" 2>/dev/null || true
   else
-    [ -n "$repo" ] && [ -n "$branch" ] || die "usage: fleet new <repo> <branch> [-p prompt] [--bare] [--switch|-s] [--base branch] [--harness|-h name] [--self-merge|--no-self-merge] [--mode default|acceptEdits|plan|auto|bypassPermissions]  (or: fleet new --scratch [label] for a repo-less agent)"
+    [ -n "$repo" ] && [ -n "$branch" ] || die "usage: fleet new <repo> <branch> [-p prompt] [--bare] [--switch|-s] [--base branch] [--harness|-h name] [--self-merge|--no-self-merge] [--autocommit|--no-autocommit] [--mode default|acceptEdits|plan|auto|bypassPermissions]  (or: fleet new --scratch [label] for a repo-less agent)"
     repo_base=$(resolve_repo "$root" "$repo") || die "repo '$repo' not found under $root"
     local branchdir="${branch//\//_}" anchor=""
     local is_bare_repo; is_bare_repo=$(git -C "$repo_base" rev-parse --is-bare-repository 2>/dev/null)
@@ -1344,7 +1416,7 @@ $(ready_instructions)"
       # means THIS scratch pane IS a sub-orch: carry FLEET_SUBORCH_ID=so-<id> in its env
       # so a worker it later spawns inherits the owner edge (Phase B). Plain scratch /
       # worker spawns leave it unset.
-      local _eargs=(-e FLEET_ROLE=worker -e FLEET_DOCS="$docs" -e FLEET_SELF_MERGE="$self_merge")
+      local _eargs=(-e FLEET_ROLE=worker -e FLEET_DOCS="$docs" -e FLEET_SELF_MERGE="$self_merge" -e FLEET_AUTOCOMMIT="$autocommit")
       [ -n "${FLEET_NEW_SUBORCH_ID:-}" ] && _eargs+=(-e FLEET_SUBORCH_ID="$FLEET_NEW_SUBORCH_ID")
       # has-session||new-session is TOCTOU: two concurrent scratch spawns when the
       # hidden session is absent both miss has-session and race new-session — the
@@ -1376,7 +1448,8 @@ $(ready_instructions)"
       # $psess, not $sess: a worker spawned BY a sub-orch must land on the
       # human's bar, not in the sub-orch's parking session.
       win_id=$(tmux new-window -d -P -F '#{window_id}' -t "$psess" -n "$wname" -c "$dir" \
-        -e FLEET_ROLE=worker -e FLEET_DOCS="$docs" -e FLEET_SELF_MERGE="$self_merge" "${argv[@]}")
+        -e FLEET_ROLE=worker -e FLEET_DOCS="$docs" -e FLEET_SELF_MERGE="$self_merge" \
+        -e FLEET_AUTOCOMMIT="$autocommit" "${argv[@]}")
     fi
   else
     # nvim pane: claude autostarts via claudecode.nvim; other harnesses open in a
@@ -1386,6 +1459,7 @@ $(ready_instructions)"
     # $psess, not $sess — same reason as the bare-worker branch above.
     win_id=$(tmux new-window -d -P -F '#{window_id}' -t "$psess" -n "$wname" -c "$dir" \
       -e FLEET_ROLE=worker -e FLEET_DOCS="$docs" -e FLEET_SELF_MERGE="$self_merge" \
+      -e FLEET_AUTOCOMMIT="$autocommit" \
       -e FLEET_AUTOCLAUDE="$([ "$H_NVIM_PLUGIN" = 1 ] && echo 1 || echo 0)" \
       -e FLEET_HARNESS="$H_NAME" -e FLEET_HARNESS_BIN="$hbin${H_ARGS:+ $H_ARGS}" \
       -e FLEET_TERM_MATCH="$H_TERM_MATCH" -e FLEET_PROMPT="$prompt" \
@@ -1510,7 +1584,7 @@ $(ready_instructions)"
   # sub-orch's parked name wrote to "<sess>_hidden.agents", which nothing ever
   # reads — the worker was un-restorable after a tmux restart and its line
   # immortal (`fleet forget` a no-op). Writer and readers must agree.
-  [ "$scratch" = 1 ] || persist_agent "$psess" "$dir" "$(basename "$repo_base")" "$branch" "$bare" "$base" "$H_NAME" "$self_merge" "$wname" "$_owner"
+  [ "$scratch" = 1 ] || persist_agent "$psess" "$dir" "$(basename "$repo_base")" "$branch" "$bare" "$base" "$H_NAME" "$self_merge" "$wname" "$_owner" "$autocommit"
   sync_main_tiles "$psess" 2>/dev/null || true
 }
 
@@ -2351,7 +2425,7 @@ cmd_gate() {
     post)    gate_post    "$@" ;;   # compose + enqueue a gate message (sev warn)
     park)    gate_park    "$@" ;;   # mark a sub-orch ledger gate{1,2}-wait (reap-guard)
     waiting) gate_waiting "$@" ;;   # list sub-orchs parked at a gate (reap consults this)
-    *) die "usage: fleet gate parse|post <1|2>|park <id> <1|2>|waiting" ;;
+    *) die "usage: fleet gate parse|post <1|2> [-w <worktree>]|park <id> <1|2>|waiting" ;;
   esac
 }
 
@@ -2374,16 +2448,28 @@ gate_parse() { # parse [file]
   printf '\n'
 }
 
+# Best-effort worktree lookup for a dispatch slug, so the GATE 2 zero-commit
+# precondition works without the caller having to pass -w. Matches the saved-agents
+# line whose BRANCH is <slug> or ends in /<slug> (cmd_new names impl branches
+# `fleet/<slug>`). Fail-silent: no match prints nothing and the check is skipped.
+gate_worktree_for_slug() { # <slug>
+  local slug="${1:-}"; [ -n "$slug" ] || return 0
+  local sess; sess=$(session_name 2>/dev/null) || return 0
+  local f; f=$(agents_file "$sess"); [ -f "$f" ] || return 0
+  awk -F'\t' -v s="$slug" '$3==s || $3 ~ ("/" s "$") {print $1; exit}' "$f" 2>/dev/null
+}
+
 # Compose + enqueue a gate message. Posted at sev=warn so the desktop notify fires
 # (info would be silent). Body is SHORT (sentinel + pointer + digest) because the body
 # is what gets pasted into the sub-orch on pop. The GATE 2 target defaults to the
 # project integration-branch and is frozen into the sentinel.
-gate_post() { # post <1|2> --slug S [--target T] [--summary "…"] [--plan FILE] [-d <id>]
+gate_post() { # post <1|2> --slug S [--target T] [--summary "…"] [--plan FILE] [-d <id>] [-w <worktree>]
   local gate="${1:-}"; [ $# -gt 0 ] && shift
   case "$gate" in 1|2) ;; *) die "usage: fleet gate post <1|2> --slug S [--target T] [--summary …]" ;; esac
-  local slug="" target="" summary="" plan="" disp="-"
+  local slug="" target="" summary="" plan="" disp="-" wt=""
   while [ $# -gt 0 ]; do
     case "$1" in
+      -w|--worktree) wt="$2"; shift 2 ;;
       --slug)        slug="$2"; shift 2 ;;
       --target)      target="$2"; shift 2 ;;
       --summary)     summary="$2"; shift 2 ;;
@@ -2424,6 +2510,38 @@ In one paragraph: ${summary:-<see plan>}.
 ▸ Or reply with changes to revise the plan (nothing is built yet)."
   else
     [ -n "$target" ] || target=$(cmd_integration_branch)
+    # ZERO-COMMIT PRECONDITION. Popping a GATE 2 message is what makes the sub-orch
+    # merge S -> T and push. With a no-commit worker the merge is a silent
+    # `Already up to date`, the push is a no-op, and the ledger still reaches
+    # `done` — the pipeline declaring shipped work that does not exist. So refuse
+    # to POST gate 2 at all until the branch actually carries commits. Resolve the
+    # worktree from -w, else from the saved-agents line for this slug's branch.
+    [ -n "$wt" ] || wt=$(gate_worktree_for_slug "$slug")
+    if [ -n "$wt" ] && [ -d "$wt" ]; then
+      local _bref="" _ahead=""
+      if   git -C "$wt" rev-parse --verify -q "$target"        >/dev/null 2>&1; then _bref="$target"
+      elif git -C "$wt" rev-parse --verify -q "origin/$target" >/dev/null 2>&1; then _bref="origin/$target"; fi
+      if [ -n "$_bref" ]; then
+        _ahead=$(git -C "$wt" rev-list --count "$_bref..HEAD" 2>/dev/null)
+        if [ "${_ahead:-0}" = 0 ]; then
+          local _n; _n=$(uncommitted_status "$wt" | grep -c . 2>/dev/null)
+          printf 'fleet gate post 2: REFUSED — %s has NO commits ahead of %s, so merging it would ship nothing.\n' "$slug" "$target" >&2
+          printf '  %s uncommitted file(s) are staged at %s.\n' "${_n:-0}" "$wt" >&2
+          printf '  Review them (fleet diff-view %s), commit them yourself (git -C %s commit), then re-post gate 2.\n' "$wt" "$wt" >&2
+          # stderr reaches the SUB-ORCH, not the human — and the thing being waited
+          # on is a human commit, so a refusal that only the machine can see stalls
+          # the dispatch in silence. Escalate it as a needs-human inbox message
+          # (sev blocked => desktop notify), same channel the gate itself uses.
+          inbox_put -d "$disp" --sev blocked \
+            -t "GATE 2 blocked — $slug has nothing committed" \
+            -m "The implementation is finished and STAGED, but nothing is committed, so merging $slug -> $target would ship nothing.
+Review it:  fleet diff-view $wt
+Commit it:  git -C $wt commit
+Then the sub-orch can re-post GATE 2. (Agents no longer commit — see 'fleet autocommit'.)" 2>/dev/null || true
+          return 3
+        fi
+      fi
+    fi
     sentinel="[FLEET-GATE:2 slug=$slug action=merge target=$target]"
     [ -n "$plan" ] || plan="_reports/$slug/DONE-PLAIN.md"
     title="GATE 2 — $slug done, tests green: ready to merge → $target"
@@ -2431,6 +2549,7 @@ In one paragraph: ${summary:-<see plan>}.
 $reorient
 Details: $plan
 HOW THE TESTS PROVE IT: ${summary:-<see details>}.
+Review the diff before you pop${wt:+ (worktree: $wt)} — nothing merges until you do.
 ▸ POP this message = \"merge + push to $target\".
 ▸ Or run the manual steps, then pop to ship, or reply with what's broken to loop."
   fi
@@ -3638,13 +3757,145 @@ dispatch_status() { # report whether the hook is wired + the ledger rollup
 # Worded to gate on THE TASK being complete, never on "the agent stopped talking":
 # a Stop-hook auto-mark was rejected precisely because idle is not done (a worker
 # is idle at the end of every turn, including the one where it asks a question).
+# NO-AUTO-COMMIT (d31): the worker STAGES and stops. `git add -A` is not
+# `git commit`, and `git diff HEAD` includes the index — so staged work is already
+# visible in every review surface, still counts as dirty for `cmd_reap`'s guard,
+# and is one `git commit` away for the human. Staging is therefore mandatory, not
+# optional: anything left untracked-and-unstaged is invisible to the human's diff
+# AND outside the checkpoint ref (which snapshots the INDEX), i.e. genuinely at
+# risk. `fleet ready` no longer means "reapable" — it means "hands off, your turn".
 ready_instructions() {
   cat <<'EOF'
 --- fleet ---
-When the work you were spawned for is COMPLETE and committed, run `fleet ready`
-from inside this worktree. That flags the worktree for deletion by `fleet reap`.
+When the work you were spawned for is COMPLETE: run `git add -A` to stage
+everything, and do NOT commit. A human reviews the staged work and makes the
+commit. Then run `fleet ready` from inside this worktree to signal you are done.
 Do NOT run it if you are pausing, blocked, or asking a question — only when done.
 EOF
+}
+
+# ---- uncommitted-work surfaces (no-auto-commit, d31) --------------------------
+# In no-commit mode the interesting work lives in the INDEX and the working tree,
+# never in a commit. Three helpers own that: an honest diff (what the human reads),
+# a patch/tarball export (what stands between --force and data loss), and a
+# checkpoint ref (the reflog substitute a commit used to provide).
+
+# The set of changes that COUNTS as uncommitted work. Exactly `cmd_reap`'s dirty
+# expression — fleet's own untracked .fleet/ metadata is excluded, everything else
+# (staged, unstaged, untracked, tracked-modified under .fleet/) counts. One
+# definition, so the diff view, the `review` pill, the reap refusal and the export
+# can never disagree about whether a worktree has work in it.
+uncommitted_status() { # <dir>
+  git -C "$1" status --porcelain 2>/dev/null | grep -vE '^\?\? \.fleet/'
+}
+
+cmd_diff_view() { # diff-view [--color] <dir> — the HONEST diff of uncommitted work
+  # `git diff HEAD` alone is a LIE in no-commit mode: it shows staged AND unstaged
+  # changes but NOT untracked new files, so an agent whose whole job was to create
+  # files printed "working tree clean vs HEAD" while the git pill two inches away
+  # correctly said dirty. Three parts, and the clean/dirty decision keyed off
+  # `status --porcelain` (the same source the pill uses) rather than off whether
+  # `diff HEAD` happened to be empty.
+  local color=0
+  while [ $# -gt 0 ]; do
+    case "$1" in --color) color=1; shift ;; *) break ;; esac
+  done
+  local dir="${1:-$PWD}"
+  git -C "$dir" rev-parse --is-inside-work-tree >/dev/null 2>&1 \
+    || { echo "not a git worktree: $dir"; return 0; }
+  local cargs=(); [ "$color" = 1 ] && cargs=(-c color.ui=always)
+  if [ -z "$(uncommitted_status "$dir")" ]; then
+    echo "working tree clean — nothing uncommitted (the human's commit, if any, is already made)"
+    return 0
+  fi
+  git -C "$dir" "${cargs[@]}" diff --stat HEAD 2>/dev/null || true
+  # Untracked files never reach `diff --stat`, so name them explicitly — otherwise
+  # the summary undercounts exactly the files most at risk.
+  # One name per line, and NEVER unquoted: `printf '  %s\n' $u` word-splits on
+  # spaces and pathname-EXPANDS metacharacters, which mis-names files on the one
+  # surface whose entire job is telling the human the truth about them.
+  if [ -n "$(git -C "$dir" ls-files -o --exclude-standard 2>/dev/null | head -1)" ]; then
+    echo; echo "untracked (not staged — a worker should have run 'git add -A'):"
+    git -C "$dir" ls-files -o --exclude-standard 2>/dev/null | sed 's/^/  /'
+  fi
+  echo
+  git -C "$dir" "${cargs[@]}" diff HEAD 2>/dev/null || true
+  # `diff --no-index` against /dev/null renders an untracked file as a full
+  # addition hunk. It exits 1 whenever it finds a difference (always, here), so
+  # every invocation is `|| true`.
+  local f
+  while IFS= read -r -d '' f; do
+    [ -n "$f" ] || continue
+    git -C "$dir" "${cargs[@]}" diff --no-index -- /dev/null "$f" 2>/dev/null || true
+  done < <(git -C "$dir" ls-files -o --exclude-standard -z 2>/dev/null)
+}
+
+cmd_export_uncommitted() { # export-uncommitted <dir> [destdir] — patch + tarball, OUTSIDE the worktree
+  # The one thing standing between a --force teardown and unrecoverable loss. Both
+  # destructive paths (cmd_reap's MUTATE phase and the dashboard's `x`) call this
+  # BEFORE the point of no return and refuse if it fails. Prints the dest dir.
+  local dir="${1:-}" dest="${2:-}"
+  [ -n "$dir" ] && [ -d "$dir" ] || { echo "export-uncommitted: no such dir: $dir" >&2; return 1; }
+  git -C "$dir" rev-parse --is-inside-work-tree >/dev/null 2>&1 \
+    || { echo "export-uncommitted: not a git worktree: $dir" >&2; return 1; }
+  [ -n "$(uncommitted_status "$dir")" ] || return 0   # nothing to save — success, no dir
+  if [ -z "$dest" ]; then
+    local r; r=$(fleet_root 2>/dev/null) || r=""
+    [ -n "$r" ] || r=$(dirname "$dir")
+    local br; br=$(git -C "$dir" rev-parse --abbrev-ref HEAD 2>/dev/null); br="${br//\//_}"
+    dest="$r/.fleet/salvage/${br:-detached}__$(date +%s 2>/dev/null)"
+  fi
+  # Must live OUTSIDE the worktree — an export written inside it dies with it, and
+  # would dirty the tree on the way (the orphan-bug shape).
+  case "$(realpath "$dest" 2>/dev/null || echo "$dest")/" in
+    "$(realpath "$dir" 2>/dev/null || echo "$dir")"/*)
+      echo "export-uncommitted: refusing to export INSIDE the worktree ($dest)" >&2; return 1 ;;
+  esac
+  mkdir -p "$dest" 2>/dev/null || { echo "export-uncommitted: cannot create $dest" >&2; return 1; }
+  # `diff HEAD` carries staged AND unstaged tracked changes (incl. staged new
+  # files); the tarball carries what is untracked, which no patch can express.
+  git -C "$dir" diff HEAD >"$dest/uncommitted.patch" 2>/dev/null \
+    || { echo "export-uncommitted: git diff failed" >&2; return 1; }
+  # PIPE the NUL-separated list straight into tar — NEVER through $( ). Command
+  # substitution silently STRIPS NUL bytes, so two untracked files came out as one
+  # concatenated bogus name, tar failed, and the export refused: reap --force and
+  # the dashboard's `x` could then never complete, and the salvage promise was void
+  # exactly when there was most to salvage.
+  if [ -n "$(git -C "$dir" ls-files -o --exclude-standard 2>/dev/null | head -1)" ]; then
+    git -C "$dir" ls-files -o --exclude-standard -z 2>/dev/null \
+      | tar -czf "$dest/untracked.tgz" -C "$dir" --null -T - 2>/dev/null \
+      || { echo "export-uncommitted: tar failed" >&2; return 1; }
+  else
+    tar -czf "$dest/untracked.tgz" -C "$dir" -T /dev/null 2>/dev/null || true
+  fi
+  [ -f "$dest/uncommitted.patch" ] && [ -f "$dest/untracked.tgz" ] \
+    || { echo "export-uncommitted: export incomplete" >&2; return 1; }
+  printf '%s\n' "$dest"
+}
+
+write_checkpoint_ref() { # <worktree> — snapshot the INDEX into refs/fleet/checkpoint/<slug>
+  # A commit is also a safety net (reflog, fsck recovery), and no-commit mode
+  # removes it. So fleet writes its own: `write-tree` + `commit-tree` produce a
+  # real, GC-anchored commit object — but the ref lives under refs/fleet/, NEVER on
+  # the worker's branch, so the branch stays commit-free (want (a) holds literally)
+  # and the human's history still receives exactly one, human-authored commit.
+  # Snapshots the INDEX, which is precisely why the seeded instruction mandates
+  # `git add -A`: anything unstaged is outside this net. Fail-silent throughout.
+  local dir="${1:-}"; [ -n "$dir" ] || return 0
+  git -C "$dir" rev-parse --is-inside-work-tree >/dev/null 2>&1 || return 0
+  local head; head=$(git -C "$dir" rev-parse -q --verify HEAD 2>/dev/null) || return 0
+  local tree; tree=$(git -C "$dir" write-tree 2>/dev/null) || return 0
+  [ -n "$tree" ] || return 0
+  # Nothing staged beyond HEAD → no snapshot worth taking (and no ref churn).
+  [ "$tree" = "$(git -C "$dir" rev-parse -q --verify "$head^{tree}" 2>/dev/null)" ] && return 0
+  local slug; slug=$(git -C "$dir" rev-parse --abbrev-ref HEAD 2>/dev/null); slug="${slug//\//_}"
+  [ -n "$slug" ] && [ "$slug" != HEAD ] || slug="detached-$head"
+  local c
+  c=$(git -C "$dir" -c user.name=fleet -c user.email=fleet@localhost \
+        commit-tree "$tree" -p "$head" -m "fleet checkpoint: staged work on $slug (NOT a branch commit)" 2>/dev/null) || return 0
+  [ -n "$c" ] || return 0
+  git -C "$dir" update-ref "refs/fleet/checkpoint/$slug" "$c" 2>/dev/null || return 0
+  printf 'refs/fleet/checkpoint/%s\n' "$slug"
 }
 
 cmd_ready() { # ready [<agent>] [-m "reason"] [--clear]
@@ -3700,6 +3951,10 @@ cmd_ready() { # ready [<agent>] [-m "reason"] [--clear]
   fi
   mkdir -p "$root/.fleet" 2>/dev/null || true
   reason=$(printf '%s' "$reason" | tr '\t\n' '  ')   # keep the marker a clean line
+  # `review` is a DERIVED sentinel in TSV field 9 (ready + dirty), and that field
+  # doubles as the free-text reason — so a literal `-m review` would forge it on a
+  # clean worktree. Disambiguate at the single write site.
+  [ "$reason" = review ] && reason="review (note)"
   {
     printf 'ts=%s\n' "$(date -Is 2>/dev/null || date)"
     printf 'by=%s\n' "$by"
@@ -3715,7 +3970,23 @@ cmd_ready() { # ready [<agent>] [-m "reason"] [--clear]
   # conditional reason line, which is "false" when no -m was given even though
   # the writes succeeded. Check the actual outcome — a non-empty marker file.
   if [ -s "$marker" ]; then
-    echo "marked ready for deletion: $root${reason:+ ($reason)}"
+    # `fleet ready` no longer means "safe to delete" — it means the worker's hands
+    # are off. Whether it is ALSO reapable is derived from the tree, so say which
+    # of the two this is instead of asserting the old, now-usually-false one.
+    local _dirty _n
+    _dirty=$(uncommitted_status "$root")
+    _n=$(printf '%s\n' "$_dirty" | grep -c . 2>/dev/null)
+    if [ -n "$_dirty" ]; then
+      echo "marked ready (WORK AWAITS YOUR COMMIT): $root${reason:+ ($reason)}"
+      echo "  $_n uncommitted file(s) — nothing is committed on this branch."
+      echo "  review:  fleet diff-view $root      commit:  git -C $root commit"
+      echo "  'fleet reap' will REFUSE this worktree until the commit is made."
+      # Recovery net for the window between "worker done" and "human commits".
+      local _ck; _ck=$(write_checkpoint_ref "$root" 2>/dev/null)
+      [ -n "$_ck" ] && echo "  checkpoint: $_ck (recovery only — not on your branch)"
+    else
+      echo "marked ready for deletion: $root${reason:+ ($reason)}"
+    fi
     # SOFT warn only. `cmd_reap` removes LINKED worktrees; a plain working repo
     # (used in place, no worktree layout) can be flagged and shown `done` but will
     # never be reaped — a permanent tombstone. Say so, but still write the marker:
@@ -3812,9 +4083,16 @@ cmd_reap() { # reap [<target>] [--force] — remove worktrees flagged ready
       # "R  ORIG -> DEST", "UU ") visible to this guard, so real uncommitted user
       # work inside .fleet/ refuses HERE, before anything is killed, instead of
       # sneaking through to the removal and taking the late-skip path.
-      local dirty; dirty=$(git -C "$dir" status --porcelain 2>/dev/null | grep -vE '^\?\? \.fleet/')
+      # Dirty is the NORMAL end state now (workers stage and stop), so this message
+      # must coach the fix — commit it — and must NOT advertise `--force`, which
+      # drops six refusals at once and used to be the shortest path to losing the
+      # very work the human had not reviewed yet.
+      local dirty; dirty=$(uncommitted_status "$dir")
       if [ -n "$dirty" ]; then
-        echo "skip   $lbl: $(printf '%s\n' "$dirty" | grep -c .) uncommitted file(s) (use --force)"; continue
+        echo "skip   $lbl: $(printf '%s\n' "$dirty" | grep -c .) uncommitted file(s) — review and commit them, then re-run reap"
+        echo "         review: fleet diff-view $dir"
+        echo "         commit: git -C $dir commit"
+        continue
       fi
       local b="${base:-}"
       [ -n "$b" ] || b=$(git -C "$dir" symbolic-ref --short refs/remotes/origin/HEAD 2>/dev/null | sed 's|^origin/||')
@@ -3915,6 +4193,20 @@ cmd_reap() { # reap [<target>] [--force] — remove worktrees flagged ready
       rm -f "$dir/.fleet/ready" 2>/dev/null
       rmdir "$dir/.fleet/notes" "$dir/.fleet" 2>/dev/null || true
     fi
+    # 2b. SALVAGE. Nothing below this line is recoverable, and in no-commit mode a
+    #    reaped worktree can be carrying the ONLY copy of real work (no commit, no
+    #    reflog). So export a patch + an untracked tarball OUTSIDE the worktree
+    #    first, and treat a failed export exactly like a failed archive: refuse,
+    #    leave everything intact, a plain re-run is the retry. Reached only with
+    #    --force on the dirty path (the non-force path already refused above), but
+    #    unconditional here so no future caller can slip past it.
+    local salvage=""
+    if [ -n "$(uncommitted_status "$dir")" ]; then
+      write_checkpoint_ref "$dir" >/dev/null 2>&1 || true
+      if ! salvage=$(cmd_export_uncommitted "$dir" 2>/dev/null); then
+        echo "skip   $lbl: could not export uncommitted work — worktree left intact"; continue
+      fi
+    fi
     # 3. POINT OF NO RETURN.
     local main; main=$(git -C "$dir" worktree list --porcelain 2>/dev/null | awk '/^worktree /{print $2; exit}')
     local rmflag=""; [ "$force" = 1 ] && rmflag="--force"
@@ -3941,6 +4233,7 @@ cmd_reap() { # reap [<target>] [--force] — remove worktrees flagged ready
       safe_kill_window "$win"
       cmd_forget "$dir"
       echo "reaped $lbl$bnote"; reaped=$((reaped+1))
+      [ -n "$salvage" ] && echo "salvaged $lbl uncommitted work -> $salvage"
       [ -n "$stage" ] && echo "archived $lbl notes -> $stage"
     else
       # FAILURE — put back exactly what we deleted (step 2) and leave the window,
@@ -5712,12 +6005,12 @@ fleet — agent fleet manager (tmux + nvim + Claude Code)
   fleet up [name|path]   boot project session + daemon + command center (auto-restores saved agents; --no-restore for main only, --tmuxinator to load a same-named tmuxinator layout)
   fleet save [name]      save the current session as a reusable project alias (fleet up <name>)
   fleet restore          respawn saved agents from a previous session
-  fleet new <repo> <br>  spawn agent (worktree + window + claude) [-p prompt] [--bare] [--switch|-s] [--base br] [-h harness] [--self-merge|--no-self-merge] [--task|-T research|plan|impl|test|scratch]  (workers may merge/push by default)
+  fleet new <repo> <br>  spawn agent (worktree + window + claude) [-p prompt] [--bare] [--switch|-s] [--base br] [-h harness] [--self-merge|--no-self-merge] [--autocommit|--no-autocommit] [--task|-T research|plan|impl|test|scratch]  (workers may merge/push, but NOT commit, by default)
   fleet new --scratch    spawn a repo-less agent (no repo/branch/worktree) [label] [-p prompt] [-h harness]
   fleet ls               list THIS project's agents and states (--all|-a = every project on the server; --pick = fzf jump-to-agent popup, Enter jumps)
   fleet pick             fzf jump-to-agent
   fleet send <a> "msg"   send message to an agent's claude
-  fleet ready [a] [-m r]  flag a worktree done/ready for deletion (no arg = the one you're in) [--clear]
+  fleet ready [a] [-m r]  flag a worktree done — the worker's hands are off (no arg = the one you're in) [--clear]
   fleet reap             remove all worktrees flagged ready (skips unmerged/dirty/unread-needs-human unless --force)
   fleet inbox            worker→orchestrator summaries (bare=pager that consumes; list/read peek; put|count|gc|clear). In the dashboard: 'e' on an agent row opens its messages.
   fleet browser [u] [a]  drive a real Chromium against the dev app (headless; --watch = visible tiled window) [url|port] [agent]
@@ -5726,6 +6019,8 @@ fleet — agent fleet manager (tmux + nvim + Claude Code)
   fleet cost <a>         show an agent's token spend
   fleet guard on|off     test/CI write-guard (asks before editing tests/CI/lockfiles)
   fleet selfmerge on|off project-wide worker self-merge toggle (on=default; off blocks new workers' merge/push)
+  fleet autocommit on|off project-wide worker COMMIT toggle (off=default: workers stage with 'git add -A'; the human commits)
+  fleet diff-view [dir]  the honest diff of uncommitted work (staged + unstaged + untracked)
   fleet mode <a>         cycle an agent's Claude permission mode (Shift+Tab)
   fleet dispatch <id>    spawn the ephemeral sub-orchestrator for a ledger id (zero LLM)
   fleet dispatch enable  OPT-IN: wire the UserPromptSubmit dispatch hook (enable|disable|status)
@@ -5771,6 +6066,10 @@ case "${1:-}" in
   forget)   shift; cmd_forget "$@" ;;    # drop a saved agent (dashboard teardown)
   guard)    shift; cmd_guard "$@" ;;     # toggle the test/CI write-guard
   selfmerge) shift; cmd_selfmerge "$@" ;;  # project-wide worker self-merge toggle
+  autocommit) shift; cmd_autocommit "$@" ;;  # project-wide worker commit permission (default: off)
+  diff-view) shift; cmd_diff_view "$@" ;;    # honest uncommitted-work diff (dashboard `v`)
+  export-uncommitted) shift; cmd_export_uncommitted "$@" ;;  # internal: salvage before a destructive path
+  ready-instructions) shift; ready_instructions ;;  # internal: the text seeded into every worker
   fan)      shift; cmd_fan "$@" ;;        # best-of-N fan-out
   cost)     shift; cmd_cost "$@" ;;       # per-agent token/cost
   cost-pane) shift; cost_for_pane "$@" ;; # raw cost for a pane (dashboard)

@@ -6,6 +6,10 @@
 #      review (and worktree isolation only stops it from *checking out* main, not
 #      from `git push . HEAD:main` or merging via another worktree). This block is
 #      independent of the opt-in marker below.
+#  (1b) ALWAYS-ON (unless `fleet autocommit on`): a worker may not `git commit`.
+#      Workers STAGE (`git add -A`) and stop; the human reviews and makes the one
+#      commit. `git add` is deliberately NOT blocked — staging is what makes the
+#      work visible and the human's commit a one-liner.
 #  (2) OPT-IN (`fleet guard on`): ask/deny before edits to protected paths
 #      (tests, CI configs, lockfiles) so agents can't quietly delete tests or
 #      rewrite CI to make things pass.
@@ -300,15 +304,40 @@ def scan_text(text, env, depth, out):
                 run.append(tok)
 
 
-if tool == "Bash" and role == "worker" and os.environ.get("FLEET_SELF_MERGE") != "1":
+if tool == "Bash" and role == "worker":
     cmd = str((h.get("tool_input") or {}).get("command") or "")
     subs = []
     scan_text(cmd, {}, 0, subs)
-    for sub in subs:
-        if sub in ("merge", "push"):
-            deny("fleet-guard: workers must not run 'git %s'. Integration is the "
-                 "orchestrator's job — it reviews your diff and merges/pushes. "
-                 "Commit on your own branch and run 'fleet ready' to signal done." % sub)
+
+    if os.environ.get("FLEET_SELF_MERGE") != "1":
+        for sub in subs:
+            if sub in ("merge", "push"):
+                deny("fleet-guard: workers must not run 'git %s'. Integration is the "
+                     "orchestrator's job — it reviews your diff and merges/pushes. "
+                     "Stage your work with 'git add -A' and run 'fleet ready'; a human "
+                     "reviews and commits." % sub)
+
+    # --- (1b) ALWAYS-ON (unless `fleet autocommit on`): workers must not COMMIT ---
+    # Workers STAGE and stop; the human makes the one commit that enters history.
+    # This is a BACKSTOP, not a wall — the real lever is the wording seeded into
+    # every worker (`ready_instructions`), which is also the only lever that reaches
+    # non-claude harnesses (omp has no guard at all). The documented tokenizer gaps
+    # above (`sh -c`, `eval`, aliases, wrapper scripts) apply here identically.
+    #
+    # `add` is DELIBERATELY ABSENT from this set and must stay absent: staging is
+    # load-bearing for the whole feature (`git diff HEAD` includes the index, so
+    # staged work is what makes the human's review surface honest and the human's
+    # commit a single command). `stash` and `rebase` are absent too — a worker needs
+    # `rebase --abort` and a non-destructive park.
+    if os.environ.get("FLEET_AUTOCOMMIT") != "1":
+        for sub in subs:
+            if sub in ("commit", "commit-tree", "am", "cherry-pick", "revert"):
+                deny("fleet-guard: workers must not run 'git %s' — nothing on this "
+                     "branch gets committed by an agent. Stage everything with "
+                     "'git add -A' (do NOT commit), then run 'fleet ready'; a human "
+                     "reviews the staged tree and makes the commit. If this pane "
+                     "genuinely needs to commit, the human can allow it with "
+                     "'fleet autocommit on'." % sub)
 
 # --- (2) OPT-IN: protected-path edits (tests / CI / lockfiles) -------------------
 if os.environ.get("FLEET_GUARD_ON") != "1":

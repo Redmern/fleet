@@ -373,6 +373,85 @@ synthesized hook JSON on stdin). Run it against an older checkout with
 `GUARD=<path>/bin/fleet-guard` to see the halves go red: 22 of the DENY cases fail
 against `HEAD~`, and the ALLOW half additionally fails against pre-`034bb75` code.
 
+### No agent commits (`ready_instructions`, `FLEET_AUTOCOMMIT`, `cmd_diff_view`)
+
+Workers **stage** (`git add -A`) and never commit; the human reviews the staged tree
+and makes the one commit that enters history. The whole design rests on one fact:
+**`git add` is not `git commit`, and `git diff HEAD` includes the index.** Staged work
+is therefore already visible in every existing surface, still counts as dirty for
+`cmd_reap`'s guard, and is one command from shipped. **`git add` must never be
+blocked** — every guard here deliberately omits it (also `stash` and `rebase`, so a
+worker keeps `rebase --abort` and a non-destructive park).
+
+Five load-bearing pieces:
+
+- **The wording is the real lever, the guard is a backstop.** The whole policy is one
+  string (`ready_instructions`), which feeds BOTH the prompt trailer and the durable
+  `.fleet/ready-instructions`. It is also the only lever that reaches non-claude
+  harnesses: `fleet-guard` is claude-only (`omp` has `H_GUARD_KIND=none`, and that
+  variable has no consumer at all), and its tokenizer cannot see `sh -c` / `eval` /
+  aliases. Say so in the docs rather than implying a wall. A leak costs one unwanted
+  commit on a throwaway branch — not lost work, which is what makes this safe.
+- **`fleet autocommit` has POSITIVE marker polarity** (`<root>/.fleet/autocommit`
+  present = commits allowed), unlike `selfmerge`'s negative `no-self-merge` marker.
+  Deliberate: the safe state must be the state of an untouched project, so an existing
+  fleet gets the new behaviour with no migration. Resolved at spawn and frozen into
+  the pane env as `FLEET_AUTOCOMMIT` (no live re-read), like `FLEET_SELF_MERGE`.
+- **Persistence is column 10 and CONDITIONAL.** `persist_agent` writes it *only* when
+  it is `1`, so a default agent's `.agents` line stays exactly 9 fields — a
+  pacman-installed fleet running alongside the dev symlink has a 9-var `cmd_restore`
+  whose last var would otherwise absorb the 10th column and mangle `owner` (and with
+  it the `d<N>-` window prefix). An absent column reads back as the SAFE default, so
+  any skew loses a *grant*, never re-grants commit rights. This is the `.agents` file,
+  NOT the 9-field agents TSV — that one still may not grow a column (see "Task tag").
+- **`review` is DERIVED, never stored.** ready + dirty = `review` (the worker is
+  finished, your commit is owed); ready + clean = `done` (reapable). It reuses TSV
+  field 9 and is computed from `uncommitted_status`, the SAME expression `cmd_reap`
+  refuses on — so the pill and "reap will refuse" can never disagree. **Both**
+  `agents_tsv` emission paths must derive it (daemon-up python and the daemon-down
+  tmux fallback) or the pill flips whenever `fleetd` is down.
+- **Durability replaced the commit.** A commit was also the reflog/`fsck` net, and
+  there is no stash/format-patch machinery anywhere in `bin/`. Two replacements:
+  `write_checkpoint_ref` snapshots the **index** into `refs/fleet/checkpoint/<slug>`
+  via `write-tree` + `commit-tree` (a real, GC-anchored commit object, but under
+  `refs/fleet/`, never on the worker's branch — which is why "the agent did not
+  commit" still holds literally); and `cmd_export_uncommitted` writes
+  `uncommitted.patch` + `untracked.tgz` outside the worktree before **every**
+  destructive path. Because the checkpoint snapshots the INDEX, unstaged work is
+  outside the net — which is exactly why the seeded instruction mandates `git add -A`.
+
+Two destructive paths, not one. `cmd_reap --force` was the known one; the dashboard's
+`x` (`confirm_teardown`) is a 3-keystroke force-remove that never had a dirty guard at
+all and whose failure text used to coach `FORCE` — a **shorter** path to loss. Both now
+export first and refuse the removal if the export fails. `cmd_reap`'s dirty refusal no
+longer advertises `--force` (dirty is the normal end state now); it points at
+`fleet diff-view` + `git commit`. Note `cmd_reap`'s unmerged guard silently stops
+guarding in this mode: `merge-base --is-ancestor HEAD $baseref` is trivially true with
+zero commits, so protection drops from two orthogonal guards to one.
+
+`cmd_diff_view` is the single definition of "the diff": diffstat + tracked diff +
+untracked rendered via `diff --no-index -- /dev/null <f>`, with the clean/dirty branch
+keyed off `status --porcelain` — NOT off whether `diff HEAD` came back empty. The old
+inline `git diff HEAD` in `fleet-dash`'s `view_diff` omitted untracked files and then
+printed "working tree clean vs HEAD", so an agent whose whole job was creating files
+showed as having done nothing. In no-commit mode that popup is the primary review
+surface and may not lie.
+
+**GATE 2 gained a zero-commit precondition.** Popping a gate-2 message is what makes
+the sub-orch merge and push; with a commit-free branch that merge is a silent
+`Already up to date`, the push a no-op, and the ledger still reaches `done` — the
+pipeline declaring shipped work that does not exist. `gate_post 2` now refuses (rc 3)
+while the branch has no commits ahead of the target, resolving the worktree from `-w`
+or from the saved-agents line (`gate_worktree_for_slug`).
+
+Known limitation, documented not fixed: base selection and `worktree add` only see
+*committed* work, so a NEEDS-WORK loop or a parallel peer would start from a base
+missing the prior round. It survives today only via worktree reuse.
+
+Locked in by `test/no-auto-commit-proof.sh` (22 cases; case 4 — staging and the
+non-destructive git verbs still allowed — is the highest-value one, since a guard that
+blocks `git add` breaks the entire feature).
+
 ### Worktree secrets (`inject_secrets`)
 
 `inject_secrets <repo> <dir>` runs inside `cmd_new` right after the worktree is
@@ -492,6 +571,20 @@ this project with the `fleet` CLI.
   workers may merge/push); bare/`status` reports the current state. **Spawn-time:**
   affects workers spawned from now on — existing panes keep their grant. Per-agent
   `--self-merge`/`--no-self-merge` on `fleet new` override the project default.
+- `fleet autocommit on|off|status` — project-wide worker **commit** toggle.
+  **Default: off — agents do not commit.** A worker stages its work (`git add -A`)
+  and stops; you review it and make the one commit that enters history. `on` drops
+  a `<root>/.fleet/autocommit` marker so newly-spawned workers in this project may
+  commit again; `off` removes it; bare/`status` reports the state. **Spawn-time:**
+  affects workers spawned from now on — existing panes keep their grant. Per-agent
+  `--autocommit`/`--no-autocommit` on `fleet new` override the project default.
+  **Enforcement is honest about its limits:** the real lever is the instruction
+  seeded into every worker; on top of it `fleet-guard` denies `git commit` (and
+  `cherry-pick`/`revert`/`am`) for worker panes — but that guard is a **backstop,
+  not a wall**. It is claude-only (`omp` has no guard at all, so for `omp` the
+  policy is purely advisory) and it cannot see a commit hidden inside `sh -c`,
+  `eval`, an alias or a wrapper script. `git add` is deliberately never blocked.
+  A leak costs one unwanted commit on a throwaway branch, not lost work.
 - `fleet new --scratch [label] [-p "task"] [--harness|-h <name>]` — spawn a
   **repo-less** agent: no repo, branch, or worktree, just a plain agent pane at
   the project root. `[label]` names the window (default `scratch`). Use for
@@ -526,15 +619,18 @@ this project with the `fleet` CLI.
   silently dropped — pop it to resume that sub-orch. The **main** (human) pane is
   unchanged: it is never send-keys'd, its wake stays out-of-band (toast + bell +
   dashboard alert).
-- `fleet ready [<agent>] [-m "reason"]` — signal that a work item is **done and
-  its worktree is ready for deletion.** **Workers: run bare `fleet ready` from
-  inside your own worktree when the task you were spawned for is complete AND
-  committed — not when you are pausing, blocked, or asking a question.** (Every
-  spawned worker is seeded this instruction on its first prompt and again in
-  `<worktree>/.fleet/ready-instructions`, which survives a `/clear`.) You flag
-  someone else's with `fleet ready <agent>`, or press **`y`** on its row in the
-  dashboard. This drops a `.fleet/ready` marker, so the agent shows as `done` in
-  `fleet ls` and the dashboard. `--clear` removes the flag.
+- `fleet ready [<agent>] [-m "reason"]` — signal that a work item is **done: the
+  worker's hands are off it.** **Workers: when the task you were spawned for is
+  complete, run `git add -A` to stage everything and do NOT commit — a human
+  reviews the staged work and makes the commit — then run bare `fleet ready` from
+  inside your own worktree. Not when you are pausing, blocked, or asking a
+  question.** (Every spawned worker is seeded this instruction on its first prompt
+  and again in `<worktree>/.fleet/ready-instructions`, which survives a `/clear`.)
+  You flag someone else's with `fleet ready <agent>`, or press **`y`** on its row
+  in the dashboard. This drops a `.fleet/ready` marker. A flagged worktree that is
+  still dirty shows as **`review`** (yellow) in `fleet ls` and the dashboard —
+  finished, but your commit is owed; once committed it shows `done` and `fleet
+  reap` will take it. `--clear` removes the flag.
 - `fleet reap [<target>] [--force]` — remove every worktree flagged ready (close
   its window, delete the worktree and its merged branch). Refuses any worktree
   with uncommitted changes, a branch not merged into its base, or a worker that
@@ -544,7 +640,15 @@ this project with the `fleet` CLI.
   early or late, leaves the worktree, its window, its saved-agents line and its
   `.fleet/ready` marker untouched, so a plain **re-run is the retry** — reach for
   `--force` only to genuinely discard dirty or unmerged work, never as the generic
-  remedy (it disables the dirty *and* unmerged guards together).
+  remedy (it disables the dirty *and* unmerged guards together). Because workers
+  now leave work **staged but uncommitted**, dirty-at-reap is the normal state: the
+  refusal points you at `fleet diff-view` + `git commit`, not at `--force`. Any
+  destructive path that *does* run (`--force`, or the dashboard's `x`) first
+  exports `uncommitted.patch` + `untracked.tgz` to `<root>/.fleet/salvage/…` and
+  **refuses to proceed if that export fails**.
+- `fleet diff-view [<dir>]` — the honest diff of a worktree's uncommitted work:
+  diffstat + staged + unstaged + **untracked new files** (which a bare `git diff
+  HEAD` silently omits). This is what the dashboard's **`v`** key runs.
 
 ## Leader menu (which-key)
 
@@ -634,6 +738,10 @@ tell the user you've dispatched and will report when done. The watcher pings you
 when they're all idle; you resume then, read their results with `fleet ls` /
 their diffs, and report consolidated status.
 
-When a delegated task is finished, the worker (or you) flags its worktree with
-`fleet ready`; once you've reviewed and merged the diff, `fleet reap` clears out
-all the finished worktrees in one step (it refuses unmerged or dirty ones).
+When a delegated task is finished, the worker stages its work (`git add -A`) and
+flags its worktree with `fleet ready` — **nothing is committed by an agent**. Review
+the staged diff (`fleet diff-view <worktree>`, or `v` in the dashboard), make the
+commit yourself, then merge. Once merged, `fleet reap` clears out all the finished
+worktrees in one step (it refuses unmerged or dirty ones — an uncommitted worktree
+shows as `review`, not `done`).
+

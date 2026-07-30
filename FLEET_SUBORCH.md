@@ -267,6 +267,16 @@ race the same tree. If the feature genuinely needs parallel writers on overlappi
 reviewer sub-agent is fine. `--no-self-merge` because the human gate authorises the merge;
 **YOU** execute it after GATE 2.
 
+> **NO AGENT COMMITS.** The impl worker **stages** its finished work (`git add -A`)
+> and **does not commit** — the human reviews the staged tree and makes the one
+> commit that enters history. Its branch therefore sits at **zero commits ahead of
+> base** until the human acts, and its worktree shows as **`review`**, not `done`.
+> Do not "helpfully" commit on its behalf, and do not treat a commit-free branch as
+> a failed implementation. This is enforced two ways — the instruction fleet seeds
+> into every worker, plus a `fleet-guard` deny on `git commit` — and `git add` is
+> deliberately never blocked. The human can lift it per-project with
+> `fleet autocommit on`.
+
 **Role 3 — TEST** — after implementation goes idle. One fleet agent on the impl branch
 (`fleet new <repo> fleet/<slug> --task test`), fanning out via harness sub-agents:
 - **≥2 independent tester** sub-agents that do **NOT** share context — the "two
@@ -585,7 +595,11 @@ fleet gate park <id> 1     # ledger state=gate1-wait → `fleet reap` will NOT t
 ```
 # GATE 2 — after the two independent testers + the adversary sub-agent (§3.0.4) return
 # DONE, the completion agent wrote DONE-PLAIN.md. Merge target = project integration-branch.
-fleet gate post 2 --slug "$slug" --summary "<2-4 plain sentences: how the tests prove it>" -d <id>
+fleet gate post 2 --slug "$slug" --summary "<2-4 plain sentences: how the tests prove it>" -d <id> -w <impl-worktree>
+# `gate post 2` REFUSES (rc 3) while the impl branch has zero commits ahead of the target —
+# the work is staged and awaiting the HUMAN's commit. That refusal is correct, not an error:
+# post GATE 2 only once the branch actually carries commits. -w names the worktree to check
+# (omit it and fleet resolves one from the saved-agents line for this slug).
 fleet gate park <id> 2
 # …then END YOUR TURN.
 ```
@@ -604,7 +618,7 @@ printf '%s' "$INCOMING_PROMPT" | fleet gate parse    # rc 0 + "gate=N action=…
 | Parsed sentinel | What you do |
 |---|---|
 | `gate=1 action=implement slug=S` | Proceed to **Phase 3 (TDD)** for slug S using PLAN.md/SYNTHESIS.md. |
-| `gate=2 action=merge slug=S target=T` | Review the diff, then **delegate integration** — spawn a SHIP worker with `--self-merge` to merge S → T and push T — watch it, report, then `fleet ready`. |
+| `gate=2 action=merge slug=S target=T` | Review the diff, then **delegate integration** — spawn a SHIP worker with `--self-merge` to merge S → T and push T — watch it, report, then `fleet ready`. The human has already made the commit by the time they pop this — if `S` still has **no commits** ahead of `T`, do NOT dispatch the integration (the merge would be a silent `Already up to date` that marks the ledger `done` with nothing shipped): say so and end your turn. |
 
 **You never commit, push or merge yourself.** Your pane is `FLEET_ROLE=worker`, so
 fleet-guard denies integration there — a sub-orch that tries it just gets blocked. That

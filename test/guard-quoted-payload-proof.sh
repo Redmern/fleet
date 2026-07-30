@@ -34,15 +34,15 @@ pass=0; fail=0
 
 # verdict <command> [env...] -> ALLOW|DENY
 verdict() {
-  local out
-  out=$(python3 -c 'import json,sys; print(json.dumps({"tool_name":"Bash","tool_input":{"command":sys.argv[1]},"cwd":sys.argv[2]}))' "$1" "$TMP" \
-        | FLEET_ROLE=worker "$GUARD" 2>/dev/null)
+  local out cmd=$1; shift
+  out=$(python3 -c 'import json,sys; print(json.dumps({"tool_name":"Bash","tool_input":{"command":sys.argv[1]},"cwd":sys.argv[2]}))' "$cmd" "$TMP" \
+        | env FLEET_ROLE=worker "$@" "$GUARD" 2>/dev/null)
   case "$out" in *'"deny"'*) echo DENY ;; *) echo ALLOW ;; esac
 }
 
-check() { # check <ALLOW|DENY> <label> <command>
-  local want=$1 label=$2 cmd=$3 got
-  got=$(verdict "$cmd")
+check() { # check <ALLOW|DENY> <label> <command> [env...]
+  local want=$1 label=$2 cmd=$3 got; shift 3
+  got=$(verdict "$cmd" "$@")
   if [ "$got" = "$want" ]; then
     pass=$((pass+1)); printf '  ok   %-6s %s\n' "$want" "$label"
   else
@@ -63,8 +63,13 @@ check ALLOW "substitution syntax inside SINGLE quotes is inert" \
   "fleet new fleet b -p 'literally \$(git push) as text'"
 check ALLOW "backtick body that is not git" \
   'fleet new fleet b -p "run `fleet ready` when done, never git push"'
-check ALLOW "the verb inside a commit message" \
-  'git commit -m "explain why we do not git push here"'
+# `git commit` is itself denied for workers now (no-auto-commit, d31), so the
+# inert-mention intent is carried on a still-allowed verb; the commit form is
+# asserted separately with the documented escape hatch on.
+check ALLOW "the verb inside a -m message payload" \
+  'git stash push -m "explain why we do not git push here"'
+check ALLOW "the verb inside a commit message (fleet autocommit on)" \
+  'git commit -m "explain why we do not git push here"' FLEET_AUTOCOMMIT=1
 check ALLOW "harmless git subcommands still work" 'git status'
 check ALLOW "harmless git subcommands still work (log)" 'git log --oneline -5'
 check ALLOW "git word in a heredoc that is only WRITTEN to a file" \
