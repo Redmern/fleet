@@ -160,6 +160,15 @@ one-liner), drop the pipeline and take the cheaper path per §3.0.1 — that rec
 is the recon paying for itself. If it reveals a genuinely separate unit of work, the
 escape valve in §3.0.3 (`fleet new --scratch <slug>-…` sibling agents) is still yours.
 
+> **Where your scratch children land.** You are yourself a parked scratch agent, living
+> in the detached `<sess>_hidden` sibling. A `fleet new --scratch` you run parks its child
+> **beside you, not under you** — the parking base is the *project* session
+> (`project_session()`), not your own. So your role agents are siblings in the same
+> `<sess>_hidden`, they get ordinary `(hidden)`-tagged dashboard rows, and `fleet ls` /
+> `fleet send` from your pane are scoped to the project — you can see and address the
+> visible session's workers, not just your own. Nothing about role spawns changes; this
+> is only the guarantee that they are reachable.
+
 **The handoff contract — RECON is the untrusted side.** The digest is cheap and therefore
 **unverified and possibly wrong**: it is one shallow pass, with no debate and no
 cross-check behind it. Hand it to the PLAN role explicitly framed that way — *"here is a
@@ -595,7 +604,15 @@ printf '%s' "$INCOMING_PROMPT" | fleet gate parse    # rc 0 + "gate=N action=…
 | Parsed sentinel | What you do |
 |---|---|
 | `gate=1 action=implement slug=S` | Proceed to **Phase 3 (TDD)** for slug S using PLAN.md/SYNTHESIS.md. |
-| `gate=2 action=merge slug=S target=T` | Review the diff, **merge S → T, push T**, then `fleet ready`. |
+| `gate=2 action=merge slug=S target=T` | Review the diff, then **delegate integration** — spawn a SHIP worker with `--self-merge` to merge S → T and push T — watch it, report, then `fleet ready`. |
+
+**You never commit, push or merge yourself.** Your pane is `FLEET_ROLE=worker`, so
+fleet-guard denies integration there — a sub-orch that tries it just gets blocked. That
+restraint is not lifted by a gate; what a popped GATE 2 gives you is the human's
+instruction to **have it done**. So spawn a SHIP worker on the feature branch with
+`--self-merge` (its `-p` prompt carries the exact commit/merge/push steps and the
+authorisation), `fleet watch` it, and report the result. Same rule for the ordinary
+commit of returned work: it goes through a worker, not through you.
 
 **A prompt with NO sentinel is normal input — NEVER a gate crossing.** A typed
 course-correction at a gate is a fresh instruction: re-plan (loop Phase 1) with the new

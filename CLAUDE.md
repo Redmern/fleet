@@ -139,6 +139,147 @@ worktree at `<repo>/<branch-with-slashes-as-underscores>`, anchored off the
 container's bare repo or first worktree, cut from `--base` (or the remote default
 branch). Branches with `/` become `_` in directory and window names.
 
+### Hidden agents: `session_name` (identity) vs `project_session` (targeting)
+
+"Hidden" is **physical parking**, not an attribute: tmux has no per-window
+"don't draw this on the bar" option and — decisively — no skip-in-next/prev
+flag, so a `--scratch` spawn is *moved* into the detached sibling session
+`<sess>_hidden` (`cmd_new`) and marked `@fleet_hidden` (1=system, 2=user via
+`cmd_hide`, 0=surfaced). Living outside the visible session is what makes it both
+off-bar **and** unreachable by `C-b n`. `agents_tsv` and `fleetd` use
+`list-panes -a` (server-global), so the daemon and dashboard still see it and
+render a normal `(hidden)`-tagged row.
+
+Two questions look identical here and are not:
+
+- **`session_name()`** — *which session is MY pane in?* (identity). Unchanged.
+- **`project_session()`** — *which session does this PROJECT live in?*
+  (targeting). Every site that targets or scopes a session wants this one:
+  `cmd_new`'s parking base, `--switch` move-in, **worker window target and
+  `persist_agent`**, `cmd_hide`, `cmd_unhide`, `cmd_ls`'s scope, `cmd_send`'s
+  fan-out scope, `sessions_rows`, **`cmd_restore`**, **`cmd_forget`**.
+
+`cmd_new` resolves it **once**, at the top, into `psess` (the project) and
+`tsess` (where the window will physically land — `psess` or its parked sibling).
+Everything downstream reads those, so the window target, the name-collision
+check and the saved-agents file can never disagree about which session a spawn
+belongs to. That disagreement was a second live bug: only the *scratch* branch
+was converted at first, so a sub-orch-spawned **code worker** still landed in
+`<sess>_hidden` — off the bar, unreachable by `C-b n` — and, durably, persisted
+to `<sess>_hidden.agents`, a file `cmd_restore` and `cmd_forget` never read. The
+worker was un-restorable after a tmux restart and its saved-agents line
+immortal. **Writer and readers must name the same file**, which is why
+`persist_agent`, `cmd_restore` and `cmd_forget` all key on `project_session()`.
+
+Conflating them was a live bug. `FLEET_SESSION` is exported only by `fleet up` /
+`fleet main` / `fleet restore` — **never** into a spawned pane — so inside a
+sub-orchestrator (itself a parked scratch agent) `session_name()` returned
+`pc_hidden`, and appending `_hidden` parked its children in `pc_hidden_hidden`.
+Nothing looks there: the dashboard's exact depth-1 comparison dropped the row,
+`fleet ls`/`fleet send` could not see the project's own workers, and tmux
+destroys the depth-1 session the moment its last window leaves — orphaning the
+depth-2 one with **no parent left to name it back**. Two such orphans were live
+on the machine, one a week old.
+
+`project_session()` strips every trailing `_hidden` and uses the base **only if
+tmux confirms that session exists** — it never invents one — **and only if the
+caller's own session does not itself look like a fleet project**
+(`session_is_project`: does it contain a `main` window? `fleet up` always makes
+one; a parking session never has one, since `cmd_hide` refuses to hide `main`).
+
+That second condition is load-bearing and the naive version was wrong. With
+genuine projects `a` **and** `a_hidden` both booted, plain stripping resolved
+`a_hidden` → `a` and parked `a_hidden`'s own scratch agents back into
+`a_hidden` — the caller's **visible** session: on the bar, reachable by `C-b n`,
+dashboard `hid=0`, yet stamped `@fleet_hidden 1`. "Hidden" that does not hide.
+Be precise about the guarantee: **a genuine fleet *project* named `foo_hidden`
+resolves to itself**; a *bare tmux session* named `foo_hidden` with no `main`
+window is genuinely indistinguishable from a parking sibling and is still
+treated as one. That is the honest limit of what fleet can know from a name.
+Belt and braces, `cmd_new` also stamps `@fleet_hidden 0` rather than `1` whenever
+the window in fact lands in a real project session — the marker never claims a
+hiding that did not happen.
+
+Deliberate non-changes and one added guard:
+
+- **`cmd_quit` stays on `session_name()`** — normalizing it would let a sub-orch
+  tear down the human's session. But literal is **not sufficient**: a sub-orch
+  lives in the parking session, so its `fleet quit` used to kill `<sess>_hidden`,
+  i.e. *every parked agent of the project* — sibling sub-orchs and the human's
+  own hidden agents. The human session survived, which is what made the
+  collateral easy to miss (the first version of `proof-quit-blast-radius.sh`
+  asserted it as correct). `cmd_quit` now **refuses outright when the calling
+  pane is parked** (`psess != sess` is exactly "I am parked"). Deliberately
+  *not* `is_main_pane`, unlike `cmd_hide`'s guard: quit is reached from the
+  leader menu's `Q` → `run-shell`, a server-wide prefix binding that fires from
+  the dashboard pane and from any agent window, none of them role=main —
+  requiring main would break the menu.
+- **`fleet pick` / `ls --pick` keep dropping `*_hidden`** — a `switch-client`
+  into a bare parking session is a teleport trap, and the glob is already
+  depth-agnostic.
+- **`agents_tsv`, `fleetd` and the 9-field TSV are untouched** — every parser is
+  positional.
+
+Defence-in-depth for machines that already have nested sessions is **narrow and
+deliberate: two places only** — the dashboard's row filter and `fleet up`'s ghost
+sweep. Both **strip suffixes** rather than matching one depth, and strip rather
+than glob `<sess>_hidden*` (which would also swallow an unrelated
+`<sess>_hiddenX`). Everything else — `cmd_ls`'s scope, `cmd_send`'s, and the
+`main_pane_for_target` / `window_pane_for` / `suborch_pane_for` lookups — still
+compares against exactly `<sess>_hidden`. That is on purpose: widening them would
+legitimise nesting in six more filters and hide the next recurrence. The
+consequence to know is that on a **pre-fix** machine with a live nested session,
+the dashboard draws those agents but `fleet ls` / `fleet send` cannot address
+them.
+
+**Do not over-read the sweep.** `fleet up` only reclaims *harness-less* debris —
+tmux-resurrect ghosts of dead shells. It deliberately refuses any nested session
+whose windows still carry `@fleet_harness`, because that is running work. Every
+nested orphan actually on this machine is harness-stamped
+(`pc_hidden_hidden` → `d31-…-plan`, `d32-…-plan`; `techweb2_hidden_hidden` →
+`d5-…-test-4`, from 2026-07-23), so **the sweep will not touch a single one of
+them** — they need a manual drain: finish or kill those windows, then the empty
+session goes on the next `fleet up`. What actually rescues them today is the
+dashboard's suffix-strip, which renders them; the sweep only stops *new* ghost
+debris accumulating.
+
+The dashboard's strip stops **at `$SESS`** rather than peeling every `_hidden` it
+can. `$SESS` may itself legitimately end in `_hidden` — that is the genuine
+`foo_hidden` *project* case above, which `project_session()` resolves to itself.
+Peeling unconditionally reduces that project's own rows to a non-match and empties
+its dashboard entirely — caught in review, guarded by the four `SESS=foo_hidden`
+rows in `proof-hidden-row-renders.sh` claim B.
+
+The alternative (keep every window in one session; omit hidden ones with a
+`window-status-format` conditional) was re-tested on tmux 3.7b and **rejected** —
+see the note in `cmd_new` for the four failure modes; the load-bearing one is
+that it cannot deliver non-navigability at all.
+
+Locked in by `test/proof-{no-nested-hidden,hidden-row-renders,bar-omits-hidden,
+hide-unhide-roundtrip,quit-blast-radius,fail-silent,ghost-sweep-depth,
+worker-spawn-session}.sh` (shared isolation preamble in
+`test/hidden-proof-common.sh`). Highest-value: `proof-no-nested-hidden.sh` case 2
+is the headline regression; `proof-worker-spawn-session.sh` is the only proof
+that spawns a **non-scratch** worker, and therefore the only cover for the
+`persist_agent` / `restore` / `forget` half; `proof-quit-blast-radius.sh` case 4
+is the collateral guard.
+
+Two things to know before trusting a green run:
+
+- The dashboard and sweep proofs `eval` fragments extracted from the real source
+  between `# >>> d32:` / `# <<< d32:` markers — **keep those markers.** Deleting
+  one fails *loudly* (the extraction is empty and the proof reports it), so this
+  is fail-closed, not silently vacuous.
+- Extraction always reads `$FLEET_REPO/bin/...` (the checkout next to the
+  script) while execution honours `$FLEET_BIN`. The default is correct and they
+  are the same tree; point `FLEET_BIN` at another checkout and a proof would
+  extract one source while exercising another.
+
+Three of the proofs — `bar-omits-hidden`, `fail-silent`, and the surviving half
+of `hide-unhide-roundtrip` — pass on pre-fix code too. That is intended: they
+assert invariants the change must not break, not the new behaviour. Six of the
+eight go red against `HEAD`.
+
 ### Task tag (`--task`, `@fleet_task`) — NOT `role`
 
 `fleet new --task <research|plan|impl|test|scratch>` tags what KIND of work

@@ -446,16 +446,39 @@ load_rows() {
   HIDDEN_N=0                               # parked-agent count, threaded into the title
   HAS_TASKS=0                              # no task anywhere => rows render byte-identically to before the flag
   TASK_ROOT=$(dash_root)                   # once per refresh, not once per row
-  local line state label sess win wname since pane age order hid
+  local line state label sess win wname since pane age order hid _base
   while IFS=$'\t' read -r state label sess win wname since pane age ready; do
     [ -n "$pane" ] || continue
-    [ "$sess" = "$SESS" ] || [ "$sess" = "${SESS}_hidden" ] || continue   # this project + its parked scratch
+    # This project + its parked scratch, at ANY depth. Defence-in-depth: before
+    # d32 a sub-orchestrator's scratch spawn parked into "<sess>_hidden_hidden",
+    # and an exact depth-1 comparison dropped the row entirely — the agent existed,
+    # fleetd reported it (list-panes -a is server-global), and the dashboard simply
+    # never drew it. project_session() makes new ones impossible; this keeps the
+    # ones already parked on a pre-fix machine visible.
+    # Suffix-stripping, NOT a "${SESS}_hidden*" glob: the glob would also swallow
+    # an unrelated session named "<SESS>_hiddenX".
+    # The strip stops AT "$SESS" rather than stripping every "_hidden" it can:
+    # $SESS may itself legitimately end in "_hidden" (project_session() supports a
+    # user session genuinely named that, and never invents a base for it). Peeling
+    # unconditionally would reduce "foo_hidden" to "foo", match nothing, and drop
+    # EVERY row — a silently empty dashboard for that project.
+    # >>> d32:sessfilter
+    _base="$sess"
+    while [ "$_base" != "$SESS" ] && [ "${_base%_hidden}" != "$_base" ]; do
+      _base="${_base%_hidden}"
+    done
+    [ "$_base" = "$SESS" ] || continue
+    # <<< d32:sessfilter
     [ "$wname" = "main" ] && continue     # skip the orchestrator itself (fast-path name)
     # …and by ROLE, so a drifted "main" window can't surface as a selectable/closable row.
     [ "$(tmux show -w -t "$win" -v @fleet_role 2>/dev/null)" = main ] && continue
-    # A window parked in <sess>_hidden is hidden (authoritative — physical
-    # location beats a possibly-stale @fleet_hidden marker). Field 9 of ROWS[].
-    hid=0; [ "$sess" = "${SESS}_hidden" ] && { hid=1; HIDDEN_N=$((HIDDEN_N+1)); }
+    # A window parked anywhere but the visible session is hidden (authoritative —
+    # physical location beats a possibly-stale @fleet_hidden marker). The filter
+    # above already guarantees any such session is "$SESS" plus one or more
+    # "_hidden" suffixes. Field 9 of ROWS[].
+    # >>> d32:hidflag
+    hid=0; [ "$sess" != "$SESS" ] && { hid=1; HIDDEN_N=$((HIDDEN_N+1)); }
+    # <<< d32:hidflag
     prime_task "$win" "$wname"; [ -n "${TASK_RAW[$win]}" ] && HAS_TASKS=1
     ROWS+=("$state"$'\t'"$label"$'\t'"$win"$'\t'"$wname"$'\t'"$since"$'\t'"$pane"$'\t'"${age:-0}"$'\t'"$ready"$'\t'"$hid")
   done < <("$FLEET_BIN" agents 2>/dev/null | sort -t$'\t' -k1,1 \

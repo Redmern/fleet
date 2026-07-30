@@ -91,6 +91,64 @@ session_name() { # FLEET_SESSION overrides (used by `fleet up` cross-session)
   tmux display -p '#{session_name}' 2>/dev/null
 }
 
+# The VISIBLE project session, resolved from ANY pane. Two questions look alike
+# and are not: session_name() answers "which session is MY pane in?" (identity);
+# project_session() answers "which session does this PROJECT live in?"
+# (targeting). Every site that *targets* or *scopes* a session wants the latter.
+#
+# Why this exists: scratch panes — and therefore every sub-orchestrator — are
+# PARKED in the detached sibling "<sess>_hidden" (see cmd_new), and FLEET_SESSION
+# is exported only by `fleet up` / `fleet main` / `fleet restore`, never into a
+# spawned pane. So inside a sub-orch, session_name() returns "pc_hidden"; a
+# targeting site that appends "_hidden" to it parks the child in
+# "pc_hidden_hidden", which no consumer looks in — the dashboard drops the row,
+# `fleet ls`/`fleet send` cannot see the project, and tmux destroys the depth-1
+# session as soon as its last window leaves, orphaning the depth-2 one with no
+# parent left to name it back. Normalizing here makes that unrepresentable
+# instead of teaching six more filters about depth.
+#
+# Does <sess> look like a real fleet PROJECT session rather than a parking
+# sibling? `fleet up` always creates a `main` window (orchestrator + dashboard);
+# a parking session never contains one — cmd_new only ever puts agent windows
+# there, and cmd_hide hard-refuses to hide `main`. So "has a main window" is the
+# one signal that separates a project genuinely NAMED "<x>_hidden" from the
+# parked sibling of "<x>". Checked by name and by authoritative role, mirroring
+# is_main_pane's belt-and-braces. Fail-silent: absent/unqueryable → not a project.
+session_is_project() { # <sess>
+  local s="${1:-}"; [ -n "$s" ] || return 1
+  tmux list-windows -t "=$s" -F $'#{window_name}\t#{@fleet_role}' 2>/dev/null \
+    | awk -F'\t' '$1=="main" || $2=="main" { found=1 } END { exit !found }'
+}
+
+# NEVER INVENT A SESSION, and never demote a real one: the stripped base is used
+# only if tmux confirms it exists AND the caller's own session does not itself
+# look like a fleet project.
+#
+# THE COLLISION THIS RESOLVES: with genuine projects "a" and "a_hidden" both
+# booted, naive stripping resolves "a_hidden" → "a" and parks that project's own
+# scratch agents into "a_hidden" — the caller's VISIBLE session. They land on the
+# bar, stay reachable by `C-b n`, and the dashboard computes hid=0, while still
+# being stamped @fleet_hidden 1: "hidden" that does not hide. The main-window
+# probe settles it, so "a_hidden" resolves to itself and parks at
+# "a_hidden_hidden". A BARE tmux session named "a_hidden" with no main window is
+# genuinely indistinguishable from a parking sibling and is still treated as one
+# — that is the honest limit of what fleet can know from a name.
+#
+# Fail-silent: falls back to the literal name on any tmux failure.
+project_session() {
+  local s base
+  s=$(session_name) || return 1
+  [ -n "$s" ] || return 1
+  session_is_project "$s" && { echo "$s"; return 0; }     # a project in its own right
+  base="$s"
+  while [ "${base%_hidden}" != "$base" ]; do base="${base%_hidden}"; done
+  [ "$base" = "$s" ] && { echo "$s"; return 0; }          # not parked — as-is
+  if [ -n "$base" ] && tmux has-session -t "=$base" 2>/dev/null; then
+    echo "$base"; return 0
+  fi
+  echo "$s"                                              # base is gone: no invention
+}
+
 fleet_root() { # project root for the current session
   local s; s=$(session_name) || return 1
   local r; r=$(tmux show -t "$s" -v @fleet_root 2>/dev/null)
@@ -339,7 +397,10 @@ cmd_ls() {
   # Scope unless --all. session_name failing/empty (not inside tmux) → can't
   # scope, so fall through to the global listing.
   local sess
-  if [ "$all" -eq 0 ] && sess=$(session_name 2>/dev/null) && [ -n "$sess" ]; then
+  # project_session, not session_name: run from a parked sub-orch pane, the
+  # caller-relative name scopes the listing to "<sess>_hidden" and the project's
+  # own workers become invisible to it.
+  if [ "$all" -eq 0 ] && sess=$(project_session 2>/dev/null) && [ -n "$sess" ]; then
     out=$(echo "$out" | awk -F'\t' -v s="$sess" '$3==s || $3==s"_hidden"')
     [ -n "$out" ] || { echo "no agents in this project"; [ "$want_hold" -eq 1 ] && hold_wait; return 0; }
   fi
@@ -632,7 +693,10 @@ persist_agent() { # session dir repo branch bare base harness [self_merge] [wnam
 
 cmd_forget() { # forget <dir> — drop a saved agent (called by the dashboard on teardown)
   local dir="${1:-}"; [ -n "$dir" ] || return 0
-  local sess; sess=$(session_name) || return 0
+  # project_session: same file persist_agent wrote (see cmd_restore). Under
+  # session_name this was a silent no-op from any parked pane, leaving the
+  # saved-agents line behind forever after the worktree was reaped.
+  local sess; sess=$(project_session) || return 0
   local f; f=$(agents_file "$sess"); [ -f "$f" ] || return 0
   # Drop the durable task tag for this agent's window BEFORE the line goes: col 8
   # is the persisted final window name, the key the tasks file uses. cmd_forget
@@ -794,7 +858,10 @@ cmd_selfmerge() { # on | off | status — project-wide worker self-merge toggle 
 }
 
 cmd_restore() { # respawn saved agents whose windows are gone
-  local sess; sess=$(session_name) || die "not inside tmux"
+  # project_session: must name the same file cmd_new's persist_agent wrote. Run
+  # from a parked pane, session_name would look for "<sess>_hidden.agents" and
+  # report "no saved agents" for a project that has plenty.
+  local sess; sess=$(project_session) || die "not inside tmux"
   local f; f=$(agents_file "$sess")
   [ -f "$f" ] || { echo "no saved agents for $sess"; return 0; }
   # match by window name (<repo>/<branchdir>, as cmd_new names them) — precise,
@@ -1088,6 +1155,19 @@ cmd_new() {
 
   local root; root=$(fleet_root) || die "not inside tmux"
   local sess; sess=$(session_name) || die "not inside tmux"
+  # THE session every spawn targets. `sess` is only this pane's identity; a
+  # sub-orchestrator is itself parked, so targeting `sess` put a real CODE WORKER
+  # into "<sess>_hidden" — off the bar, unreachable by `C-b n`, and (worse)
+  # persisted to "<sess>_hidden.agents", a file `fleet restore` and `fleet forget`
+  # never read, so the worker was un-restorable and its ledger line immortal.
+  # Resolved ONCE here so the window target, the name-collision check and the
+  # saved-agents file can never disagree about which session this spawn belongs to.
+  local psess; psess=$(project_session 2>/dev/null) || psess="$sess"
+  [ -n "$psess" ] || psess="$sess"
+  # Where the window will PHYSICALLY land — the project session, or its parked
+  # sibling for a scratch spawn. Only the name-collision check wants this; every
+  # other site wants the project session.
+  local tsess="$psess"; [ "$scratch" = 1 ] && tsess="${psess}_hidden"
   local dir wname repo_base="" docs=""
 
   # Self-merge default is ON (workers may merge/push). A project can flip the
@@ -1109,7 +1189,9 @@ cmd_new() {
     # dispatch layer — flipping the dashboard's HAS_TASKS on and shrinking every
     # label by the task field for users who never typed --task. An agent spawned
     # without the flag must behave exactly as it did before the flag existed.
-    wname=$(scratch_wname "$sess" "${repo:-scratch}")
+    # Collision-check against the session the window will ACTUALLY land in
+    # (the parked sibling), not the caller's.
+    wname=$(scratch_wname "$tsess" "${repo:-scratch}")
     # Repo-less, so no worktree/info-exclude — give it a sane scratch-docs dir
     # under the shared root anyway, so $FLEET_DOCS is always a real dir.
     docs="$root/.fleet/notes/scratch/${repo:-scratch}"
@@ -1249,7 +1331,14 @@ $(ready_instructions)"
       # must live OUTSIDE the visible session). fleetd still lists them
       # (list-panes -a is server-global), so they stay in the dashboard; the
       # dashboard moves them into "$sess" on Enter and back out on 'h'.
-      local hidden="${sess}_hidden"
+      #
+      # The parking base is the PROJECT session, not the caller's session. A
+      # sub-orchestrator is itself a parked scratch pane, so deriving the base
+      # from the caller re-suffixed an already-parked name ("pc_hidden_hidden") —
+      # a session no consumer looks in, and one tmux orphans the moment the
+      # depth-1 parent loses its last window. See project_session(); `psess` is
+      # resolved once at the top of cmd_new and `tsess` is this same name.
+      local hidden="$tsess"
       win_id=""
       # Common spawn env. FLEET_NEW_SUBORCH_ID (set only by resolve_or_spawn_suborch)
       # means THIS scratch pane IS a sub-orch: carry FLEET_SUBORCH_ID=so-<id> in its env
@@ -1284,7 +1373,9 @@ $(ready_instructions)"
       # so plain "$hidden" here (a session name has no glob chars → exact anyway).
       tmux set -t "$hidden" @fleet_root "$root" 2>/dev/null || true
     else
-      win_id=$(tmux new-window -d -P -F '#{window_id}' -t "$sess" -n "$wname" -c "$dir" \
+      # $psess, not $sess: a worker spawned BY a sub-orch must land on the
+      # human's bar, not in the sub-orch's parking session.
+      win_id=$(tmux new-window -d -P -F '#{window_id}' -t "$psess" -n "$wname" -c "$dir" \
         -e FLEET_ROLE=worker -e FLEET_DOCS="$docs" -e FLEET_SELF_MERGE="$self_merge" "${argv[@]}")
     fi
   else
@@ -1292,7 +1383,8 @@ $(ready_instructions)"
     # generic :terminal. Both seed the prompt + take FleetSend over the nvim RPC.
     local nsock="$RUNTIME_DIR/fleet/nvim-$(date +%s%N).sock"
     mkdir -p "$RUNTIME_DIR/fleet"
-    win_id=$(tmux new-window -d -P -F '#{window_id}' -t "$sess" -n "$wname" -c "$dir" \
+    # $psess, not $sess — same reason as the bare-worker branch above.
+    win_id=$(tmux new-window -d -P -F '#{window_id}' -t "$psess" -n "$wname" -c "$dir" \
       -e FLEET_ROLE=worker -e FLEET_DOCS="$docs" -e FLEET_SELF_MERGE="$self_merge" \
       -e FLEET_AUTOCLAUDE="$([ "$H_NVIM_PLUGIN" = 1 ] && echo 1 || echo 0)" \
       -e FLEET_HARNESS="$H_NAME" -e FLEET_HARNESS_BIN="$hbin${H_ARGS:+ $H_ARGS}" \
@@ -1372,7 +1464,31 @@ $(ready_instructions)"
     # in <sess>_hidden (above), NOT by a window-status-format override — leaving
     # one set would blank the window even after it is surfaced into the visible
     # session.
-    tmux set -w -t "$win_id" @fleet_hidden 1 2>/dev/null || true
+    #
+    # RE-TESTED (d32, tmux 3.7b, throwaway server) and still rejected. The
+    # alternative — keep every window in the one real session and omit hidden
+    # ones with a `#{?#{==:#{@fleet_hidden},1},,…}` conditional in the GLOBAL
+    # window-status-format — fails four ways: (a) the same conditional in
+    # window-status-current-format leaves NO current-window indicator at all when
+    # a hidden window is current; (b) it leaves a doubled separator unless
+    # window-status-separator is emptied and folded into the format; (c) it
+    # cannot deliver non-navigability — tmux has no per-window skip-in-next/prev,
+    # so `C-b n` walks the human straight into a bar-invisible pane, which is the
+    # whole reason parking exists; (d) fleetd's heal_status_format only
+    # substring-checks @agent_glyph / @fleet_task_tag and re-appends them to
+    # whatever the current global value is, so an omarchy theme switch would wipe
+    # the wrapper and silently pop every hidden window back onto the bar.
+    #
+    # Stamp only if the window ACTUALLY landed somewhere hidden. If the parking
+    # target is itself a real fleet project session (a `main` window in it — the
+    # pathological "a" + "a_hidden" pair), the window is on that project's bar and
+    # reachable by `C-b n`; marking it hidden would be a lie the dashboard
+    # contradicts anyway, since dash computes `hid` from physical location.
+    if session_is_project "$tsess"; then
+      tmux set -w -t "$win_id" @fleet_hidden 0 2>/dev/null || true
+    else
+      tmux set -w -t "$win_id" @fleet_hidden 1 2>/dev/null || true
+    fi
   fi
   echo "spawned $wname ($H_NAME) in window $win_id"
   # Window is created detached (-d) so focus stays put; jump only on --switch. A
@@ -1380,14 +1496,22 @@ $(ready_instructions)"
   # select-window only changes the active window of the session that owns it).
   if [ "$switch" = 1 ]; then
     if [ "$scratch" = 1 ]; then
-      tmux move-window -s "$win_id" -t "$sess:" 2>/dev/null || true
+      # Surface into the PROJECT session — the visible bar. Using the caller's
+      # session would "surface" a sub-orch's child into the parked session, i.e.
+      # mark it visible while it stays off the bar.
+      tmux move-window -s "$win_id" -t "${psess:-$sess}:" 2>/dev/null || true
       tmux set -w -t "$win_id" @fleet_hidden 0 2>/dev/null || true
     fi
     tmux select-window -t "$win_id" 2>/dev/null || true
   fi
   # scratch agents are repo-less + ephemeral — nothing to restore, so don't persist.
-  [ "$scratch" = 1 ] || persist_agent "$sess" "$dir" "$(basename "$repo_base")" "$branch" "$bare" "$base" "$H_NAME" "$self_merge" "$wname" "$_owner"
-  sync_main_tiles "$sess" 2>/dev/null || true
+  # $psess, not $sess: the saved-agents file is keyed by session name, and
+  # cmd_restore / cmd_forget read it under the PROJECT session. Persisting under a
+  # sub-orch's parked name wrote to "<sess>_hidden.agents", which nothing ever
+  # reads — the worker was un-restorable after a tmux restart and its line
+  # immortal (`fleet forget` a no-op). Writer and readers must agree.
+  [ "$scratch" = 1 ] || persist_agent "$psess" "$dir" "$(basename "$repo_base")" "$branch" "$bare" "$base" "$H_NAME" "$self_merge" "$wname" "$_owner"
+  sync_main_tiles "$psess" 2>/dev/null || true
 }
 
 # ---- send ---------------------------------------------------------------------
@@ -1488,7 +1612,10 @@ cmd_send() {
   # window in another project must never be a send target, and an unresolved session
   # must NOT silently fall back to the server-wide list (advisor §3b: that reopens
   # the cross-session shadow). The orchestrator gate above already captured "main".
-  local sess; sess=$(session_name 2>/dev/null)
+  # project_session: a sub-orch sending to one of its own workers is calling from a
+  # PARKED pane, so the caller-relative name would scope to "<sess>_hidden" and no
+  # worker in the visible session would resolve.
+  local sess; sess=$(project_session 2>/dev/null)
   [ -n "$sess" ] || die "fleet send: cannot resolve this session — run inside a fleet pane"
 
   # Resolve the target PRECISELY. The old matcher took the first substring hit on
@@ -4055,7 +4182,9 @@ _resolve_agent() { # <awk-session-filter> <target>  -> echoes matched line
 cmd_hide() { # hide <agent> — park ANY agent (scratch/bare/worktree, never main) off the bar
   local target="${1:-}"
   [ -n "$target" ] || die "usage: fleet hide <agent>"
-  local sess; sess=$(session_name 2>/dev/null)
+  # project_session: hide must park into the PROJECT's sibling. From a parked
+  # sub-orch pane the caller-relative name would build "<sess>_hidden_hidden".
+  local sess; sess=$(project_session 2>/dev/null)
   [ -n "$sess" ] || die "fleet hide: cannot resolve this session — run inside a fleet pane"
   # Resolve among the VISIBLE agents of this session (a parked agent is already hidden).
   local line
@@ -4084,7 +4213,10 @@ cmd_hide() { # hide <agent> — park ANY agent (scratch/bare/worktree, never mai
 cmd_unhide() { # unhide <agent> — surface a parked agent back onto the visible bar
   local target="${1:-}"
   [ -n "$target" ] || die "usage: fleet unhide <agent>"
-  local sess; sess=$(session_name 2>/dev/null)
+  # project_session: "surfaced" must mean ONTO THE BAR. From a parked sub-orch
+  # pane the caller-relative name would move the window into the parked session
+  # and clear @fleet_hidden — visible by marker, still invisible in fact.
+  local sess; sess=$(project_session 2>/dev/null)
   [ -n "$sess" ] || die "fleet unhide: cannot resolve this session — run inside a fleet pane"
   # Search BOTH the visible session and its parked <sess>_hidden sibling.
   local line
@@ -4387,6 +4519,27 @@ cmd_main_pane() { # main-pane [session]
 cmd_quit() {
   local sess; sess=$(session_name 2>/dev/null) || exit 0
   [ -n "$sess" ] || exit 0
+  # PARKED-CALLER GUARD (PLAN §3.2's "guard consistent with cmd_hide's"). Quit
+  # stays LITERAL-session on purpose — normalizing it would let a sub-orch tear
+  # down the human's session. But literal is not enough: a sub-orch lives in the
+  # PARKING session, so its `fleet quit` killed "<sess>_hidden" — every parked
+  # agent of the project, sibling sub-orchs and the human's own hidden agents
+  # included, not just itself. The human session survived, which is what made the
+  # blast radius easy to miss. A pane that is parked may not quit anything.
+  #
+  # The guard is deliberately NOT `is_main_pane`, unlike cmd_hide's. Quit is
+  # reached from the leader menu (`Q` → `run-shell '<self> quit'`), which is a
+  # server-wide prefix binding: it fires from the dashboard pane and from any
+  # agent window in the visible session, none of them role=main. Requiring main
+  # would break the menu. "Caller is not parked" is the property that actually
+  # bounds the blast radius, and it is exact: psess != sess IS "I am parked".
+  local psess; psess=$(project_session 2>/dev/null) || psess=""
+  if [ -n "$psess" ] && [ "$psess" != "$sess" ]; then
+    echo "fleet quit: refusing — this pane is parked in '$sess', a scratch/sub-orch" >&2
+    echo "  session. Quitting it would kill every parked agent in '$psess'." >&2
+    echo "  Run 'fleet quit' from the project session, or close just this agent." >&2
+    return 1
+  fi
   # Detach any client attached to this session (and its _hidden sibling) BEFORE
   # the kill, so the client lands at the shell instead of being orphaned.
   tmux detach-client -s "$sess" 2>/dev/null || true
@@ -4407,7 +4560,11 @@ cmd_quit() {
 # message instead of rows) for the zero/one-session short-circuits, so callers
 # can mirror today's "nothing to switch to" behaviour.
 sessions_rows() {
-  local cur; cur=$(session_name 2>/dev/null)
+  # "current" for the switcher means the PROJECT, not the pane: a parked pane's
+  # own session is never a switchable row (excluded just below), so reporting it
+  # as `cur` would mark nothing and print "only one open fleet session
+  # (pc_hidden)" — a session name the human has never seen.
+  local cur; cur=$(project_session 2>/dev/null)
   local list
   # Exclude *_hidden: scratch agents are parked in a "<sess>_hidden" sibling that
   # carries a mirrored @fleet_root (so in-agent `fleet` resolves root) but must
@@ -4964,11 +5121,39 @@ cmd_up() {
   # (unmirrored) @fleet_root. Sweep it before booting. A legit hidden session that
   # fleet is still driving keeps @fleet_harness stamped on its windows, so it is
   # never matched here. Fail-silent.
-  local stale_hidden="${name}_hidden"
-  if tmux has-session -t "=$stale_hidden" 2>/dev/null \
-     && ! tmux list-windows -t "=$stale_hidden" -F '#{@fleet_harness}' 2>/dev/null | grep -q .; then
+  # Sweep EVERY depth ("<name>_hidden", "<name>_hidden_hidden", …): before d32 a
+  # sub-orch's scratch spawn parked into a nested sibling, and tmux destroys the
+  # depth-1 session as soon as its last window leaves — orphaning the deeper one
+  # with no parent left to name it back. Those linger indefinitely (one had sat
+  # around for a week). The fix makes new ones impossible; widening this stops
+  # new GHOST debris accumulating at any depth.
+  #
+  # It does NOT rescue the orphans already on disk, and the doc must not claim it
+  # does: the @fleet_harness check below refuses any session still holding a live
+  # agent, and every nested orphan on this machine is harness-stamped. Those need
+  # a manual drain (finish or kill the windows); the empty session then goes on
+  # the next boot. Refusing is the correct policy — never destroy running work.
+  # Fail-silent.
+  local stale_hidden
+  while IFS= read -r stale_hidden; do
+    [ -n "$stale_hidden" ] || continue
+    tmux list-windows -t "=$stale_hidden" -F '#{@fleet_harness}' 2>/dev/null | grep -q . && continue
     tmux kill-session -t "=$stale_hidden" 2>/dev/null || true
-  fi
+  done < <(tmux list-sessions -F '#{session_name}' 2>/dev/null \
+             | awk -v n="$name" '
+                 # >>> d32:sweepawk
+                 index($0, n) != 1 { next }              # literal prefix, not a regex
+                 { s = substr($0, length(n) + 1)
+                   if (s == "") next                     # the visible session itself
+                   ok = 1
+                   while (s != "") {                     # must be (_hidden)+ and nothing else
+                     if (substr(s, 1, 7) == "_hidden") s = substr(s, 8)
+                     else { ok = 0; break }
+                   }
+                   if (ok) print
+                 }
+                 # <<< d32:sweepawk
+               ')
 
   local created=0
   if ! tmux has-session -t "=$name" 2>/dev/null; then
