@@ -63,54 +63,252 @@ def deny(reason):
 # false allow merges unreviewed code into main. Opt-out: a worker spawned with
 # `fleet new --self-merge` carries FLEET_SELF_MERGE=1 and is exempt.
 #
-# Known accepted gaps (pre-existing; this block is a speed-bump against ACCIDENTAL
-# self-merge, not an airtight sandbox): `sh -c 'git push'`, `eval`, aliases, and
-# wrapper scripts all have a non-`git` command word and are not caught.
-ENV_ASSIGN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
+# A quoted argument is INERT TEXT; the same characters in command-word position are
+# an EXECUTED command. That distinction is the whole design here, and it cuts both
+# ways — narrowing the false positives is only safe if every construct that turns
+# text back INTO a command is followed:
+#
+#   * `$(…)` and backticks   — command substitution: the body is executed. shlex's
+#                              punctuation_chars already splits `$(`; backticks are
+#                              not punctuation, so they are rewritten to `;` FIRST
+#                              (a `;` cannot break quote structure, so a backtick
+#                              inside a single-quoted payload stays one inert token).
+#   * `eval …`               — its arguments are re-parsed as a command: recurse on
+#                              them joined by spaces, exactly as the shell does.
+#   * `sh|bash|zsh|… -c "…"`  — the -c operand is a script: recurse into it.
+#   * `xargs [opts] cmd …`   — the remainder is a command run: re-analyze it.
+#   * env/nohup/time/timeout/sudo/… — transparent prefixes: strip and re-analyze.
+#   * shell keywords (`then`, `do`, `{`, `!`, …) — `if true; then git push; fi` has
+#                              `then` in front of the command word, not a command.
+#   * `V="git push"; $V`     — simple assignments are tracked so an expanded command
+#                              word resolves back to the command it names.
+#
+# fail-CLOSED for THIS block (the inverse of the guard's general "on any doubt,
+# allow"): the always-on merge/push floor is an integrity control. On an
+# unbalanced-quote parse error we cannot tell payload from command at all, so we
+# fall back to a raw regex over the text — which over-denies (a payload mentioning
+# the verb plus a stray quote is refused) but never lets a real `git merge`/`git
+# push` slip past. A false deny on malformed input is recoverable (rephrase); a
+# false allow merges unreviewed code into main. Opt-out: a worker spawned with
+# `fleet new --self-merge` carries FLEET_SELF_MERGE=1 and is exempt.
+#
+# Remaining accepted gaps (this block is a speed-bump against ACCIDENTAL
+# self-merge, not a sandbox): shell functions and aliases, a wrapper script whose
+# name is not `git`, `find -exec`, and a command word built by expansion we cannot
+# resolve (`$UNKNOWN`, `${x:-git}`, `g$(echo it)`).
+ENV_ASSIGN = re.compile(r"^([A-Za-z_][A-Za-z0-9_]*)=(.*)$", re.S)
+RAW_GIT = re.compile(r"\bgit\b(?:\s+-[^\s]*(?:\s+[^\s-][^\s]*)?)*\s+(merge|push)\b")
+VAR_REF = re.compile(r"^\$\{?([A-Za-z_][A-Za-z0-9_]*)\}?$")
+
+SHELLS = ("sh", "bash", "zsh", "dash", "ksh", "ash", "mksh", "busybox")
+# transparent prefixes -> how many NON-option operands to drop before the command
+PREFIX = {"env": 0, "nohup": 0, "command": 0, "builtin": 0, "exec": 0, "stdbuf": 0,
+          "setsid": 0, "sudo": 0, "doas": 0, "time": 0, "nice": 0, "ionice": 0,
+          "timeout": 1, "xargs": 0}
+KEYWORD = ("if", "then", "else", "elif", "fi", "do", "done", "while", "until",
+           "for", "case", "esac", "in", "{", "}", "!", "(", ")")
+MAXDEPTH = 6
+
 
 def is_op(tok):  # an operator token is made solely of shell metacharacters
     return tok != "" and all(c in "();<>|&" for c in tok)
 
-def git_sub_in_run(run):  # subcommand iff `git` is this run's command word, else None
-    k = 0
-    while k < len(run) and ENV_ASSIGN.match(run[k]):   # skip FOO=bar prefixes
-        k += 1
-    if k >= len(run) or run[k] != "git":
-        return None
-    j = k + 1
-    while j < len(run) and run[j].startswith("-"):     # skip git global opts
-        if run[j] in ("-C", "-c") and j + 1 < len(run):
-            j += 2
-        else:
-            j += 1
-    return run[j] if j < len(run) else ""
 
-def git_subcommands(line):  # all command-word git subcommands on one line
+def tokenize(line):
+    """Quote-aware tokens, or None when the input does not parse."""
     try:
         lex = shlex.shlex(line, posix=True, punctuation_chars=True)
         lex.whitespace_split = True
-        toks = list(lex)
+        return list(lex)
     except ValueError:
-        toks = line.split()            # fall CLOSED: conservative whitespace scan
-    subs, run = [], []
-    for tok in toks + ["\n"]:          # sentinel flushes the final run
-        if tok == "\n" or is_op(tok):
-            s = git_sub_in_run(run)
-            if s is not None:
-                subs.append(s)
-            run = []
+        return None
+
+
+def _close_subst(text, i):
+    """Body and end index of the `…` / $(…) substitution starting at i, or None.
+
+    Quote state matters and is NOT symmetric: inside DOUBLE quotes a substitution
+    still runs (`echo "x $(git push)"` pushes), inside SINGLE quotes it is inert.
+    So the caller skips single-quoted spans and calls us for everything else.
+    """
+    if text[i] == "`":
+        j = i + 1
+        while j < len(text):
+            if text[j] == "\\":
+                j += 2
+                continue
+            if text[j] == "`":
+                return text[i + 1:j], j + 1
+            j += 1
+        return None
+    j, depth, sq, dq = i + 2, 1, False, False
+    while j < len(text):
+        c = text[j]
+        if sq:
+            sq = c != "'"
+        elif c == "\\":
+            j += 1
+        elif c == "'" and not dq:
+            sq = True
+        elif c == '"':
+            dq = not dq
+        elif not dq:
+            if c == "(":
+                depth += 1
+            elif c == ")":
+                depth -= 1
+                if depth == 0:
+                    return text[i + 2:j], j + 1
+        j += 1
+    return None
+
+
+def lift_substitutions(text):
+    """(text with substitutions blanked out, [their bodies]) or None if unbalanced.
+
+    Lifting the bodies OUT — rather than rewriting them into `;`-separated
+    statements in place — is what keeps quoting intact: the surrounding string
+    stays exactly as balanced as it was, so a payload is still one inert token
+    while the substituted body is scanned as the command it is.
+    """
+    out, bodies, i, sq, dq = [], [], 0, False, False
+    while i < len(text):
+        c = text[i]
+        if sq:
+            sq = c != "'"
+            out.append(c)
+        elif c == "\\" and i + 1 < len(text):
+            out.append(c)
+            out.append(text[i + 1])
+            i += 2
+            continue
+        elif c == "'" and not dq:
+            sq = True
+            out.append(c)
+        elif c == '"':
+            dq = not dq
+            out.append(c)
+        elif c == "`" or (c == "$" and text[i + 1:i + 2] == "("):
+            got = _close_subst(text, i)
+            if got is None:
+                return None                 # unbalanced -> caller falls CLOSED
+            body, i = got
+            bodies.append(body)
+            out.append("_fleetsub_")
+            continue
         else:
-            run.append(tok)
-    return subs
+            out.append(c)
+        i += 1
+    return "".join(out), bodies
+
+
+def scan_run(run, env, depth, out):
+    """Record git subcommands executed by one statement (a run of words)."""
+    if depth > MAXDEPTH:
+        return
+    k = 0
+    while k < len(run):
+        m = ENV_ASSIGN.match(run[k])
+        if m:                                   # FOO=bar prefix (and remember it)
+            env[m.group(1)] = m.group(2)
+            k += 1
+        elif run[k] in KEYWORD:                 # `then git push` is a command
+            k += 1
+        else:
+            break
+    if k >= len(run):
+        return
+    word = run[k]
+    rest = run[k + 1:]
+
+    v = VAR_REF.match(word)                     # V="git push"; $V
+    if v:
+        val = env.get(v.group(1))
+        if val is not None:
+            scan_text(val, env, depth + 1, out)
+        return
+
+    name = os.path.basename(word)
+
+    if name == "git":
+        j = 0
+        while j < len(rest) and rest[j].startswith("-"):   # skip git global opts
+            j += 2 if rest[j] in ("-C", "-c") and j + 1 < len(rest) else 1
+        out.append(rest[j] if j < len(rest) else "")
+        return
+
+    if name == "eval":                          # args are re-parsed as a command
+        scan_text(" ".join(rest), env, depth + 1, out)
+        return
+
+    if name in SHELLS:                          # sh -c '…'
+        j = 0
+        while j < len(rest):
+            if rest[j] == "-c" and j + 1 < len(rest):
+                scan_text(rest[j + 1], env, depth + 1, out)
+                return
+            if rest[j].startswith("-") and "c" in rest[j][1:] and j + 1 < len(rest):
+                scan_text(rest[j + 1], env, depth + 1, out)
+                return
+            j += 1
+        return
+
+    if name in PREFIX:                          # env/xargs/timeout/… <command> …
+        drop = PREFIX[name]
+        j = 0
+        while j < len(rest):
+            if rest[j].startswith("-"):
+                j += 1
+            elif ENV_ASSIGN.match(rest[j]) and name in ("env", "sudo"):
+                j += 1
+            elif drop > 0:
+                drop -= 1
+                j += 1
+            else:
+                break
+        scan_run(rest[j:], env, depth + 1, out)
+        return
+
+
+def scan_text(text, env, depth, out):
+    """Record every git subcommand this shell text would EXECUTE."""
+    if depth > MAXDEPTH:
+        return
+    lifted = lift_substitutions(text)
+    if lifted is None:                          # fall CLOSED: unparseable input
+        m = RAW_GIT.search(text)
+        if m:
+            out.append(m.group(1))
+        return
+    text, bodies = lifted
+    for body in bodies:                         # `…` / $(…) bodies ARE executed
+        scan_text(body, env, depth + 1, out)
+    for line in text.split("\n"):
+        toks = tokenize(line)
+        if toks is None:                        # fall CLOSED: unparseable input
+            m = RAW_GIT.search(line)
+            if m:
+                out.append(m.group(1))
+            continue
+        run = []
+        for tok in toks + ["\n"]:               # sentinel flushes the final run
+            if tok == "\n" or is_op(tok):
+                if run:
+                    scan_run(run, env, depth, out)
+                run = []
+            else:
+                run.append(tok)
+
 
 if tool == "Bash" and role == "worker" and os.environ.get("FLEET_SELF_MERGE") != "1":
     cmd = str((h.get("tool_input") or {}).get("command") or "")
-    for line in cmd.split("\n"):
-        for sub in git_subcommands(line):
-            if sub in ("merge", "push"):
-                deny("fleet-guard: workers must not run 'git %s'. Integration is the "
-                     "orchestrator's job — it reviews your diff and merges/pushes. "
-                     "Commit on your own branch and run 'fleet ready' to signal done." % sub)
+    subs = []
+    scan_text(cmd, {}, 0, subs)
+    for sub in subs:
+        if sub in ("merge", "push"):
+            deny("fleet-guard: workers must not run 'git %s'. Integration is the "
+                 "orchestrator's job — it reviews your diff and merges/pushes. "
+                 "Commit on your own branch and run 'fleet ready' to signal done." % sub)
 
 # --- (2) OPT-IN: protected-path edits (tests / CI / lockfiles) -------------------
 if os.environ.get("FLEET_GUARD_ON") != "1":
