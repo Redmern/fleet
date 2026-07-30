@@ -987,7 +987,16 @@ render() {
           local hstate hsdisp hscol hage
           hstate=$(field "$i" 1); hage=$(field "$i" 7); hsdisp="$hstate"; hscol=$(state_pcol "$hstate")
           if [ "$hstate" = working ] && (( ${hage:-0} > STALL_SEC )); then hsdisp="stalled"; hscol=1; fi
-          case "$hstate" in working|blocked) ;; *) [ -n "$(field "$i" 8)" ] && { hsdisp="done"; hscol=5; } ;; esac
+          # Same three-way as the worker row below: `review` (ready + dirty) is NOT
+          # `done` — a magenta done pill on a card whose reap would refuse lies.
+          case "$hstate" in
+            working|blocked) ;;
+            *) case "$(field "$i" 8)" in
+                 "")     ;;
+                 review) hsdisp="review"; hscol=3 ;;
+                 *)      hsdisp="done";   hscol=5 ;;
+               esac ;;
+          esac
           local hpill; hpill=$(pill "$hsdisp" "$hscol")
           local hw                                            # hrule width shrinks by the pill so content stays == inner
           if (( i == sel )); then
@@ -1075,9 +1084,16 @@ render() {
       # override a NON-live state: a working/blocked agent carrying a stale or
       # inherited .fleet/ready marker is still busy, so keep its live pill.
       # idle/stalled/dead/unknown + flagged = genuinely done.
+      # `review` (ready + dirty, derived in agents_tsv) means the worker is finished
+      # but a human still owes the commit — yellow, NOT the magenta `done`, because
+      # `done` reads as "reapable" and reap will refuse this worktree.
       case "$state" in
         working|blocked) ;;
-        *) [ -n "$(field "$i" 8)" ] && { sdisp="done"; scol=5; } ;;
+        *) case "$(field "$i" 8)" in
+             "")      ;;
+             review)  sdisp="review"; scol=3 ;;
+             *)       sdisp="done";   scol=5 ;;
+           esac ;;
       esac
       # State-independent ready glyph. The `done` pill above is idle-only BY
       # DESIGN (a `done` pill on a live agent would make the reap scan lie), so a
@@ -1696,7 +1712,7 @@ confirm_teardown() {
   opts+=("Close window (keep files)");                acts+=("close")
   if (( iswt == 1 )); then
     opts+=("Close + remove worktree");                acts+=("remove")
-    opts+=("Close + FORCE remove (discard changes)"); acts+=("force")
+    opts+=("Close + FORCE remove (salvages a patch first)"); acts+=("force")
   fi
   opts+=("Cancel");                                   acts+=("cancel")
   local n=${#opts[@]} mi=0 k r R C bw=54
@@ -1743,8 +1759,20 @@ confirm_teardown() {
                  "$FLEET_BIN" forget "$dir" 2>/dev/null
                  status="closed $label"; return ;;
           remove|force)
-            local force="" main
+            local force="" main salvage=""
             [ "${acts[mi]}" = force ] && force="--force"
+            # SALVAGE FIRST. This key is a 3-keystroke force-remove and, unlike
+            # `fleet reap`, it never had a dirty guard — after no-auto-commit that
+            # makes it the shortest path to destroying work no human has reviewed
+            # (uncommitted == no reflog, no fsck recovery). Export a patch +
+            # untracked tarball outside the worktree before anything is removed,
+            # and REFUSE the removal outright if the export fails: a teardown we
+            # cannot make recoverable is one we do not perform.
+            if [ -n "$dir" ]; then
+              if ! salvage=$("$FLEET_BIN" export-uncommitted "$dir" 2>/dev/null); then
+                status="refused: could not salvage uncommitted work — $label left intact"; return
+              fi
+            fi
             # main working tree (or bare container) to run `worktree remove` from
             main=$(git -C "$dir" worktree list --porcelain 2>/dev/null | awk '/^worktree /{print $2; exit}')
             "$FLEET_BIN" safe-kill-window "$win" 2>/dev/null   # brake: refuse main/last/empty
@@ -1753,8 +1781,9 @@ confirm_teardown() {
             if git -C "${main:-$dir}" worktree remove $force "$dir" 2>/dev/null; then
               status="removed worktree: $label"
             else
-              status="closed; worktree kept (uncommitted? use FORCE): $label"
+              status="closed; worktree kept — commit or salvage it first: $label"
             fi
+            [ -n "$salvage" ] && status="$status · salvaged -> $salvage"
             return ;;
         esac ;;
       q) return ;;
@@ -1762,13 +1791,19 @@ confirm_teardown() {
   done
 }
 
-# view_diff <dir> <label> -> show the agent's `git diff HEAD` in a popup pager
+# view_diff <dir> <label> -> show the agent's uncommitted work in a popup pager
 # (delta if available, else less). Blocks until the user quits the pager.
+#
+# Delegates to `fleet diff-view`, which is the ONE definition of "the diff" —
+# staged + unstaged + UNTRACKED. The old inline `git diff HEAD` omitted untracked
+# files entirely and then printed "working tree clean vs HEAD", so an agent whose
+# whole job was creating new files showed as having done nothing. In no-commit
+# mode that is the primary review surface, so it may not lie.
 view_diff() {
-  local dir="$1" label="$2" pager="less -R" q
+  local dir="$1" label="$2" pager="less -R" q fq
   command -v delta >/dev/null 2>&1 && pager="delta"
-  q=$(printf '%q' "$dir")
-  local cmd="d=\$(git -C $q -c color.ui=always diff HEAD 2>/dev/null); if [ -n \"\$d\" ]; then printf '%s\\n' \"\$d\" | $pager; else printf 'working tree clean vs HEAD\\n'; sleep 1.2; fi"
+  q=$(printf '%q' "$dir"); fq=$(printf '%q' "$FLEET_BIN")
+  local cmd="d=\$($fq diff-view --color $q 2>/dev/null); if [ -n \"\$d\" ]; then printf '%s\\n' \"\$d\" | $pager; else printf 'no diff available\\n'; sleep 1.2; fi"
   tmux display-popup -E -b rounded -w 90% -h 90% -T " diff · $label " "$cmd" 2>/dev/null
 }
 

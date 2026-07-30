@@ -392,15 +392,24 @@ EOS
 # CLAUDE.md's own head, and install_orch_guide propagates FLEET.md into every
 # project's CLAUDE.md / AGENTS.md). Compare the `fleet ready` bullet byte-for-byte.
 ( c=12
-  bullet() { awk '/^- `fleet ready /{f=1} f{print} f&&/^$/{exit}' "$1"; }
+  # Stop at the next top-level bullet OR a blank line — whichever comes first. The
+  # old blank-line-only terminator silently swallowed the following bullets when
+  # the list had no blank separator, which made the content assertions below
+  # vacuous (they matched "uncommitted" in the `fleet reap` bullet).
+  bullet() { awk '/^- `fleet ready /{f=1; print; next} f&&(/^- /||/^$/){exit} f{print}' "$1"; }
   fb=$(bullet "$HERE/FLEET.md"); cb=$(awk '/^# Fleet — orchestrator capabilities/{s=1} s' "$HERE/CLAUDE.md" \
-        | awk '/^- `fleet ready /{f=1} f{print} f&&/^$/{exit}')
+        | awk '/^- `fleet ready /{f=1; print; next} f&&(/^- /||/^$/){exit} f{print}')
   if [ -z "$fb" ]; then fail $c "no \`fleet ready\` bullet found in FLEET.md"; exit 1; fi
   if [ "$fb" != "$cb" ]; then
     fail $c "the \`fleet ready\` bullet differs between FLEET.md and CLAUDE.md's mirrored block"; exit 1
   fi
-  if ! printf '%s' "$fb" | grep -q 'committed'; then
-    fail $c "the bullet is not an unambiguous worker instruction (must say: when the task is done AND COMMITTED; not when pausing/blocked/asking)"
+  # INVERTED by d31 (no-auto-commit): the bullet used to have to say the task is
+  # done AND COMMITTED. Agents no longer commit — they STAGE and stop — so the
+  # bullet must now say exactly that, and must NOT re-introduce the old directive.
+  if ! printf '%s' "$fb" | grep -qF 'git add -A'; then
+    fail $c "the bullet is not an unambiguous worker instruction (must say: stage with 'git add -A', do NOT commit, then fleet ready; not when pausing/blocked/asking)"
+  elif printf '%s' "$fb" | grep -q 'complete AND$\|and committed\|AND committed'; then
+    fail $c "the bullet still tells workers to commit before \`fleet ready\` (d31 removed agent commits)"
   elif ! grep -qF '**`y`** toggles the ready flag' "$HERE/FLEET.md" \
     || ! grep -qF '**`y`** toggles the ready flag' "$HERE/CLAUDE.md"; then
     fail $c "the agents-view \`y\` verb is not documented in both FLEET.md and CLAUDE.md"
