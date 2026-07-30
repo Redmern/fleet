@@ -336,6 +336,43 @@ Locked in by `test/agent-task-proof.sh` (22 cases / 36 assertions; the regressio
 group asserting the 9-field shapes and the absent `done` pill is the highest-value
 part).
 
+### Guard: executed command vs inert argument (`fleet-guard` block 1)
+
+The always-on worker merge/push floor asks exactly one question: **is this text a
+command being EXECUTED, or an argument that merely mentions it?** Both errors are
+real. Scanning raw text denied `fleet new … -p "…git merge…"` — a sub-orch
+delegating integration, the sanctioned path — and taught the operator to route
+around the guard by stashing the prompt in a file. Scanning only the command word
+of each `;`/`&&`/`|` run lets `eval`, `sh -c`, `xargs`, `` ` ` `` and `$V` walk
+straight through.
+
+So the parse follows every construct that turns text back INTO a command, and
+nothing else: `$(…)`/backtick bodies are **lifted out** of the text (leaving the
+surrounding quoting exactly as balanced as it was — rewriting them in place as
+`;`-separated statements is what breaks a payload back into false tokens) and
+scanned as their own script; `eval`'s args are re-joined and re-parsed; a shell's
+`-c` operand is recursed into; `xargs`/`env`/`timeout`/`sudo`/`nohup`/`command`
+are transparent prefixes; leading shell keywords are skipped (`then git push` is a
+command); simple `V=…` assignments are tracked so an expanded command word
+resolves. Quote state is **not symmetric** and the code says so: `$(git push)` runs
+inside DOUBLE quotes and is inert inside SINGLE ones.
+
+Unbalanced quotes fall **CLOSED** — a raw regex over the line, the inverse of the
+guard's general "on any doubt, allow". A false deny is recoverable by rephrasing;
+a false allow merges unreviewed code into main. `FLEET_SELF_MERGE=1` (from
+`fleet new --self-merge`) still exempts the pane, and only `role=worker` + `Bash`
+is in scope.
+
+Remaining accepted gaps, unchanged in kind: shell functions/aliases, a wrapper
+script not named `git`, `find -exec`, and a command word built by expansion we
+cannot resolve. This block is a speed-bump against ACCIDENTAL self-merge, not a
+sandbox.
+
+Locked in by `test/guard-quoted-payload-proof.sh` (57 assertions, no tmux/daemon —
+synthesized hook JSON on stdin). Run it against an older checkout with
+`GUARD=<path>/bin/fleet-guard` to see the halves go red: 22 of the DENY cases fail
+against `HEAD~`, and the ALLOW half additionally fails against pre-`034bb75` code.
+
 ### Worktree secrets (`inject_secrets`)
 
 `inject_secrets <repo> <dir>` runs inside `cmd_new` right after the worktree is
