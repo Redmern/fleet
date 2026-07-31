@@ -59,7 +59,10 @@ SUBORCH_MD="$HERE/FLEET_SUBORCH.md"
 # The commit this feature branched from. Group B byte-compares bin/fleet-guard
 # against it to prove the always-on block was not touched (SYNTHESIS
 # non-negotiable 3). Overridable so the harness stays runnable from a rebase.
-BASE_REF="${SMG_BASE:-0755b32}"
+# Re-pinned at round 3: `main` legitimately changed the guard (d32 `cb4a42b`,
+# tokenize whole; and the no-auto-commit block), so the round-1 ref no longer
+# means "unchanged by THIS work". Pin to main's current guard instead.
+BASE_REF="${SMG_BASE:-ee08bfc}"
 
 [ -x "$FLEET" ] || { echo "no such fleet: $FLEET" >&2; exit 2; }
 [ -x "$GUARD" ] || { echo "no such guard: $GUARD" >&2; exit 2; }
@@ -169,7 +172,7 @@ ok $? "A7 popped line 2 is byte-identical to the sentinel (header-drift pin)" \
 
 printf 'From x: t\n\n[FLEET-GATE:2 slug=s action=merge target=main]\n' \
   | "$FLEET" gate parse >/dev/null 2>&1
-[ $? != 0 ]; ok $? "A8 sentinel on line 3 does NOT parse (bound is 2, the real shape)" \
+[ $? != 0 ]; ok $? "A8 a sentinel on line 3 does NOT parse (the parser reads line 1 and line 2 only — characterisation, NOT a bound pin: no assertion here can detect the bound changing)" \
   "the bound is wider than the pop shape — pure widening of the forgery window"
 
 # The ANCHOR, not the count: a bare bound of 2 still honours line 2 after ANY
@@ -203,7 +206,9 @@ gcheck DENY  "worker: git -C elsewhere merge" 'git -C /tmp/x merge y'
 gcheck ALLOW "worker + --self-merge grant"  'git merge feature' FLEET_SELF_MERGE=1
 gcheck ALLOW "worker: git status"           'git status'
 gcheck ALLOW "worker: git add -A"           'git add -A'
-gcheck ALLOW "worker: git commit"           'git commit -m "work"'
+# Worker commits are DENIED on current main — the no-auto-commit backstop, a
+# separate landed feature. Characterised here, not owned by this round.
+gcheck DENY  "worker: git commit (no-auto-commit backstop)" 'git commit -m "work"'
 gcheck ALLOW "worker: single-line quoted body naming the verb" \
   'fleet inbox put -d d1 -t done -m "orchestrator will git merge this"'
 # ALLOW CONTROL, labelled as such: the verb sits MID-LINE, so the line's command
@@ -211,14 +216,18 @@ gcheck ALLOW "worker: single-line quoted body naming the verb" \
 # only as the control its honest companion below is measured against.
 gcheck ALLOW "CONTROL: multi-line body, verb MID-line (command word is 'step')" \
   "$(printf 'fleet new fleet b -p "step 1: commit\nstep 2: git merge into main\n"')"
-# KNOWN DEFECT, the honest companion. `bin/fleet-guard:286` splits on newline
-# BEFORE the quote-aware tokenizer, so a line of a QUOTED prompt whose first word
-# is the integration verb is judged as an executed command and DENIED. This is a
-# live guard defect that `ecd71fe` did NOT fix, and it is precisely why §7.1 must
-# put the steps in SHIP.md and keep the prompt a one-line pointer. This row goes
-# RED if anyone "corrects" the docs back to claiming the multi-line form is fine.
-gcheck DENY  "KNOWN DEFECT: multi-line quoted body, verb at COLUMN 0 of line 2" \
+# THE DEFECT IS FIXED (d32 `cb4a42b` tokenizes the text whole instead of splitting
+# on newline first). The verb at COLUMN 0 of line 2 of a QUOTED prompt is now ALLOW.
+# This row inverted at round 3: it previously pinned the DENY. Kept because it is the
+# measurement §7.1's prose now rests on — the pointer shape survives for the harness's
+# auto-mode classifier, NOT for fleet-guard.
+gcheck ALLOW "FIXED (cb4a42b): multi-line quoted body, verb at COLUMN 0 of line 2" \
   "$(printf 'fleet new fleet b -p "step 1: commit\ngit merge S into main\n"')"
+# The DISCRIMINATOR for the row above: a genuinely multi-line SCRIPT — the newline is
+# outside quotes, so the verb really is a command word — is still DENIED. Without this
+# row the ALLOW above is equally satisfied by a guard that allows everything.
+gcheck DENY  "multi-line SCRIPT, real git push on line 2 (unquoted newline) still DENIED" \
+  "$(printf 'printf "a\\nb\\n"\ngit push origin main')"
 # Unbalanced quote: the always-on block deliberately falls CLOSED (a raw regex),
 # the inverse of the guard's general "on any doubt, allow".
 gcheck DENY  "worker: unbalanced quote around the verb (fails CLOSED)" \
@@ -587,8 +596,22 @@ if [ "$F_OK" = 1 ]; then
   nfleet new repo1 feat --bare --name ship-b >/dev/null 2>&1
   wait_win ship-b
   [ -e "$WT/.fleet/ready" ]
-  ok $? "F9 a same-branch spawn does NOT clear a marker whose pane is ALIVE" \
+  ok $? "F9 a same-branch spawn does NOT clear a marker whose pane is a live OCCUPANT of \$dir" \
     "the second spawn erased the live impl worker's done marker"
+
+  # F9b — THE DISCRIMINATOR, and the reason liveness alone is not enough. Pane ids
+  # restart at %0 on a new tmux server, the very event .fleet/ready persists across,
+  # so a recycled id that is live SOMEWHERE ELSE must not keep the marker. Red today:
+  # the old server-global liveness test kept it. F9 alone cannot detect that.
+  killwin ship-b 2>/dev/null
+  OPANE=$(tmux list-panes -a -F '#{window_name}	#{pane_id}' 2>/dev/null | awk -F'\t' '$1=="scratch-named"{print $2; exit}')
+  printf 'ts=x\nby=worker\npane=%s\n' "$OPANE" > "$WT/.fleet/ready"
+  nfleet new repo1 feat --bare --name ship-b2 >/dev/null 2>&1
+  wait_win ship-b2
+  [ ! -e "$WT/.fleet/ready" ]
+  ok $? "F9b a marker whose pane is ALIVE but occupies a DIFFERENT dir IS cleared" \
+    "liveness-only: a recycled pane id live elsewhere kept a stale marker, arming reap"
+  killwin ship-b2 2>/dev/null
 
   # …and the reap-safety case it was written for is preserved: an INHERITED marker
   # from a pane that is gone must still be cleared, or reap would tear down the
@@ -734,15 +757,56 @@ for f in "$HERE/CLAUDE.md" "$HERE/FLEET.md" "$SUBORCH_MD"; do
 done
 [ "$d11" = 0 ]
 ok $? "D11 no shipped file still claims --name prevents the .fleet/ready clobber" \
-  "the marker is protected by pane liveness, not by the window name"
-grep -q 'pane liveness' "$HERE/CLAUDE.md"
-ok $? "D11b CLAUDE.md states the marker's ACTUAL protection (pane liveness)" \
+  "the marker is protected by pane occupancy, not by the window name"
+grep -q 'pane occupancy' "$HERE/CLAUDE.md"
+ok $? "D11b CLAUDE.md states the marker's ACTUAL protection (pane OCCUPANCY, not liveness)" \
   "the corrected mechanism is undocumented"
+# D11c — the honesty disclaimer that goes with it. This is the sentence most likely to
+# be edited away later, so it is pinned positively, same shape as D15.
+grep -q 'reliability check, not a control' "$HERE/CLAUDE.md" \
+  && grep -qi 'plain text in a same-uid world' "$HERE/CLAUDE.md"
+ok $? "D11c CLAUDE.md keeps the occupancy-check residual disclaimer (not a control)" \
+  "the honesty sentence was dropped — the check would read as a security control"
 
-# D12 — the descoped hazard block (R5) must not be quietly deleted.
-grep -q 'KNOWN, UNMITIGATED' "$HERE/CLAUDE.md"
-ok $? "D12 CLAUDE.md carries the KNOWN, UNMITIGATED live-CLI hazard block" \
-  "the descope was deleted — silence here was the round-1 failure"
+# D11d — R10's STATED LIMITATION: the saved-agents record is keyed on the worktree
+# dir, so a same-branch pair does NOT survive a tmux restart. All three prose files
+# must state it, and none may still carry the old 'survives a restart' denial.
+d11d=0
+for f in "$HERE/CLAUDE.md" "$HERE/FLEET.md" "$SUBORCH_MD"; do
+  grep -qi 'keyed on the worktree dir' "$f" 2>/dev/null \
+    || { d11d=1; echo "    (no restart limitation: $(basename "$f"))"; }
+  grep -qiE 'so it survives a tmux (server )?restart' "$f" 2>/dev/null \
+    && { d11d=1; echo "    (still denies it: $(basename "$f"))"; }
+done
+[ "$d11d" = 0 ]
+ok $? "D11d all three prose files state the same-branch restart limitation and no longer deny it" \
+  "BLOCK-1: prose asserts a durability property persist_agent does not have"
+
+# D11e — R15. The guard-defect rationale is DEAD on current main (cb4a42b); the
+# auto-mode-classifier rationale is the one that survives. Both halves pinned.
+d11e=0
+for f in "$HERE/CLAUDE.md" "$SUBORCH_MD"; do
+  grep -qiE 'live guard defect|KNOWN DEFECT|coin-flip' "$f" 2>/dev/null \
+    && { d11e=1; echo "    (still blames the guard: $(basename "$f"))"; }
+done
+[ "$d11e" = 0 ]
+ok $? "D11e no shipped file still blames fleet-guard for the multi-line prompt (fixed by cb4a42b)" \
+  "prose asserts a guard defect the code no longer has — round 1+2's failure shape, inverted"
+grep -qi "auto-mode classifier" "$SUBORCH_MD"
+ok $? "D11f §7.1 keeps the rationale that DID survive (the harness auto-mode classifier)" \
+  "the surviving reason for the one-line pointer was deleted with the dead one"
+
+# D12 — the descoped hazard block (R5) must not be quietly deleted, and it must
+# reach the agent that can TRIGGER it: the sub-orch dispatching a SHIP worker,
+# which reads FLEET_SUBORCH.md §7 and never CLAUDE.md.
+d12=0
+for f in "$HERE/CLAUDE.md" "$SUBORCH_MD"; do
+  grep -q 'KNOWN, UNMITIGATED' "$f" 2>/dev/null && grep -q 'merge --abort' "$f" 2>/dev/null \
+    || { d12=1; echo "    (no live-CLI hazard + recovery: $(basename "$f"))"; }
+done
+[ "$d12" = 0 ]
+ok $? "D12 BOTH CLAUDE.md and FLEET_SUBORCH.md carry the UNMITIGATED live-CLI hazard + recovery" \
+  "the descope was deleted, or is invisible to the agent that triggers it"
 grep -q 'merge --abort' "$HERE/CLAUDE.md"
 ok $? "D13 the hazard block names the fleet-free recovery command" "no recovery command"
 grep -q '2026-07-30' "$HERE/CLAUDE.md"

@@ -1439,20 +1439,27 @@ $(ready_instructions)"
   # SECOND agent on the same branch — exactly the GATE 2 SHIP worker — reuses the
   # impl worker's worktree and used to erase its `.fleet/ready` whatever either
   # window was called. --name cannot fix that: the window name never enters $dir.
-  # The marker records the pane that wrote it (`pane=`, see cmd_ready), the same
-  # predicate agents_tsv already uses to decide whether a marker belongs to a given
-  # occupant. Keep it while that pane is ALIVE — a live sibling's "I am done" is
-  # not ours to erase — and clear it otherwise, which is the inherited-stale-marker
-  # case this clear exists for. Unstamped (legacy) markers clear exactly as before.
-  # RESIDUAL, stated: cmd_ready writes with `>`, so two live agents flagging the
-  # same worktree still race and the last writer wins.
-  local _rmk="$dir/.fleet/ready" _rpane=""
+  # The marker records the pane that wrote it (`pane=`, see cmd_ready). Keep it only
+  # while that pane is a live OCCUPANT of $dir. Occupancy, not mere liveness, is the
+  # discriminator: the pair shares $dir exactly, while pane ids restart at %0 on a new
+  # tmux server — the very event markers persist across — so a server-global liveness
+  # test keeps a stale marker on a recycled id. Same scan shape as cmd_reap's
+  # live-occupant check; realpath because the dispatch symlink farm makes $dir and
+  # pane_current_path differ in the real deployment. A miss CLEARS, deliberately: a
+  # cleared marker costs a pill and one `fleet ready`, a kept stale one costs a live
+  # agent's worktree. RESIDUAL: a reliability check, not a control — cmd_ready writes
+  # with `>`, so two live agents flagging one worktree still race, last writer wins.
+  local _rmk="$dir/.fleet/ready" _rpane="" _live=0 _drp _gp _gpath
   [ -e "$_rmk" ] && _rpane=$(sed -n 's/^pane=//p' "$_rmk" 2>/dev/null | head -1)
-  if [ -n "$_rpane" ] && tmux list-panes -a -F '#{pane_id}' 2>/dev/null | grep -qxF "$_rpane"; then
-    : # a LIVE sibling wrote it — leave the marker alone
-  else
-    rm -f "$_rmk" 2>/dev/null || true
+  if [ -n "$_rpane" ]; then
+    _drp=$(realpath "$dir" 2>/dev/null || echo "$dir")
+    while IFS=$'\t' read -r _gp _gpath; do
+      [ "$_gp" = "$_rpane" ] || continue
+      [ "$(realpath "$_gpath" 2>/dev/null || echo "$_gpath")" = "$_drp" ] || continue
+      _live=1; break
+    done < <(tmux list-panes -a -F '#{pane_id}'$'\t''#{pane_current_path}' 2>/dev/null)
   fi
+  [ "$_live" = 1 ] || rm -f "$_rmk" 2>/dev/null || true
 
   local win_id
   if [ "$bare" = 1 ]; then
@@ -2523,11 +2530,11 @@ cmd_gate() {
 # honoured only when line 1 is an actual pop header. `fleet inbox put` has NO role
 # check, so any pane can enqueue an arbitrary body; a bare bound of N would hand an
 # attacker N-1 lines of camouflage lead-in to bury a forged sentinel behind.
-GATE_SCAN_LINES=2
 gate_parse() { # parse [file]
+  # Reads line 1 and line 2 and nothing else — the bound is structural, not a knob.
   local head l1 l2 first=""
-  if [ -n "${1:-}" ] && [ -f "$1" ]; then head=$(sed -n "1,${GATE_SCAN_LINES}p" "$1" 2>/dev/null)
-  else head=$(sed -n "1,${GATE_SCAN_LINES}p" 2>/dev/null); fi
+  if [ -n "${1:-}" ] && [ -f "$1" ]; then head=$(sed -n '1,2p' "$1" 2>/dev/null)
+  else head=$(sed -n '1,2p' 2>/dev/null); fi
   l1=$(printf '%s\n' "$head" | sed -n 1p)
   l2=$(printf '%s\n' "$head" | sed -n 2p)
   case "$l1" in
