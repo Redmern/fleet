@@ -304,24 +304,34 @@ an agent does, for display only. Three load-bearing constraints:
    (fork-bomb, merge/push, `is_main_pane`). `main` is not in the task enum, so a
    worker cannot self-promote through this surface.
 3. **The enum is closed, validated at the single write site AND re-validated on
-   read** (`task_of`). `@fleet_task`'s *contents* are format-expanded by tmux via
-   the `window-status-format` token, so an unvalidated value carrying `#[` would
-   corrupt the status bar for the **whole tmux server**. Tags are 4 pure-ASCII
+   read** (`task_of`). It no longer *has* to be — the value stopped reaching a tmux
+   format string when the status-bar token was removed (d35), and with it the blast
+   radius where an unvalidated `#[` corrupted `window-status-format` for the **whole
+   tmux server**. Both checks stay: they are free, and they are what keeps a garbage
+   tag out of the two surfaces that remain. Tags are 4 pure-ASCII
    chars (`rsch`/`plan`/`impl`/`test`/`scr `, blank otherwise) because
    `popup_fit_content`, `fit_left` and `hrule` all count **codepoints, not display
    cells**, and there is no ASCII-fallback ladder to degrade to.
 
-Rendered in three places:
+Rendered in **two** places — the tmux status bar was the third and is **gone**
+(d35). It used to be a second token appended beside `@agent_glyph`, expanding a
+companion `@fleet_task_tag` option that held the already-rendered tag (a tmux
+format expands an option's value verbatim and cannot map `research`→`rsch`
+itself). With the token gone **nothing reads `@fleet_task_tag`**, so it is no
+longer stamped — only actively *unset* at the write site, on both branches, so a
+window carrying a stale value from an older fleet cannot render one. `@fleet_task`
+is now the sole stored form, canonical and machine-readable, read by `task_of` /
+the dash / `fleet ls`.
 
-- **the tmux status bar** — a second token appended beside `@agent_glyph`, never
-  *into* it (`@agent_glyph` is fleetd-owned and rewritten on every state
-  transition). Healed by both `inject_status_format` and fleetd's
-  `heal_status_format`. It expands a companion **`@fleet_task_tag`** option
-  holding the already-rendered tag: a tmux format expands an option's value
-  verbatim and cannot map `research`→`rsch` itself, so pointing the token at
-  `@fleet_task` would print the full enum word. Both options are stamped at the
-  same validated write site; `@fleet_task` stays the canonical machine-readable
-  one that `task_of` / the dash / `fleet ls` read.
+Removing the token is not enough on its own: a **running tmux server, or a
+resurrected/saved format, still carries it baked in**, and the global
+`window-status-format` is only ever rewritten by `inject_status_format` and
+fleetd's `heal_status_format`. Both therefore **strip** it — idempotent,
+fail-silent, and by **literal substring removal, never a regex**, because the
+fleetd-owned `@agent_glyph` token sits immediately next to it and is load-bearing.
+Both twins must keep doing it: fleetd's sweep re-heals the bar after a theme
+switch, so fixing only `bin/fleet` would let the stale token return every 60s.
+
 - **the dashboard row** — a 4-char text field (not a pill: a pill costs `PW+4`=11
   columns), shed **first** in the width ladder so the label is never squeezed, and
   hidden entirely when no visible agent has a task (`HAS_TASKS`), so a task-less
@@ -332,9 +342,13 @@ Rendered in three places:
   because a padded field makes `fleet ls | column -t` mis-align that row; the
   padded `task_tag` is only for the dashboard's fixed-width row.
 
-Locked in by `test/agent-task-proof.sh` (22 cases / 36 assertions; the regression
-group asserting the 9-field shapes and the absent `done` pill is the highest-value
-part).
+Locked in by `test/agent-task-proof.sh` (22 cases; the regression group asserting
+the 9-field shapes and the absent `done` pill is the highest-value part). Cases
+**16b** and **16d** were inverted at d35: they now assert the token is *absent*
+from both formats, that an already-installed legacy token is *stripped* (by the
+bash injector and by fleetd's Python twin independently), and that `@agent_glyph`
+survives both — the coverage was inverted rather than deleted. Case 16's
+server-wide scan now fails on **any** stamped `@fleet_task_tag`.
 
 ### Guard: executed command vs inert argument (`fleet-guard` block 1)
 
@@ -561,8 +575,8 @@ this project with the `fleet` CLI.
   `fleet selfmerge off`; override a single spawn either way with `--self-merge`
   (force allow) or `--no-self-merge` (force block). **`--task <kind>`** tags what
   KIND of work this agent does — one of `research|plan|impl|test|scratch`
-  — shown as a 4-char tag (`rsch`/`plan`/`impl`/`test`/`scr`) in the tmux window
-  status bar, the dashboard row, and `fleet ls`'s TASK column. Unset (or unknown,
+  — shown as a 4-char tag (`rsch`/`plan`/`impl`/`test`/`scr`) in the dashboard
+  row and `fleet ls`'s TASK column (**not** in the tmux status bar). Unset (or unknown,
   which warns and drops) renders blank. Display only: it is a separate namespace
   from the orchestrator/worker *role*, and `--task main` and `--task generic` are hard-rejected (error + non-zero exit, no spawn).
 - `fleet selfmerge on|off|status` — project-wide worker self-merge toggle. `off`

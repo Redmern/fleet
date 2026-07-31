@@ -1181,9 +1181,12 @@ cmd_new() {
 
   # THE SINGLE WRITE SITE for the task tag — a HARD closed enum, deliberately not
   # a pattern match. Two things depend on this being exhaustive:
-  #   * @fleet_task's CONTENTS are format-expanded by tmux (the status-bar token in
-  #     inject_status_format), so a value carrying '#[' or an unbalanced '#{' would
-  #     corrupt window-status-format for the WHOLE tmux server, not one window;
+  #   * @fleet_task is read back by three surfaces (the dashboard row, `fleet ls`'s
+  #     TASK column, task_of) and its contents used to be format-expanded by tmux in
+  #     the status bar, where a value carrying '#[' or an unbalanced '#{' corrupted
+  #     window-status-format for the WHOLE tmux server. The bar token is gone (d35),
+  #     so that blast radius is gone with it — the closed enum stays anyway: it is
+  #     free, and it is what keeps a garbage tag out of the two remaining surfaces;
   #   * `main` must never be storable — it is the vocabulary of the FLEET_ROLE /
   #     .fleet/roles / @fleet_role brakes (fork-bomb gate, merge/push gate,
   #     is_main_pane), and this namespace must stay unable to touch them.
@@ -1484,9 +1487,17 @@ $(ready_instructions)"
   fi
   tmux set -w -t "$win_id" @fleet_harness "$H_NAME"
   # Task tag: live window option + durable window-name-keyed file. Only ever an
-  # enum member (validated above), so the status-bar format token that expands
-  # @fleet_task cannot be made to inject. Empty task → neither is written, and the
-  # agent behaves exactly as before the flag existed.
+  # enum member (validated above). The tag is NO LONGER rendered in the tmux
+  # status bar (d35) — it shows in the dashboard row and `fleet ls`'s TASK column
+  # only — so @fleet_task's contents no longer reach a tmux format string. The
+  # closed enum + task_of's re-validation stay regardless: they are cheap and the
+  # value is still read by three surfaces. The companion @fleet_task_tag option
+  # existed SOLELY for the bar token (a tmux format cannot map research->rsch
+  # itself); with the token gone nothing reads it, so it is no longer written —
+  # only actively UNSET, on both branches, so a window carrying a stale value from
+  # an older fleet cannot render one if a stale format lingers.
+  # Empty task → nothing is written, and the agent behaves exactly as before the
+  # flag existed.
   # SPAWN IS AUTHORITATIVE, both ways. The durable file is keyed by window NAME,
   # and window names are recycled — a window killed by hand (plain tmux
   # kill-window, a crash: neither routes through cmd_forget) leaves its file
@@ -1499,12 +1510,7 @@ $(ready_instructions)"
     forget_task "$root" "$wname"
   else
     tmux set -w -t "$win_id" @fleet_task "$task" 2>/dev/null || true
-    # …plus the rendered tag as its own option. The status-bar format expands an
-    # option's VALUE verbatim and cannot map research->rsch itself, so the bar
-    # would otherwise print the full enum word. Derived from the same validated
-    # value, so it is exactly as injection-proof; @fleet_task stays the canonical
-    # machine-readable one that task_of / the dash / `fleet ls` read.
-    tmux set -w -t "$win_id" @fleet_task_tag "$(task_tag_trim "$task")" 2>/dev/null || true
+    tmux set -w -t "$win_id" -u @fleet_task_tag 2>/dev/null || true
     record_task "$root" "$wname" "$task"
   fi
   # Hand the freshly-spawned window_id back to a caller that asked for it (the
@@ -1549,7 +1555,7 @@ $(ready_instructions)"
     # cannot deliver non-navigability — tmux has no per-window skip-in-next/prev,
     # so `C-b n` walks the human straight into a bar-invisible pane, which is the
     # whole reason parking exists; (d) fleetd's heal_status_format only
-    # substring-checks @agent_glyph / @fleet_task_tag and re-appends them to
+    # substring-checks @agent_glyph and re-appends it to
     # whatever the current global value is, so an omarchy theme switch would wipe
     # the wrapper and silently pop every hidden window back onto the bar.
     #
@@ -1941,7 +1947,7 @@ record_pane_role() { # <root> <pane_id> <role>
 # Stored twice at spawn, never in either TSV (the .agents line and `fleet agents`
 # are both positionally read as exactly 9 fields by three independent readers that
 # all fail SILENTLY-WRONG on a 10th column — see CLAUDE.md):
-#   * @fleet_task window option — live, fast, what the dash and status bar read;
+#   * @fleet_task window option — live, fast, what the dash and `fleet ls` read;
 #   * <root>/.fleet/tasks/<window-name> — durable, survives a tmux server restart.
 # Keyed by WINDOW NAME, not pane id: tmux reassigns pane ids across a server
 # restart, which is why .fleet/roles/<pane-id> silently accumulates dead entries.
@@ -1983,9 +1989,9 @@ task_tag() { # <task> -> a FIXED-WIDTH 4-char pure-ASCII tag ("    " when unset/
 }
 
 task_tag_trim() { # <task> -> the same tag with padding stripped ("" when unset)
-  # For the TAB-separated / free-flowing surfaces (`fleet ls`, the tmux status
-  # bar) where nothing needs a fixed column: a padded 4-space field there makes
-  # `fleet ls | column -t` mis-align the row, and puts a stray space in the bar.
+  # For the TAB-separated / free-flowing surfaces (`fleet ls`, and the internal
+  # `fleet task-tag` verb) where nothing needs a fixed column: a padded 4-space
+  # field there makes `fleet ls | column -t` mis-align that row.
   # The padded form (task_tag) is only for the dashboard's fixed-width row.
   local t; t=$(task_tag "$1"); printf '%s' "${t%% *}"
 }
@@ -4939,6 +4945,18 @@ ensure_daemon() {
   sleep 0.3
 }
 
+strip_task_token() { # <format> -> the format with the legacy task-tag token removed
+  # The two literal spellings fleet ever wrote (bin/fleet and bin/fleetd agreed on
+  # the first; the second is defensive against a hand-edited copy). Literal
+  # substring removal only — a regex over a tmux format risks eating the
+  # neighbouring, fleetd-owned @agent_glyph token. A format that never carried the
+  # token comes back unchanged, so this is safe to run on every heal.
+  local f="${1:-}"
+  f="${f//'#{?@fleet_task_tag, #{@fleet_task_tag},}'/}"
+  f="${f//'#{?@fleet_task_tag,#{@fleet_task_tag},}'/}"
+  printf '%s' "$f"
+}
+
 inject_status_format() { # append agent glyph to window-status formats.
   # window-status-* are window options — tmux has no per-session scope for
   # them, so inject into the runtime GLOBAL value (never the config file).
@@ -4949,15 +4967,15 @@ inject_status_format() { # append agent glyph to window-status formats.
     fmt=$(tmux show -g -v "$opt" 2>/dev/null)
     [ -n "$fmt" ] || continue
     case "$fmt" in *@agent_glyph*) ;; *) tmux set -g "$opt" "$fmt#{?@agent_glyph, #{@agent_glyph},}" ;; esac
-    # Task tag: a SECOND, independent token. @agent_glyph is fleetd-owned and
-    # rewritten on every state transition, so we never write into it. Re-read the
-    # value — the glyph append above may have just changed it. Safe to expand the
-    # option's contents ONLY because cmd_new hard-validates it against a closed
-    # enum: tmux format-expands what is in there, and a stray '#[' would corrupt
-    # window-status-format for the entire server.
+    # Task tag: REMOVED from the status bar (d35). It renders in the dashboard row
+    # and `fleet ls` only. A live tmux server (or a saved/resurrected format) can
+    # still carry the old token baked in, so strip it rather than merely stopping
+    # the append — otherwise the bar keeps showing tags until the next theme
+    # switch. Plain literal substring removal, never a regex: @agent_glyph is
+    # fleetd-owned and load-bearing and must not be touched. Idempotent (a format
+    # without the token is left byte-identical) and fail-silent.
     fmt=$(tmux show -g -v "$opt" 2>/dev/null)
-    [ -n "$fmt" ] || continue
-    case "$fmt" in *@fleet_task_tag*) ;; *) tmux set -g "$opt" "$fmt#{?@fleet_task_tag, #{@fleet_task_tag},}" ;; esac
+    case "$fmt" in *@fleet_task_tag*) tmux set -g "$opt" "$(strip_task_token "$fmt")" 2>/dev/null || true ;; esac
   done
   # (The ambient inbox unread badge is gone — unread now lives per-agent in the
   # dashboard rows + the agents-view title summary, not on the status bar.)

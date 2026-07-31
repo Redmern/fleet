@@ -284,11 +284,16 @@ class Fleet:
             if fmt and "@agent_glyph" not in fmt:
                 fmt = fmt + "#{?@agent_glyph, #{@agent_glyph},}"
                 tmux("set", "-g", opt, fmt)
-            # Second, independent token: the task tag (@fleet_task, written only by
-            # `fleet new` from a closed enum). Mirrors inject_status_format so a
-            # theme switch re-heals both. Never touches @agent_glyph.
-            if fmt and "@fleet_task_tag" not in fmt:
-                tmux("set", "-g", opt, fmt + "#{?@fleet_task_tag, #{@fleet_task_tag},}")
+            # The task tag is NO LONGER rendered here (d35) — it lives in the
+            # dashboard row and `fleet ls` only. A running server can still carry
+            # the old token baked into its format, so STRIP it, mirroring
+            # inject_status_format in bin/fleet. Literal substring removal, never a
+            # regex: @agent_glyph sits right next to it and is load-bearing.
+            if fmt and "@fleet_task_tag" in fmt:
+                for tok in ("#{?@fleet_task_tag, #{@fleet_task_tag},}",
+                            "#{?@fleet_task_tag,#{@fleet_task_tag},}"):
+                    fmt = fmt.replace(tok, "")
+                tmux("set", "-g", opt, fmt)
         # status-left ship glyph used to be re-healed off the (now-deleted) inbox
         # poll; ride the same theme-switch healing as the window-status glyphs.
         self.heal_status_left()
