@@ -385,7 +385,8 @@ with `--self-merge`**. That was paper: never executed, and broken in four places
   returned **rc 1 for every genuine approval**, while §7 says "run it through the
   oracle, never eyeball it". `inbox_pop_text` is `printf '%s\n%s\n\n' head body` —
   header then body *immediately*, blank *after* — so a genuine popped sentinel is on
-  **line 2 and never lower**. The scan is `GATE_SCAN_LINES=2` and, decisively,
+  **line 2 and never lower**. The parser reads **line 1 and line 2 only** — a
+  structural bound, not a knob crediting a constant — and, decisively,
   **anchored**: line 2 is honoured only when line 1 is an actual pop header. The
   offset is then a consequence of the format rather than a free allowance, which
   matters because `fleet inbox put` has **no role check** — any pane can enqueue a
@@ -397,17 +398,18 @@ with `--self-merge`**. That was paper: never executed, and broken in four places
 - **The prompt shape.** §7 told the sub-orch to put "the exact commit/merge/push
   steps" in the SHIP worker's `-p` string. §7 now writes them to
   `<worktree>/.fleet/notes/SHIP.md` and the prompt is **one line naming the file**.
-  This is a **necessary workaround for a live guard defect, not a style preference,
-  and reverting it re-breaks the spawn**: `bin/fleet-guard:286` splits the text on
-  newlines *before* the quote-aware tokenizer, so any line of a **quoted** prompt
-  whose first word is `git merge`/`git push` is judged an executed command and
-  DENIED. `ecd71fe` did **not** fix this — it fixed the *mid-line* case, which is
-  why the suite's old "MULTILINE" row (command word `step`) passed while proving
-  nothing. Group B now carries both: that row relabelled as an ALLOW **control**,
-  and its honest companion — the verb at **column 0 of line 2** — pinned as a
-  `KNOWN DEFECT` DENY. The pointer shape also sidesteps the harness's own auto-mode
-  classifier. Fixing the tokenizer is out of scope here (the always-on block is not
-  touched by this feature); this section only stops the prose lying about it.
+  **The guard rationale for this is DEAD — do not restore it.** It used to be a
+  workaround for a live `fleet-guard` defect (newline split before the quote-aware
+  tokenizer, so a **quoted** prompt line whose first word was `git merge`/`git push`
+  was DENIED). `cb4a42b` (d32) fixed that by tokenizing the text whole; measured on
+  current `main`, the verb at **column 0 of line 2 of a quoted `-p` is ALLOWED**.
+  Group B pins that measurement — the row is now an **ALLOW**, beside its mid-line
+  control and a genuinely multi-line script whose real `git push` is still DENIED,
+  so the pair discriminates fixed-defect from blanket-allow.
+  What survives is a **separate** rationale, hit live on 2026-07-31: the harness's
+  own auto-mode classifier denies a batched command carrying the verb, and fleet
+  cannot see or fix that. So §7.1 keeps the one-line pointer — for the classifier,
+  not for the guard.
 - **Nothing terminated the ledger.** §7 now ends in `fleet dispatch done <id>` after
   a *verified* merge, and `fleet send --needs-human main` on failure — a silent park
   at GATE 2 is indistinguishable from a wedged pipeline.
@@ -431,10 +433,16 @@ window name is a pure function of repo+branch, so a SHIP worker on the impl work
 branch gets a byte-identical name and `send`/`ready`/`watch` hit whichever pane tmux
 resolves first. It does **not** protect the impl worker's `.fleet/ready` marker and
 never could — the marker lives in `$dir`, which the window name never enters. That is
-handled separately, by **pane liveness**: `cmd_new`'s reap-safety clear keeps a marker
-whose `pane=` writer is still alive (the same liveness predicate `agents_tsv` uses)
-and clearing it once that pane is gone. Residual, stated: `cmd_ready` writes with `>`,
-so two live agents flagging one worktree still race and the last writer wins. `--name`
+handled separately, by **pane occupancy**: `cmd_new`'s reap-safety clear keeps a marker
+only while its `pane=` writer is a live pane whose cwd is that worktree (`cmd_reap`'s
+live-occupant scan, not `agents_tsv`'s row-local predicate), and clears it otherwise —
+including every ambiguous case, because a cleared marker costs a pill and a kept one
+costs a worktree. Residual, stated: this is a reliability check, not a control.
+`.fleet/ready` is plain text in a same-uid world, so any agent can stamp any pane id —
+including a live occupant's — or delete the marker outright; and `cmd_ready` writes
+with `>`, so two live agents flagging one worktree still race and the last writer wins.
+The occupancy test only stops the *accidental* case: a pane id recycled across a tmux
+server restart that happens to be live somewhere unrelated. `--name`
 is validated on the same closed charset logic as `@fleet_task`, since the name reaches
 `window-status-format`, and it is validated **once for both spawn branches** — it used
 to be parsed and then silently dropped for `--scratch`. It is also **re-passed by
@@ -444,8 +452,20 @@ overwrote col 8, destroying the record. That re-pass is only safe because the `d
 owner prefix is **idempotent** — a plain prepend grows the name a segment per restart,
 and the name keys `.fleet/tasks/<wname>`, restore's own match and `cmd_forget`.
 Window names are additionally **uniquified at spawn** (`scratch_wname`), so two roles
-on one branch stop sharing an address; the matcher rework their consumers want is
-deliberately deferred.
+on one branch stop sharing an address **for `send`/`ready`/`watch` routing only**; the
+matcher rework their consumers want is deliberately deferred.
+
+**STATED LIMITATION — a same-branch pair does not survive a tmux server restart.**
+`persist_agent` keys the saved-agents record on column 1, the **worktree dir**, which
+`--name` never enters, so the second spawn *deletes* the first's line: spawn order
+decides which of the pair returns (usually the SHIP worker, losing the impl worker) and
+the other must be respawned by hand. Once the survivor is forgotten or reaped the
+worktree has **no record at all** — `fleet restore` never respawns it, `cmd_reap` never
+sees it, an orphan only a human can clear. Re-keying on `dir + wname` is a named
+follow-up with its cost written down: 2 lines plus ~25-30 of consequence across
+`cmd_forget`, `cmd_reap` (two lines, one `$dir`, so decide/mutate runs twice) and
+`bin/fleet-dash`, a ~45-60 line proof that does not exist, and it makes `cmd_restore`
+respawn TWO agents into ONE worktree — inside the reap-safety clear's own blast radius.
 
 ### KNOWN, UNMITIGATED: a conflicted integration worktree takes the CLI down machine-wide
 
@@ -890,9 +910,12 @@ this project with the `fleet` CLI.
   worker), where the identical name would misroute `send`/`ready`/`watch`. It fixes
   **routing only**: the other agent's `.fleet/ready` marker lives in the shared
   worktree dir, which the window name never enters, and is protected instead by the
-  spawn's pane-liveness check. Honoured for `--scratch` too, persisted, and re-passed
-  by `fleet restore` so it survives a tmux server restart. Rejected (warn + derived
-  name) unless `[A-Za-z0-9._/-]`.
+  spawn's pane-**occupancy** check. Honoured for `--scratch` too, persisted, and
+  re-passed by `fleet restore`. **Restore is single-record per worktree:** the
+  saved-agents file is keyed on the worktree dir, so a second agent on the same branch
+  overwrites the first's record — after a tmux server restart only the LAST-spawned of
+  the pair comes back, and the other must be respawned by hand. Rejected (warn +
+  derived name) unless `[A-Za-z0-9._/-]`.
 - `fleet selfmerge on|off|status` — project-wide worker self-merge toggle. `off`
   drops a `<root>/.fleet/no-self-merge` marker so newly-spawned workers in this
   project (all repos) are blocked from merge/push; `on` removes it (the default,

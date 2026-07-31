@@ -28,9 +28,12 @@ this project with the `fleet` CLI.
   worker), where the identical name would misroute `send`/`ready`/`watch`. It fixes
   **routing only**: the other agent's `.fleet/ready` marker lives in the shared
   worktree dir, which the window name never enters, and is protected instead by the
-  spawn's pane-liveness check. Honoured for `--scratch` too, persisted, and re-passed
-  by `fleet restore` so it survives a tmux server restart. Rejected (warn + derived
-  name) unless `[A-Za-z0-9._/-]`.
+  spawn's pane-**occupancy** check. Honoured for `--scratch` too, persisted, and
+  re-passed by `fleet restore`. **Restore is single-record per worktree:** the
+  saved-agents file is keyed on the worktree dir, so a second agent on the same branch
+  overwrites the first's record — after a tmux server restart only the LAST-spawned of
+  the pair comes back, and the other must be respawned by hand. Rejected (warn +
+  derived name) unless `[A-Za-z0-9._/-]`.
 - `fleet selfmerge on|off|status` — project-wide worker self-merge toggle. `off`
   drops a `<root>/.fleet/no-self-merge` marker so newly-spawned workers in this
   project (all repos) are blocked from merge/push; `on` removes it (the default,
