@@ -371,6 +371,17 @@ command); simple `V=…` assignments are tracked so an expanded command word
 resolves. Quote state is **not symmetric** and the code says so: `$(git push)` runs
 inside DOUBLE quotes and is inert inside SINGLE ones.
 
+The text is tokenized **once, whole** — never pre-split on `\n`. A newline is a
+statement separator only *outside* quotes, and the quote-aware walk that lifts
+substitutions marks those (emitting `\n;` — the newline still terminates a `#`
+comment, the `;` is the separator token shlex sees). Splitting first threw that
+away and was the F3 bug: a multi-line `-p "…"` payload — the normal shape of
+`fleet new` — was cut into fragments with unbalanced quotes, and an indented
+payload line read as a command word, so the guard denied the very calls F2 was
+commissioned to allow. The inverse case is the one to protect: a genuinely
+multi-line script (`printf 'a\nb\n'` then a real `git push` on its own line) is
+still caught, because that newline is outside quotes.
+
 Unbalanced quotes fall **CLOSED** — a raw regex over the line, the inverse of the
 guard's general "on any doubt, allow". A false deny is recoverable by rephrasing;
 a false allow merges unreviewed code into main. `FLEET_SELF_MERGE=1` (from
@@ -382,7 +393,7 @@ script not named `git`, `find -exec`, and a command word built by expansion we
 cannot resolve. This block is a speed-bump against ACCIDENTAL self-merge, not a
 sandbox.
 
-Locked in by `test/guard-quoted-payload-proof.sh` (57 assertions, no tmux/daemon —
+Locked in by `test/guard-quoted-payload-proof.sh` (75 assertions, no tmux/daemon —
 synthesized hook JSON on stdin). Run it against an older checkout with
 `GUARD=<path>/bin/fleet-guard` to see the halves go red: 22 of the DENY cases fail
 against `HEAD~`, and the ALLOW half additionally fails against pre-`034bb75` code.

@@ -75,6 +75,26 @@ check ALLOW "harmless git subcommands still work (log)" 'git log --oneline -5'
 check ALLOW "git word in a heredoc that is only WRITTEN to a file" \
   "$(printf 'cat > notes.md <<%s\nask the orchestrator to git merge this\n%s\n' EOF EOF)"
 
+echo "== A2. MULTI-LINE quoted payload -> ALLOW (must fail pre-fix) =="
+# A newline INSIDE a quoted payload is data. Pre-fix, scan_text split the text on
+# "\n" before tokenizing, so each fragment had unbalanced quotes and an indented
+# payload line read as a command word -> false DENY. Multi-line -p prompts are the
+# normal shape of `fleet new`.
+check ALLOW "multi-line -p, indented verb line" \
+  "$(printf 'fleet new fleet b -p "line one\n  git push\nline three"\n')"
+check ALLOW "multi-line -m with a blank line" \
+  "$(printf 'fleet inbox put -m "summary\n\n  git -C /tmp push\n"\n')"
+check ALLOW "multi-line payload with embedded single quotes" \
+  "$(printf 'fleet send main "don'\''t do this:\n  git merge main\nask me instead"\n')"
+check ALLOW "multi-line single-quoted payload" \
+  "$(printf "fleet new fleet b -p 'plan:\n  1. stage\n  2. never git push\n'\n")"
+check ALLOW "multi-line payload containing separators and a substitution" \
+  "$(printf 'fleet send main "step 1; step 2 && git push\nand \$(git merge x) is text\n"\n')"
+check ALLOW "multi-line payload with a trailing real command that is harmless" \
+  "$(printf 'fleet send main "a\n  git push\nb"\ngit status\n')"
+check ALLOW "multi-line payload followed by a comment line" \
+  "$(printf 'fleet send main "a\n  git push\nb"   # note about git merge\necho done\n')"
+
 echo "== B. executed command -> DENY (this half must fail pre-fix) =="
 check DENY "direct" 'git merge main'
 check DENY "direct push" 'git push origin HEAD'
@@ -116,6 +136,29 @@ check DENY "variable expanded into command position" 'V="git push"; $V'
 check DENY "variable expanded, braced" 'V="git merge x"; ${V}'
 check DENY "heredoc fed to a shell (the lines ARE the script)" \
   "$(printf 'sh <<%s\ngit push\n%s\n' EOF EOF)"
+# The multi-line REAL SCRIPT: looks like the payload case above, is not. A quoted
+# multi-line argument on one statement must not launder a genuine command on the
+# next line — this is the case the A2 fix is most likely to break.
+check DENY "multi-line script: quoted arg first, real verb on its own line" \
+  "$(printf "printf 'a\\\\nb\\\\n'\ngit push\n")"
+check DENY "multi-line script: MULTI-LINE quoted arg, then real verb" \
+  "$(printf 'printf "a\nb\n"\ngit push origin HEAD\n')"
+check DENY "multi-line script: indented real verb after a plain line" \
+  "$(printf 'cd repo\n  git merge main\n')"
+check DENY "multi-line script: verb after a comment line" \
+  "$(printf '# git push is what we avoid\ngit push\n')"
+check DENY "multi-line script: verb inside a multi-line if block" \
+  "$(printf 'if true\nthen\n  git push\nfi\n')"
+check DENY "multi-line script: verb in a substitution spanning lines" \
+  "$(printf 'X=$(cd repo &&\n  git merge main)\n')"
+check DENY "multi-line script: verb after a line-continuation" \
+  "$(printf 'echo a \\\\\n  && git push\n')"
+check DENY "multi-line script: sh -c with a multi-line body" \
+  "$(printf 'sh -c "echo a\ngit push"\n')"
+check DENY "multi-line payload closed early, verb on next line" \
+  "$(printf 'fleet send main "a\nb"\ngit merge main\n')"
+check DENY "unbalanced quote across lines falls CLOSED" \
+  "$(printf 'fleet send main "a\n  git push\n')"
 check DENY "unbalanced quote falls CLOSED" 'git push "'
 check DENY "unbalanced quote, verb mid-line" 'echo " ; git merge main'
 
