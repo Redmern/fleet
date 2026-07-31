@@ -4,8 +4,10 @@
 # The feature: a validated task enum (research|plan|impl|test|scratch|generic)
 # stamped at spawn into a NEW `@fleet_task` window option PLUS a window-name-keyed
 # <root>/.fleet/tasks/<wname> file, rendered as a 4-char ASCII tag (rsch/plan/impl/
-# test/scr, blank when unset) in the tmux status bar, the dashboard row, and a new
-# TASK column in `fleet ls`.
+# test/scr, blank when unset) in the dashboard row and a new TASK column in
+# `fleet ls`. It was ALSO rendered in the tmux status bar until d35, which removed
+# that token and made both injectors strip a legacy one; cases 16b/16d assert the
+# inverse of what they used to.
 #
 # The three things this harness exists to nail down, in priority order:
 #
@@ -27,9 +29,10 @@
 #
 #   B. FAIL-CLOSED VALIDATION. `--task main` must be rejected (a worker must not
 #      self-promote past the FLEET_ROLE / .fleet/roles / @fleet_role brakes), and
-#      the enum must be re-validated ON READ — tmux format-expands a window
-#      option's CONTENTS, so a value carrying `#[` would corrupt the status bar
-#      for the WHOLE tmux server, not one window.
+#      the enum must be re-validated ON READ. (That check used to also protect the
+#      whole tmux server: tmux format-expands a window option's CONTENTS, so a
+#      value carrying `#[` corrupted the status bar server-wide. The bar token is
+#      gone at d35; the validation stays and is still asserted.)
 #
 #   C. ASCII-only, fixed 4-cell width. popup_fit_content / fit_left / hrule all
 #      count CODEPOINTS, not display cells, and there is no ASCII-fallback ladder
@@ -262,9 +265,11 @@ tmux set -t "$FLEET_SESSION" @fleet_root "$FLEET_ROOT" 2>/dev/null
 sleep 0.4
 W1=$(wid_of "repo/feat_one")
 if [ -n "$W1" ]; then
+  # d35: the tag is off the status bar, so the companion @fleet_task_tag option
+  # (which existed ONLY for the bar token) must not be stamped by the respawn.
   rtag=$(tmux show -wqv -t "$W1" @fleet_task_tag 2>/dev/null)
   if [ "$(opt_of "$W1")" != impl ]; then fail 9 "restored agent lost its task (@fleet_task='$(opt_of "$W1")')"
-  elif [ "$rtag" != impl ]; then fail 9 "restored agent lost its rendered tag (@fleet_task_tag='$rtag')"
+  elif [ -n "$rtag" ]; then fail 9 "restore stamped the retired bar option (@fleet_task_tag='$rtag')"
   else pass 9; fi
 else
   fail 9 "cmd_restore did not respawn repo/feat_one after the server restart"
@@ -373,9 +378,11 @@ while read -r w; do
   [ -n "$w" ] || continue
   v=$(tmux show -wqv -t "$w" @fleet_task 2>/dev/null)
   case "$v" in ""|research|plan|impl|test|scratch|generic) ;; *) bad=1; echo "    poison in $w: @fleet_task='$v'" ;; esac
-  # …and the RENDERED companion, which is the one the status format expands
+  # …and the retired companion (d35): it fed the removed status-bar token and is
+  # now never written, so ANY value here is a regression — including a valid-looking
+  # one, which would re-render on a stale format.
   v=$(tmux show -wqv -t "$w" @fleet_task_tag 2>/dev/null)
-  case "$v" in ""|rsch|plan|impl|test|scr) ;; *) bad=1; echo "    poison in $w: @fleet_task_tag='$v'" ;; esac
+  case "$v" in "") ;; *) bad=1; echo "    $w still stamps the retired @fleet_task_tag='$v'" ;; esac
   n=$(sgr_count "$w")
   if [ "${n:-0}" -gt "${base_n:-0}" ]; then
     bad=1; echo "    $w expands to $n '#[' vs baseline $base_n — format injection"
@@ -384,50 +391,69 @@ done < <(tmux list-windows -a -F '#{window_id}' 2>/dev/null)
 [ "$bad" = 0 ] && pass 16 || fail 16 "status-bar format corruption reachable"
 
 # ------------------------------------------------------------------------- 16b
-# …and the bar must actually SHOW the tag. This is the surface the human sees
-# without running any command — the whole point of the feature. inject_status_format
-# is only run by `fleet up`/fleetd, so drive it through its internal subcommand
-# against a known format. NOT `( . "$FLEET"; inject_status_format )`: sourcing the
-# CLI runs its dispatch block, which falls through to usage — or, on a tty, to the
-# interactive project picker, where it HANGS. That made this case prove nothing.
+# INVERTED at d35: the tag must NOT reach the tmux status bar at all. It renders in
+# the dashboard row and `fleet ls`'s TASK column only. Two halves:
+#   (i) a clean format must gain NO task token — only the @agent_glyph one, which
+#       is fleetd-owned and load-bearing and must survive untouched;
+#  (ii) an ALREADY-INSTALLED format carrying the legacy token must be CLEANED —
+#       a live tmux server keeps rendering tags otherwise, and the only thing that
+#       ever rewrites that global is this injector (+ fleetd's twin, 16d).
+# inject_status_format is only run by `fleet up`/fleetd, so drive it through its
+# internal subcommand against a known format. NOT `( . "$FLEET";
+# inject_status_format )`: sourcing the CLI runs its dispatch block, which falls
+# through to usage — or, on a tty, to the interactive project picker, where it HANGS.
 tmux set -g window-status-format '#I:#W' 2>/dev/null
 tmux set -g window-status-current-format '#I:#W' 2>/dev/null
 "$FLEET" inject-status-format >/dev/null 2>&1
 gfmt=$(tmux show -g -v window-status-format 2>/dev/null)
-# research is the ONLY fixture that discriminates tag from enum word (see below)
-spawn repo feat/bar-rsch --task research >/dev/null 2>&1
-WRS=$(wid_of "repo/feat_bar-rsch")
+# research is the ONLY fixture that discriminates tag from enum word — if the bar
+# regressed to expanding @fleet_task instead, this window shows 'research'. The
+# branch is deliberately named WITHOUT 'rsch' in it: the old fixture was
+# `feat/bar-rsch`, whose own window NAME satisfied the `grep rsch` on the expanded
+# format, so the assertion passed on the name alone.
+spawn repo feat/barq --task research >/dev/null 2>&1
+WRS=$(wid_of "repo/feat_barq")
 e_rsch=$(tmux display-message -p -t "$WRS" '#{E:window-status-format}' 2>/dev/null)
-e_tagged=$(tmux display-message -p -t "$W1" '#{E:window-status-format}' 2>/dev/null)
 e_plain=$(tmux display-message -p -t "$WBASE" '#{E:window-status-format}' 2>/dev/null)
-if ! printf '%s' "$gfmt" | grep -q '@fleet_task_tag'; then
-  fail 16b "inject_status_format did not append a task token: $gfmt"
-elif [ "$(printf '%s' "$gfmt" | grep -o '@fleet_task_tag' | grep -c .)" != 2 ]; then
-  # exactly one token — which itself names the option twice (test + value)
-  fail 16b "the task token was appended more than once: $gfmt"
-elif ! printf '%s' "$e_rsch" | grep -q 'rsch'; then
-  fail 16b "a research-tagged window's status bar does not show its tag: '$e_rsch'"
-elif printf '%s' "$e_rsch" | grep -q 'research'; then
-  # THE DISCRIMINATING ASSERTION. The bar must expand the RENDERED 4-char tag, not
-  # the enum word. `impl`/`plan`/`test` are useless as fixtures here — the enum
-  # value and its tag are byte-identical, so pointing the status token at
-  # @fleet_task instead of @fleet_task_tag passes unnoticed. Only research->rsch
-  # (and scratch->'scr ') can tell them apart, and the fixed-4-cell guarantee is
-  # the entire design rationale for the closed enum (fit_left/hrule count
-  # codepoints, not cells, with no ASCII fallback).
-  fail 16b "the status bar expanded the RAW ENUM WORD, not the 4-char tag: '$e_rsch'"
+# (ii) legacy format, both options, then re-run the injector
+LEGACY_TOK='#{?@fleet_task_tag, #{@fleet_task_tag},}'
+tmux set -g window-status-format "#I:#W#{?@agent_glyph, #{@agent_glyph},}$LEGACY_TOK" 2>/dev/null
+tmux set -g window-status-current-format "#I:#W#{?@agent_glyph, #{@agent_glyph},}$LEGACY_TOK" 2>/dev/null
+"$FLEET" inject-status-format >/dev/null 2>&1
+cleaned=$(tmux show -g -v window-status-format 2>/dev/null)
+cleaned_cur=$(tmux show -g -v window-status-current-format 2>/dev/null)
+if printf '%s' "$gfmt" | grep -q '@fleet_task'; then
+  fail 16b "inject_status_format still appends a task token to the bar: $gfmt"
+elif ! printf '%s' "$gfmt" | grep -q '@agent_glyph'; then
+  fail 16b "the fleetd-owned @agent_glyph token was lost: $gfmt"
+elif printf '%s' "$e_rsch" | grep -qE 'rsch|research'; then
+  fail 16b "a research-tagged window's status bar still shows a tag: '$e_rsch'"
 elif printf '%s' "$e_plain" | grep -qE 'rsch|impl|test|scr'; then
   fail 16b "an untagged window's status bar shows a tag: '$e_plain'"
+elif printf '%s' "$cleaned" | grep -q '@fleet_task'; then
+  fail 16b "an already-installed format kept its legacy task token: $cleaned"
+elif printf '%s' "$cleaned_cur" | grep -q '@fleet_task'; then
+  fail 16b "window-status-current-format kept its legacy task token: $cleaned_cur"
+elif ! printf '%s' "$cleaned" | grep -q '@agent_glyph'; then
+  fail 16b "cleanup ate the neighbouring @agent_glyph token: $cleaned"
 else pass 16b; fi
+# the cleanup must leave a token-free format byte-identical (no trailing debris)
+tmux set -g window-status-format '#I:#W' 2>/dev/null
+tmux set -g window-status-current-format '#I:#W' 2>/dev/null
+"$FLEET" inject-status-format >/dev/null 2>&1
+gfmt=$(tmux show -g -v window-status-format 2>/dev/null)
 # 16d — fleetd's heal_status_format is a SECOND, INDEPENDENT implementation of the
 # same injection (Python, run on the daemon's sweep — it is what actually re-heals
 # the bar after a theme switch wipes the format). It had NO functional coverage:
 # deleting its task branch outright, or pointing it at @fleet_task instead of
 # @fleet_task_tag, left the whole suite green. Two implementations of one rule can
 # drift silently, which is the same defect class as 16b's original vacuity.
-# Invoke the real method directly rather than waiting out the 60s sweep.
-tmux set -g window-status-format '#I:#W' 2>/dev/null
-tmux set -g window-status-current-format '#I:#W' 2>/dev/null
+# INVERTED at d35 exactly like 16b: it must not re-append the token, and it must
+# STRIP a legacy one — fleetd's sweep is what actually re-heals the bar after a
+# theme switch, so a stale token would come back every 60s if only bin/fleet were
+# fixed. Invoke the real method directly rather than waiting out the sweep.
+tmux set -g window-status-format "#I:#W$LEGACY_TOK" 2>/dev/null
+tmux set -g window-status-current-format "#I:#W$LEGACY_TOK" 2>/dev/null
 python3 - "$FLEETD" <<'PYHEAL' >/dev/null 2>&1
 import importlib.util, sys
 spec = importlib.util.spec_from_loader("fleetd_mod",
@@ -436,11 +462,14 @@ m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
 m.Fleet().heal_status_format()
 PYHEAL
 hfmt=$(tmux show -g -v window-status-format 2>/dev/null)
-if ! printf '%s' "$hfmt" | grep -q '@fleet_task_tag'; then
-  fail 16d "fleetd.heal_status_format did not re-append the task token: $hfmt"
-elif printf '%s' "$hfmt" | grep -q '@fleet_task[^_]'; then
-  # must point at the RENDERED tag option, exactly as the bash twin does
-  fail 16d "fleetd healed to @fleet_task, not @fleet_task_tag (drift from bin/fleet): $hfmt"
+hcur=$(tmux show -g -v window-status-current-format 2>/dev/null)
+if printf '%s' "$hfmt" | grep -q '@fleet_task'; then
+  fail 16d "fleetd.heal_status_format left a task token on the bar (drift from bin/fleet): $hfmt"
+elif printf '%s' "$hcur" | grep -q '@fleet_task'; then
+  fail 16d "fleetd left a task token on window-status-current-format: $hcur"
+elif ! printf '%s' "$hfmt" | grep -q '@agent_glyph'; then
+  # the heal must still do its ONE original job
+  fail 16d "fleetd's heal lost the @agent_glyph token: $hfmt"
 else pass 16d; fi
 
 # second run must be a no-op (fleetd's heal_status_format re-runs this forever)
@@ -661,10 +690,11 @@ if [ "$grc" = 0 ]; then fail 26a "--task generic exited 0; a script cannot detec
 elif [ -n "$WG" ]; then fail 26a "--task generic must not spawn an agent (window $WG exists)"
 elif ! printf '%s' "$gout" | grep -qi 'generic'; then fail 26a "no error naming 'generic' on stderr: $gout"
 else pass 26a; fi
-# …and the rejection must leave NOTHING behind that could flip HAS_TASKS: no
-# @fleet_task_tag, no durable sidecar. The dash derives HAS_TASKS from the tag, so
-# a stored-but-unrenderable value is exactly the failure being closed here.
-gtag=$(tmux show -wqv -t "$WG" @fleet_task_tag 2>/dev/null)
+# …and the rejection must leave NOTHING behind that could flip HAS_TASKS: no live
+# option, no durable sidecar. The dash derives HAS_TASKS from the stored task, so a
+# stored-but-unrenderable value is exactly the failure being closed here. (d35: the
+# retired @fleet_task_tag must be empty too — checked here and server-wide in 16.)
+gtag=$(tmux show -wqv -t "$WG" @fleet_task 2>/dev/null)$(tmux show -wqv -t "$WG" @fleet_task_tag 2>/dev/null)
 if [ -z "$gtag" ] && [ ! -e "$(task_file 'repo/feat_generic')" ]; then pass 26b
 else fail 26b "rejected 'generic' left state behind: tag='$gtag' file=$(task_file 'repo/feat_generic')"; fi
 # the warning must name the CLOSED enum, so the message can't advertise a value

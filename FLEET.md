@@ -19,8 +19,8 @@ this project with the `fleet` CLI.
   `fleet selfmerge off`; override a single spawn either way with `--self-merge`
   (force allow) or `--no-self-merge` (force block). **`--task <kind>`** tags what
   KIND of work this agent does — one of `research|plan|impl|test|scratch`
-  — shown as a 4-char tag (`rsch`/`plan`/`impl`/`test`/`scr`) in the tmux window
-  status bar, the dashboard row, and `fleet ls`'s TASK column. Unset (or unknown,
+  — shown as a 4-char tag (`rsch`/`plan`/`impl`/`test`/`scr`) in the dashboard
+  row and `fleet ls`'s TASK column (**not** in the tmux status bar). Unset (or unknown,
   which warns and drops) renders blank. Display only: it is a separate namespace
   from the orchestrator/worker *role*, and `--task main` and `--task generic` are hard-rejected (error + non-zero exit, no spawn).
 - `fleet selfmerge on|off|status` — project-wide worker self-merge toggle. `off`
