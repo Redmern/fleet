@@ -16,6 +16,53 @@
 # Fail-silent and fast — on any doubt, allow.
 set -eu
 
+# ---- lazy promote prologue (see the "release tree" block in bin/fleet) --------
+# ~/.local/bin/fleet-guard points at a RELEASE tree, not at the dev worktree, so
+# a conflicted merge can no longer publish itself to every tool call. This
+# prologue is what keeps the worktree instant-live anyway: if the source file
+# this binary was built from is newer than the release, promote (validated,
+# atomic) and re-exec.
+#
+# Four properties, all load-bearing, this being the hottest path in the system:
+#  * It runs BEFORE stdin is read and before anything is written to stdout or
+#    stderr, so the re-exec inherits an untouched stdin and the PreToolUse hook
+#    protocol is byte-identical whether or not a promote happened.
+#  * Every steady-state check is a shell BUILTIN — no fork, no subshell. Cost is
+#    two stats. A wrapper PROCESS was measured at +0.60 ms and rejected.
+#  * It is silent on every path, including failure. A hook that prints is a hook
+#    that corrupts the protocol.
+#  * It fires ONLY when the file being run IS the released one — `-ef` (inode
+#    identity, not a string compare), so it is true through the ~/.local/bin
+#    symlink and false for a worktree copy someone runs directly. Running
+#    ./bin/fleet-guard by hand, or from a proof, must exercise THAT file and
+#    never silently re-exec into the release. FLEET_PROMOTED bounds the re-exec
+#    to one hop; FLEET_NO_PROMOTE disables the whole thing (used by the promote
+#    gate's own smoke run, so a staged tree can never recurse back into promote).
+if [ -z "${FLEET_NO_PROMOTE:-}" ] && [ -z "${FLEET_PROMOTED:-}" ]; then
+  __fr="${FLEET_RELEASE_DIR:-${HOME:-/nonexistent}/.local/lib/fleet}"
+  __fs=""
+  if [ -f "$__fr/source" ]; then read -r __fs < "$__fr/source" || __fs=""; fi
+  # The third stat is the NEGATIVE CACHE, and it is not an optimisation. The
+  # trigger (`source -nt .stamp`) stays true for as long as the worktree is
+  # broken, so without this every PreToolUse of every agent would re-run the
+  # whole gate — measured 15 ms -> 88 ms, indefinitely, precisely WHILE the
+  # worktree is mid-merge. The degraded mode would be the incident mode. The
+  # drift marker is written on every refusal, so "source not newer than drift"
+  # means "already tried at these bytes, don't try again until they change".
+  if [ -n "$__fs" ] && [ "$0" -ef "$__fr/current/bin/fleet-guard" ] \
+     && [ "$__fs/bin/fleet-guard" -nt "$__fr/current/.stamp" ] \
+     && { [ ! -f "$__fr/drift" ] || [ "$__fs/bin/fleet-guard" -nt "$__fr/drift" ]; }; then
+    FLEET_PROMOTED=1 FLEET_NO_PROMOTE=1 "$__fs/bin/fleet" promote --lazy </dev/null >/dev/null 2>&1 || true
+    if [ -x "$__fr/current/bin/fleet-guard" ]; then
+      FLEET_PROMOTED=1 exec "$__fr/current/bin/fleet-guard" "$@"
+    fi
+  fi
+  unset __fr __fs
+fi
+# The one-hop marker arrives via `exec`, i.e. in the ENVIRONMENT, so it would be
+# inherited by everything this hook spawns. Drop it once it has done its job.
+unset FLEET_PROMOTED 2>/dev/null || true
+
 CFG="${XDG_CONFIG_HOME:-$HOME/.config}/fleet"
 command -v python3 >/dev/null 2>&1 || exit 0
 

@@ -17,6 +17,10 @@ RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
 SOCK="$RUNTIME_DIR/fleet.sock"
 CONF_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/fleet"
 HARNESS_DIR="$FLEET_DIR/harness.d"
+# The release tree ~/.local/bin/* points at (see "release tree" below). Kept
+# DISTINCT from the packaged /usr/lib/fleet, which is root-owned and pacman's;
+# same SHAPE, so FLEET_DIR resolution works identically in both.
+RELEASE_DIR="${FLEET_RELEASE_DIR:-$HOME/.local/lib/fleet}"
 
 die() { echo "fleet: $*" >&2; exit 1; }
 
@@ -5120,7 +5124,9 @@ ensure_daemon() {
   if command -v fleetd >/dev/null; then
     nohup fleetd >/dev/null 2>&1 &
   else
-    nohup "$FLEET_DIR/bin/fleetd" >/dev/null 2>&1 &
+    # via release_stable_dir: `current/`, not the rel-<stamp> this fleet happens
+    # to be running from, which a later promote will prune out from under it.
+    nohup "$(release_stable_dir)/bin/fleetd" >/dev/null 2>&1 &
   fi
   sleep 0.3
 }
@@ -5782,6 +5788,511 @@ cmd_status() {
   echo "fleet status: bin/fleet-status not found" >&2; return 0
 }
 
+# ---- release tree + validated lazy promote -----------------------------------
+# WHY. Before this, ~/.local/bin/{fleet,fleetd,fleet-hook,fleet-guard} symlinked
+# straight into the dev worktree, so the artifact every agent EXECUTES and the
+# artifact the human EDITS were the same bytes with no validity gate between
+# them. Git is *designed* to write syntactically invalid files into a working
+# tree; on 2026-07-30 a conflicted merge in fleet/main published conflict markers
+# into `bin/fleet` and `bin/fleet-guard` fleet-wide, instantly, and every agent's
+# every tool call died until the merge was resolved.
+#
+# Fix: ~/.local/bin points at $RELEASE_DIR/current/bin/*, where `current` is ONE
+# directory symlink swapped by ONE `ln -sfnT` (rename(2) — the only zero-window
+# publish there is). Promote is LAZY: each entry point asks "is my source newer
+# than my release?" and promotes if so, so saving a file is still instantly live.
+# Promote is GATED, so a source that does not validate is simply not published
+# and the fleet keeps running the last good release.
+#
+# Three invariants, each of which was a measured failure mode:
+#   * Nothing is ever rewritten in place. Bash reads a script incrementally by
+#     byte offset, so `cp` over a RUNNING script corrupts the running process
+#     (`unexpected EOF`, rc=2). Every release tree is built elsewhere and renamed.
+#   * One swap or none. A half-promote (new `fleet` + old `fleet-guard`) is worse
+#     than the outage it replaces: it is silent, and a stale fail-silent guard
+#     ALLOWS what it should deny.
+#   * Manifest-driven, never glob-driven. `~/.local/bin/fleet-tile` is a dangling
+#     link from a removed binary; any glob-driven promote/repair trips over it.
+
+# Files that constitute a release. `bin/fleet` derives FLEET_DIR from its own
+# resolved path and then reads harness.d/, nvim/, FLEET.md, FLEET_SUBORCH.md,
+# systemd/ and lib/ from it — a bin/-only release is broken on day one.
+# lib/node_modules (13M) is deliberately excluded: fleet already prefers
+# $FLEET_VENDOR (~/.local/share/fleet/lib) for the browser driver deps.
+release_manifest() { # release_manifest <src-dir> -> relative paths, one per line
+  local s="${1:-$FLEET_DIR}" p
+  for p in bin/fleet bin/fleetd bin/fleet-hook bin/fleet-guard bin/fleet-dash \
+           bin/fleet-status bin/fleet-dispatch.sh \
+           nvim/fleet.lua FLEET.md FLEET_SUBORCH.md \
+           lib/browser-test.js lib/package.json lib/package-lock.json \
+           systemd/fleetd.service; do
+    [ -f "$s/$p" ] && printf '%s\n' "$p"
+  done
+  for p in "$s"/harness.d/*.conf; do
+    [ -f "$p" ] && printf 'harness.d/%s\n' "${p##*/}"
+  done
+  # skills/ ships too: the sub-orch skill is symlinked into every Claude profile,
+  # and a CONFLICTED SKILL.md mis-instructs every agent QUIETLY — worse than a
+  # crash. sort for a deterministic manifest (the proofs diff it).
+  local f
+  while IFS= read -r f; do printf '%s\n' "${f#"$s"/}"; done \
+    < <(find "$s/skills" -type f 2>/dev/null | LC_ALL=C sort)
+  return 0
+}
+
+# Which worktree do promotes read from? Explicit override wins; a fleet running
+# FROM the release reads the recorded pointer; otherwise it is its own FLEET_DIR.
+# Am I running FROM the release tree? $FLEET_DIR is built through `readlink -f`
+# while $RELEASE_DIR is a literal $HOME path, so a comparison of the two raw
+# strings goes silently false whenever $HOME, /home or ~/.local is itself a
+# symlink — and then lazy promote never fires and `cmd_setup` bakes a
+# rel-<stamp> path into settings.json that the next promote prunes. Resolve
+# both, once, cached. Prefix-test with ${x#…} rather than a `case` glob:
+# $RELEASE_DIR is DATA and a `[` or `*` in it would be read as a pattern.
+_REL_RESOLVED=""
+release_dir_resolved() {
+  [ -n "$_REL_RESOLVED" ] || _REL_RESOLVED=$(readlink -f "$RELEASE_DIR" 2>/dev/null || printf '%s' "$RELEASE_DIR")
+  printf '%s\n' "$_REL_RESOLVED"
+}
+release_running_from_release() { # rc 0 = this fleet lives inside the release tree
+  local r; r=$(release_dir_resolved)
+  [ -n "$r" ] || return 1
+  [ "${FLEET_DIR#"$r"/}" != "$FLEET_DIR" ] || [ "$FLEET_DIR" = "$r" ]
+}
+
+release_source() {
+  if [ -n "${FLEET_SOURCE:-}" ]; then printf '%s\n' "$FLEET_SOURCE"; return 0; fi
+  if release_running_from_release; then
+    [ -f "$RELEASE_DIR/source" ] && head -1 "$RELEASE_DIR/source" 2>/dev/null
+    return 0
+  fi
+  printf '%s\n' "$FLEET_DIR"
+}
+
+# A path to THIS install that survives the next promote. $FLEET_DIR resolves
+# through `current` to rel-<stamp>, which is immutable AND eventually pruned, so
+# anything WRITTEN TO DISK (systemd ExecStart, the hook commands baked into
+# settings.json, ~/.local/bin symlinks) must name `current/` instead or every
+# promote orphans it. Non-release installs (worktree, /usr/lib/fleet) are
+# returned unchanged.
+release_stable_dir() {
+  if release_running_from_release; then printf '%s\n' "$RELEASE_DIR/current"
+  else printf '%s\n' "$FLEET_DIR"; fi
+}
+
+# GATE CHECK 1 — is a git operation in progress? Cheapest and most decisive: it
+# fires on the ACTUAL incident condition before a byte of source is read.
+release_git_busy() { # release_git_busy <src> -> prints the marker, rc 0 if busy
+  local gd m
+  gd=$(git -C "$1" rev-parse --absolute-git-dir 2>/dev/null) || return 1
+  for m in MERGE_HEAD REBASE_HEAD CHERRY_PICK_HEAD REVERT_HEAD rebase-merge rebase-apply; do
+    [ -e "$gd/$m" ] && { printf '%s\n' "$m"; return 0; }
+  done
+  return 1
+}
+
+# GATE CHECKS 2-4 over a STAGED tree. Prints "<file>|<check>|<detail>" and
+# returns non-zero on the first failure; silent + 0 when the tree is publishable.
+#
+# `bash -n` alone is provably insufficient and this is the single most important
+# fact in the design: conflict markers inside an embedded python heredoc parse as
+# valid shell (rc=0) and die at RUNTIME with SyntaxError — which is exactly the
+# shape of fleet-guard/fleet-hook, and fleet-guard WAS one of the conflicted
+# files on 07-30. Hence check 4, a real invocation.
+release_gate() { # release_gate <stage-dir>
+  local st="$1" p hit first
+
+  # 0. COMPLETENESS. `release_manifest` skips what it cannot find, so a source
+  #    missing a file yields a manifest that is internally consistent and a
+  #    release that is quietly incomplete — a half-promote arrived at from the
+  #    other direction. The required set is asserted against the STAGE, so a
+  #    file lost in staging is caught too.
+  for p in bin/fleet bin/fleetd bin/fleet-hook bin/fleet-guard bin/fleet-dash \
+           bin/fleet-status bin/fleet-dispatch.sh nvim/fleet.lua \
+           FLEET.md FLEET_SUBORCH.md; do
+    [ -f "$st/$p" ] || { printf '%s|missing|not in the staged release\n' "$p"; return 1; }
+  done
+  set -- "$st"/harness.d/*.conf
+  [ -f "$1" ] || { printf 'harness.d|missing|no harness adapters in the staged release\n'; return 1; }
+
+  while IFS= read -r p; do
+    [ -n "$p" ] || continue
+    # 2. anchored conflict markers (anchored: '=======' appears unanchored in
+    #    plenty of legitimate markdown rules)
+    hit=$(grep -nE '^(<<<<<<< |=======$|>>>>>>> )' "$st/$p" 2>/dev/null | head -1)
+    [ -n "$hit" ] && { printf '%s|conflict-marker|%s\n' "$p" "$hit"; return 1; }
+
+    # 3. parse: dispatch on the shebang, so adding a binary needs no list edit.
+    #    harness.d/*.conf is in scope even though it has no shebang — it is
+    #    `.`-sourced by bin/fleet on EVERY invocation, so a marker-free syntax
+    #    error in one breaks every fleet call from an otherwise valid release.
+    case "$p" in
+      harness.d/*)
+        hit=$(bash -n "$st/$p" 2>&1) \
+          || { printf '%s|bash -n|%s\n' "$p" "$(printf '%s' "$hit" | head -1)"; return 1; }
+        continue ;;
+      bin/*) ;;
+      *) continue ;;
+    esac
+    first=$(head -1 "$st/$p" 2>/dev/null)
+    case "$first" in
+      *python*)
+        hit=$(python3 -m py_compile "$st/$p" 2>&1) \
+          || { printf '%s|py_compile|%s\n' "$p" "$(printf '%s' "$hit" | tail -1)"; return 1; } ;;
+      *bash*)
+        hit=$(bash -n "$st/$p" 2>&1) \
+          || { printf '%s|bash -n|%s\n' "$p" "$(printf '%s' "$hit" | head -1)"; return 1; } ;;
+      *sh*)
+        hit=$(sh -n "$st/$p" 2>&1) \
+          || { printf '%s|sh -n|%s\n' "$p" "$(printf '%s' "$hit" | head -1)"; return 1; } ;;
+    esac
+  done <<EOF
+$(release_manifest "$st")
+EOF
+
+  # 3b. embedded python. `sh -n` / `bash -n` treat a quoted heredoc as an opaque
+  #     string, so a conflict marker or a syntax error INSIDE one parses clean
+  #     (rc=0) and dies at runtime — and that is exactly the shape of
+  #     fleet-guard/fleet-hook, one of which WAS conflicted on 07-30. A
+  #     `bash -n`-only gate would have published the outage.
+  hit=$(python3 - "$st" <<'PY' 2>&1
+import os, re, sys
+root = sys.argv[1]
+pat = re.compile(r"^(?P<open>[^\n]*<<'(?P<tag>\w+)'[^\n]*)\n(?P<body>.*?)\n(?P=tag)\n",
+                 re.S | re.M)
+for dirpath, _dirs, files in os.walk(os.path.join(root, "bin")):
+    for fn in sorted(files):
+        p = os.path.join(dirpath, fn)
+        try:
+            s = open(p, encoding="utf-8", errors="replace").read()
+        except Exception:
+            continue
+        for m in pat.finditer(s):
+            # Only heredocs actually FED TO python — an awk or sed heredoc is
+            # not python and must not be compiled as such.
+            if "python" not in m.group("open"):
+                continue
+            try:
+                compile(m.group("body"), "<heredoc>", "exec")
+            except SyntaxError as e:
+                print("%s|embedded-python|line %s: %s"
+                      % (os.path.relpath(p, root), e.lineno, e.msg))
+                sys.exit(1)
+PY
+  ) || { printf '%s\n' "$hit"; return 1; }
+
+  # 4. smoke — actually RUN the hot-path binaries. Sandboxed HOME/XDG so the
+  #    smoke can neither read nor write real state, and FLEET_NO_PROMOTE so a
+  #    staged tree can never recurse back into promote.
+  # Fails CLOSED if the sandbox cannot be made. Every other doubt in fleet
+  # resolves to "allow"; not this one. The smoke run is the ONLY check that
+  # catches a guard whose python is valid but no longer denies (proof variant 5),
+  # and skipping it silently is exactly the security inversion being defended
+  # against.
+  local sb="$st/.smoke"
+  mkdir -p "$sb/config" 2>/dev/null \
+    || { printf 'bin/fleet-guard|smoke|could not create the smoke sandbox\n'; return 1; }
+  # BEHAVIOURAL, not exit-code: fleet-guard ends its python with `|| exit 0`
+  # (fail-silent by design), so a guard whose python is broken still exits 0 —
+  # while silently ALLOWING everything it is supposed to deny. That security
+  # inversion is precisely what must not ship, so the smoke asserts the DENY.
+  hit=$(printf '%s' '{"tool_name":"Bash","tool_input":{"command":"git push origin main"}}' \
+        | env FLEET_NO_PROMOTE=1 FLEET_ROLE=worker HOME="$sb" XDG_CONFIG_HOME="$sb/config" \
+              sh "$st/bin/fleet-guard" 2>/dev/null)
+  case "$hit" in
+    *'"deny"'*) ;;
+    *) printf 'bin/fleet-guard|smoke|did not deny a worker `git push` (its python is dead)\n'
+       rm -rf "$sb"; return 1 ;;
+  esac
+  if ! printf '%s' '{"tool_name":"Bash","tool_input":{"command":"true"}}' \
+       | env FLEET_NO_PROMOTE=1 HOME="$sb" XDG_CONFIG_HOME="$sb/config" \
+             sh "$st/bin/fleet-guard" >/dev/null 2>&1; then
+    printf 'bin/fleet-guard|smoke|non-zero exit on a PreToolUse payload\n'; rm -rf "$sb"; return 1
+  fi
+  if ! env FLEET_NO_PROMOTE=1 HOME="$sb" XDG_CONFIG_HOME="$sb/config" \
+       sh "$st/bin/fleet-hook" idle >/dev/null 2>&1; then
+    printf 'bin/fleet-hook|smoke|non-zero exit\n'; rm -rf "$sb"; return 1
+  fi
+  if ! env FLEET_NO_PROMOTE=1 HOME="$sb" XDG_CONFIG_HOME="$sb/config" \
+       bash "$st/bin/fleet" help >/dev/null 2>&1; then
+    printf 'bin/fleet|smoke|non-zero exit on `fleet help`\n'; rm -rf "$sb"; return 1
+  fi
+  rm -rf "$sb"
+  return 0
+}
+
+# Materialise the manifest into a private staging dir. --from-head reads
+# `git archive HEAD` instead of the worktree: no commit has ever contained a
+# conflict marker, so that path is STRUCTURALLY immune to the outage. It is not
+# the default, because defaulting to HEAD would kill instant-live.
+release_stage() { # release_stage <src> <stage> <from_head>
+  local src="$1" st="$2" fh="$3" p
+  mkdir -p "$st" 2>/dev/null || return 1
+  if [ "$fh" = 1 ]; then
+    local paths; paths=$(release_manifest "$src")
+    # shellcheck disable=SC2086 — manifest paths are repo-relative, no spaces
+    ( cd "$src" && git archive HEAD -- $paths ) 2>/dev/null | tar -C "$st" -xf - 2>/dev/null || return 1
+  else
+    while IFS= read -r p; do
+      [ -n "$p" ] || continue
+      # only for nested paths: `${p%/*}` on a bare 'FLEET.md' yields 'FLEET.md'
+      # itself, which would create a DIRECTORY of that name and eat the copy.
+      case "$p" in */*) mkdir -p "$st/${p%/*}" 2>/dev/null ;; esac
+      cp -p "$src/$p" "$st/$p" 2>/dev/null || return 1
+    done <<EOF
+$(release_manifest "$src")
+EOF
+  fi
+  chmod +x "$st"/bin/* 2>/dev/null || true
+  [ -f "$st/bin/fleet" ] || return 1
+  return 0
+}
+
+# Does any manifest file post-date <ref>? The comparisons themselves are `-nt`
+# builtins; building the manifest costs one subshell (and one `find` over
+# skills/), which `fleet` can afford — unlike the hook prologues, which is why
+# those compare a single file inline instead of calling this.
+release_newer_than() { # release_newer_than <src> <ref-file> ; rc 0 = something is newer
+  local src="$1" ref="$2" p
+  [ -e "$ref" ] || return 0
+  while IFS= read -r p; do
+    [ -n "$p" ] || continue
+    [ "$src/$p" -nt "$ref" ] && return 0
+  done <<EOF
+$(release_manifest "$src")
+EOF
+  return 1
+}
+
+release_behind() { # release_behind <src> ; rc 0 = behind (or no release at all)
+  [ -d "$1" ] || return 1
+  release_newer_than "$1" "$RELEASE_DIR/current/.stamp"
+}
+
+release_prune() { # keep the N newest release trees; never the live or previous one
+  local keep="${1:-3}" cur prev d n=0
+  cur=$(readlink "$RELEASE_DIR/current" 2>/dev/null)
+  prev=$(head -1 "$RELEASE_DIR/previous" 2>/dev/null)
+  while IFS= read -r d; do
+    [ -n "$d" ] || continue
+    [ "$d" = "$cur" ] && continue
+    [ "$d" = "$prev" ] && continue
+    n=$((n+1))
+    # -mmin +10: a `fleet` that started before the last few promotes may still be
+    # reading harness.d/ or FLEET.md out of an older tree (its FLEET_DIR resolved
+    # to it). Deleting a tree out from under a running process is cheap to avoid
+    # and unpleasant to debug, so nothing is reaped until it has been cold for
+    # ten minutes.
+    [ "$n" -ge "$keep" ] \
+      && find "$RELEASE_DIR" -maxdepth 1 -name "$d" -mmin +10 -exec rm -rf {} + 2>/dev/null
+  done <<EOF
+$(cd "$RELEASE_DIR" 2>/dev/null && command ls -1dt rel-* 2>/dev/null)
+EOF
+  # Abandoned staging trees. A SIGKILL'd promote leaks its whole private stage
+  # (the atomicity proof leaves ~6 per run), and nothing else would ever collect
+  # them. +60 min so a slow in-flight promote is never pulled out from under
+  # itself. Anchored to a name pattern under one directory — never a bare glob.
+  find "$RELEASE_DIR" -maxdepth 1 -name '.stage-*' -mmin +60 -exec rm -rf {} + 2>/dev/null
+  return 0
+}
+
+release_rollback() {
+  local prev cur
+  prev=$(head -1 "$RELEASE_DIR/previous" 2>/dev/null)
+  [ -n "$prev" ] && [ -d "$RELEASE_DIR/$prev" ] \
+    || { echo "fleet: no previous release to roll back to" >&2; return 1; }
+  cur=$(readlink "$RELEASE_DIR/current" 2>/dev/null)
+  ln -sfnT "$prev" "$RELEASE_DIR/current" 2>/dev/null \
+    || { echo "fleet: rollback failed (could not swap 'current')" >&2; return 1; }
+  # Toggle, so a rollback of a rollback returns you to where you were.
+  [ -n "$cur" ] && printf '%s\n' "$cur" > "$RELEASE_DIR/previous" 2>/dev/null
+  echo "fleet: rolled back to $prev"
+  return 0
+}
+
+# `fleet promote` — build, validate, swap. Usable as `./bin/fleet promote`
+# straight from the worktree with NO dependence on `current`: if promote only
+# ever shipped inside what it promotes, a bad release would break its own
+# recovery command and leave things worse than the outage it replaces.
+cmd_promote() {
+  local from_head=0 lazy=0 keep=3
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --from-head) from_head=1 ;;
+      --rollback)  release_rollback; return $? ;;
+      --status)    doctor_release; return 0 ;;
+      --lazy)      lazy=1 ;;                    # internal: the hot-path caller
+      --keep)      shift; keep="${1:-3}" ;;
+      -h|--help)   echo "usage: fleet promote [--from-head] [--rollback] [--status] [--keep N]"; return 0 ;;
+      *)           echo "fleet promote: unknown flag '$1'" >&2; return 2 ;;
+    esac
+    shift
+  done
+
+  local src; src=$(release_source)
+  if [ -z "$src" ] || [ ! -d "$src" ]; then
+    [ "$lazy" = 1 ] || echo "fleet: no promote source (set \$FLEET_SOURCE)" >&2
+    return 1
+  fi
+  mkdir -p "$RELEASE_DIR" 2>/dev/null || return 1
+
+  local fail=""
+  if [ "$from_head" = 0 ]; then
+    local busy; busy=$(release_git_busy "$src") && fail="worktree|git-in-progress|$busy"
+  fi
+
+  # Unique per process AND per attempt, so two entry points racing a promote
+  # build private trees and both swap; last writer wins and BOTH are valid.
+  local stage="$RELEASE_DIR/.stage-$$-$(date +%s%N)"
+  if [ -z "$fail" ]; then
+    release_stage "$src" "$stage" "$from_head" || fail="worktree|stage|could not materialise the manifest"
+  fi
+  # Key the decision on the gate's EXIT STATUS, not merely on whether it printed.
+  # A check that returns non-zero without writing a detail line (python3 killed
+  # by a signal, a future `return 1` added without a printf) would otherwise leave
+  # $fail empty and PUBLISH — a gate that fails open. Fail CLOSED here: this is
+  # the one place in fleet where doubt must mean refuse.
+  if [ -z "$fail" ]; then
+    local grc=0
+    fail=$(release_gate "$stage") || grc=$?
+    [ "$grc" = 0 ] || fail="${fail:-worktree|gate|check failed with no detail (rc=$grc)}"
+  fi
+
+  if [ -n "$fail" ]; then
+    rm -rf "$stage" 2>/dev/null
+    { printf 'release behind %s\n' "$src"
+      printf 'file:   %s\n' "${fail%%|*}"
+      printf 'check:  %s\n' "$(printf '%s' "$fail" | cut -d'|' -f2)"
+      printf 'detail: %s\n' "${fail##*|}"
+      printf 'when:   %s\n' "$(date -Is 2>/dev/null)"
+    } > "$RELEASE_DIR/drift" 2>/dev/null
+    # Fail-silent on the lazy path — hot-path callers own stdout/stderr.
+    [ "$lazy" = 1 ] || echo "fleet: promote REFUSED — ${fail%%|*}: $(printf '%s' "$fail" | cut -d'|' -f2)" >&2
+    return 3
+  fi
+
+  local stamp rel; stamp=$(date +%Y%m%d-%H%M%S)-$$; rel="rel-$stamp"
+  { printf 'stamp=%s\n' "$stamp"
+    printf 'source=%s\n' "$src"
+    printf 'git=%s\n' "$(git -C "$src" rev-parse --short HEAD 2>/dev/null)"
+    printf 'from_head=%s\n' "$from_head"
+    printf 'fleetd_sha=%s\n' "$(sha256sum "$stage/bin/fleetd" 2>/dev/null | cut -d' ' -f1)"
+  } > "$stage/.release" 2>/dev/null
+  : > "$stage/.stamp" 2>/dev/null      # AFTER the content: it is the mtime ref
+
+  mv "$stage" "$RELEASE_DIR/$rel" 2>/dev/null || { rm -rf "$stage" 2>/dev/null; return 1; }
+  local cur; cur=$(readlink "$RELEASE_DIR/current" 2>/dev/null)
+  # THE swap. -n/-T are mandatory: bare `ln -sf` onto an existing dir symlink
+  # creates the link INSIDE the target directory (reproduced), which is silently
+  # wrong. coreutils implements this as symlink-to-temp + rename(2) = atomic.
+  ln -sfnT "$rel" "$RELEASE_DIR/current" 2>/dev/null || return 1
+  [ -n "$cur" ] && printf '%s\n' "$cur" > "$RELEASE_DIR/previous" 2>/dev/null
+  printf '%s\n' "$src" > "$RELEASE_DIR/source" 2>/dev/null
+  rm -f "$RELEASE_DIR/drift" 2>/dev/null
+  release_prune "$keep"
+  [ "$lazy" = 1 ] || echo "fleet: promoted $rel from $src"
+  return 0
+}
+
+# The lazy promote for `fleet` itself. NOT hot path — unlike the hook prologues
+# this one costs a subshell per manifest build (plus a `find` over skills/), which
+# is affordable here and is why the prologues deliberately do NOT call it. Only
+# fires when this fleet is running FROM the release — a worktree `./bin/fleet`
+# must stay exactly as immediate as it is today.
+release_lazy_self() {
+  # Consume the marker FIRST — before the FLEET_NO_PROMOTE early return — so it
+  # is dropped on every path, including inside the promote child (which is
+  # invoked with both vars set and spawns git/tar/python of its own).
+  # CONSUME the one-hop marker rather than merely reading it. A prefix assignment
+  # on `exec` becomes part of the new process's ENVIRONMENT, so simply testing it
+  # leaves it exported to every descendant — and `fleet up` starts the tmux
+  # SERVER, which would then stamp FLEET_PROMOTED=1 on every agent pane for the
+  # whole session and silently disable the guard/hook prologues fleet-wide. That
+  # is the "I'm debugging stale code" failure this design exists to prevent, so
+  # the marker dies here, before anything is spawned.
+  local __was_promoted="${FLEET_PROMOTED:-}"
+  unset FLEET_PROMOTED
+  [ -n "${FLEET_NO_PROMOTE:-}" ] && return 0
+  [ -n "$__was_promoted" ] && return 0
+  release_running_from_release || return 0
+  local src; src=$(release_source)
+  [ -n "$src" ] && [ -d "$src" ] || return 0
+  release_behind "$src" || return 0
+  # Negative cache, as in the hook prologues: don't re-run a gate that already
+  # refused these exact bytes. The stderr line below still fires every call —
+  # being told once per command that you are running stale code is the point.
+  if [ ! -f "$RELEASE_DIR/drift" ] || release_newer_than "$src" "$RELEASE_DIR/drift"; then
+    FLEET_PROMOTED=1 FLEET_NO_PROMOTE=1 "$src/bin/fleet" promote --lazy </dev/null >/dev/null 2>&1 || true
+  fi
+  if release_behind "$src"; then
+    # Still behind = the gate refused. Exactly ONE stderr line, once per call:
+    # zero and you debug a phantom "my edit didn't work"; one per subshell and
+    # you learn to ignore it.
+    echo "fleet: release is BEHIND your worktree (running last good release; see 'fleet doctor')" >&2
+    return 0
+  fi
+  # Promoted: re-exec so THIS invocation runs the code that was just saved. The
+  # release tree was renamed into place, never rewritten, so the currently
+  # running script's inode is untouched and this exec is safe.
+  [ -x "$RELEASE_DIR/current/bin/fleet" ] || return 0
+  # PREFIX assignment, never `export`: an exported FLEET_PROMOTED is inherited by
+  # every descendant, and `fleet up` starts the tmux SERVER — so one `fleet up`
+  # right after an edit would stamp it on every agent pane for the whole session
+  # and silently kill the guard/hook prologues. That is precisely the "I'm
+  # debugging stale code" failure this design exists to prevent.
+  FLEET_PROMOTED=1 exec "$RELEASE_DIR/current/bin/fleet" "$@"
+}
+
+# release health, folded into `fleet doctor`
+doctor_release() {
+  echo "--- release ---"
+  if [ ! -e "$RELEASE_DIR/current" ]; then
+    echo "warn no release tree at $RELEASE_DIR (run './bin/fleet promote')"
+    return 0
+  fi
+  echo "ok   current -> $(readlink "$RELEASE_DIR/current" 2>/dev/null) ($RELEASE_DIR)"
+  local src; src=$(release_source)
+  echo "     source: ${src:-<unknown>}"
+  if [ -n "$src" ] && [ -d "$src" ]; then
+    if release_behind "$src"; then echo "warn release is BEHIND the worktree"
+    else echo "ok   release is current with the worktree"; fi
+  else
+    echo "warn source worktree missing — the release is frozen (still serving)"
+  fi
+  if [ -f "$RELEASE_DIR/drift" ]; then
+    echo "warn last promote was REFUSED by the gate:"
+    sed 's/^/       /' "$RELEASE_DIR/drift" 2>/dev/null
+  fi
+  # fleetd compiles its source once at import, so it is immune to file changes
+  # until restarted. LAZY PROMOTE NEVER RESTARTS IT: an unconditional restart
+  # drops the socket ~2s and fleet-hook silently discards state transitions in
+  # that window — one lost edge leaves an agent stuck "working" forever. Skew is
+  # benign and visible; a dropped socket is neither.
+  local relsha runsha
+  relsha=$(grep '^fleetd_sha=' "$RELEASE_DIR/current/.release" 2>/dev/null | cut -d= -f2)
+  runsha=$(rpc fleet.ping 2>/dev/null | grep -o '"fleetd_sha": *"[^"]*"' | cut -d'"' -f4)
+  if [ -z "$runsha" ]; then
+    echo "warn fleetd version unknown (daemon down, or predates version reporting)"
+  elif [ "$runsha" = "$relsha" ]; then
+    echo "ok   fleetd matches the current release"
+  else
+    echo "warn fleetd is STALE vs the release (systemctl --user restart fleetd)"
+  fi
+  # The regression adviser B rates most likely: someone re-runs an old
+  # install.sh and the symlinks point back into a worktree.
+  local b tgt
+  for b in fleet fleetd fleet-hook fleet-guard; do
+    [ -L "$HOME/.local/bin/$b" ] || { echo "warn ~/.local/bin/$b is not a symlink (or absent)"; continue; }
+    tgt=$(readlink -f "$HOME/.local/bin/$b" 2>/dev/null)
+    case "$tgt" in
+      "$(readlink -f "$RELEASE_DIR" 2>/dev/null)"/*) echo "ok   ~/.local/bin/$b -> release" ;;
+      "") echo "warn ~/.local/bin/$b is DANGLING" ;;
+      *)  echo "warn ~/.local/bin/$b -> $tgt (NOT the release — a worktree conflict takes the fleet down)" ;;
+    esac
+  done
+  return 0
+}
+
 cmd_doctor() {
   local ok=0
   for dep in tmux nvim git python3 fzf; do
@@ -5823,6 +6334,7 @@ cmd_doctor() {
   fi
   local _curpfx; _curpfx=$(tmux show -gv prefix 2>/dev/null)
   [ -n "$_curpfx" ] && echo "ok   tmux prefix: $_curpfx (leader: prefix+$(keybind_for menu))"
+  doctor_release       # release tree: stamp, drift, gate failure, fleetd skew
   doctor_config_sync   # non-fatal advisories: symlinks / chezmoi / stale clones
   doctor_secrets       # warn-only: pass state + referenced entries + honest caveat
   return $ok
@@ -6068,15 +6580,28 @@ cmd_setup() {
   # Hook bins resolve relative to THIS install (packaged: real files under
   # /usr/lib/fleet/bin; dev: the worktree bin/). This replaces install.sh's
   # hardcoded $HOME/.local/bin/fleet-hook.
-  local HOOK="$FLEET_DIR/bin/fleet-hook"
-  local GUARD="$FLEET_DIR/bin/fleet-guard"
+  # …via release_stable_dir, so a release install bakes `current/bin/…` into
+  # settings.json rather than a rel-<stamp> that the next promote prunes.
+  local STABLE; STABLE=$(release_stable_dir)
+  local HOOK="$STABLE/bin/fleet-hook"
+  local GUARD="$STABLE/bin/fleet-guard"
 
   # Dev-shadow guard (RESEARCH §6.2): if some OTHER fleet is first on PATH, wiring
   # this one would fight it — last writer wins on the shared settings.json. Wire
   # the install the `fleet` you ran belongs to; warn and no-op otherwise.
-  local onpath; onpath=$(command -v fleet 2>/dev/null)
-  if [ -n "$onpath" ] && \
-     [ "$(readlink -f "$onpath" 2>/dev/null)" != "$(readlink -f "$FLEET_DIR/bin/fleet" 2>/dev/null)" ]; then
+  # The fleet on PATH is now a symlink into the RELEASE, so it legitimately does
+  # not resolve to $FLEET_DIR/bin/fleet when you run ./bin/fleet setup from the
+  # worktree that release was built from. Without the second arm, setup from the
+  # canonical worktree — the normal case — aborts with "another fleet shadows
+  # this one". Accept either: the same file, or the release this worktree feeds.
+  local onpath onpathr selfr relr
+  onpath=$(command -v fleet 2>/dev/null)
+  onpathr=$(readlink -f "$onpath" 2>/dev/null)
+  selfr=$(readlink -f "$FLEET_DIR/bin/fleet" 2>/dev/null)
+  relr=$(readlink -f "$RELEASE_DIR/current/bin/fleet" 2>/dev/null)
+  if [ -n "$onpath" ] && [ "$onpathr" != "$selfr" ] && \
+     { [ -z "$relr" ] || [ "$onpathr" != "$relr" ] \
+       || [ "$(readlink -f "$(head -1 "$RELEASE_DIR/source" 2>/dev/null)" 2>/dev/null)" != "$(readlink -f "$FLEET_DIR" 2>/dev/null)" ]; }; then
     echo "ERROR: fleet setup aborted — another fleet shadows this one on PATH:" >&2
     echo "         on PATH:  $onpath -> $(readlink -f "$onpath" 2>/dev/null)" >&2
     echo "         this one: $FLEET_DIR/bin/fleet" >&2
@@ -6101,7 +6626,7 @@ cmd_setup() {
   if [ "$no_systemd" = 1 ]; then
     echo "  skipping systemd unit (--no-systemd); fleetd starts on demand via 'fleet up'"
     if [ ! -S "$SOCK" ]; then
-      nohup "$FLEET_DIR/bin/fleetd" >/dev/null 2>&1 &
+      nohup "$STABLE/bin/fleetd" >/dev/null 2>&1 &   # current/, not this rel-<stamp>
       echo "  started fleetd (nohup, pid $!)"
     fi
   else
@@ -6111,9 +6636,9 @@ cmd_setup() {
        [ ! -f /usr/lib/systemd/user/fleetd.service ]; then
       local unit_dir="$HOME/.config/systemd/user"
       mkdir -p "$unit_dir"
-      sed "s#^ExecStart=.*#ExecStart=$FLEET_DIR/bin/fleetd#" \
+      sed "s#^ExecStart=.*#ExecStart=$STABLE/bin/fleetd#" \
         "$FLEET_DIR/systemd/fleetd.service" > "$unit_dir/fleetd.service"
-      echo "  installed user unit: $unit_dir/fleetd.service (ExecStart=$FLEET_DIR/bin/fleetd)"
+      echo "  installed user unit: $unit_dir/fleetd.service (ExecStart=$STABLE/bin/fleetd)"
     fi
     systemctl --user daemon-reload 2>/dev/null || true
     systemctl --user enable --now fleetd 2>/dev/null \
@@ -6235,6 +6760,9 @@ fleet — agent fleet manager (tmux + nvim + Claude Code)
   fleet status           live config report (what's deployed, per config repo)
   fleet setup            per-user post-install: enable fleetd + wire Claude hooks [--no-systemd] [--browser] [--force]
   fleet unsetup          reverse setup: disable the user unit + unwire hooks
+  fleet promote          build+validate+atomically swap the release tree ~/.local/bin points at
+                         (normally automatic: saving a file promotes on the next invocation)
+                         [--from-head] [--rollback] [--status] [--keep N]
   fleet doctor           dependency / wiring check
 
   Claude profiles wired by setup/doctor/unsetup default to ~/.claude + ~/.claude_personal.
@@ -6248,6 +6776,12 @@ EOF
 # dispatching (so shell tests can call inbox_*/reap predicates directly). `return`
 # is valid only in a sourced file; the gate keeps it off the exec path.
 [ "${FLEET_SOURCE_ONLY:-}" = 1 ] && return 0 2>/dev/null
+
+# Lazy promote for the CLI itself, immediately before dispatch: `fleet` is not
+# hot path, so unlike the hook prologues it can afford the full manifest drift
+# check (~30 builtin stats, no fork). No-op unless this fleet is running FROM
+# the release — a worktree ./bin/fleet stays exactly as immediate as it is today.
+release_lazy_self "$@"
 
 case "${1:-}" in
   up)      shift; cmd_up "$@" ;;
@@ -6320,6 +6854,9 @@ case "${1:-}" in
   status)     shift; cmd_status "$@" ;;
   setup)      shift; cmd_setup "$@" ;;     # per-user post-install: systemd + hook wiring (+ --browser)
   unsetup)    shift; cmd_unsetup "$@" ;;   # reverse setup: disable unit + unwire hooks (per-user only)
+  promote)    shift; cmd_promote "$@" ;;             # build+validate+atomically swap the release tree
+  release-manifest) shift; release_manifest "$@" ;;   # internal: the release file list (proof harness)
+  release-behind)   shift; release_behind "$@" ;;     # internal: rc 0 = release behind source (proof harness)
   doctor)     shift; cmd_doctor "$@" ;;
   help|-h|--help) print_usage ;;       # explicit help: always the usage text
   "")

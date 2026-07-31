@@ -6,6 +6,14 @@ set -euo pipefail
 FLEET_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
 BIN_DIR="$HOME/.local/bin"
 UNIT_DIR="$HOME/.config/systemd/user"
+# ~/.local/bin points at the RELEASE TREE, never at this worktree. Linking the
+# worktree directly is what made a conflicted merge a fleet-wide outage on
+# 2026-07-30: git writes conflict markers into a working tree by design, and that
+# working tree was the production install. See the "release tree" block in
+# bin/fleet. Everything installed below resolves through ONE directory symlink,
+# $RELEASE_DIR/current, which `fleet promote` swaps atomically.
+RELEASE_DIR="${FLEET_RELEASE_DIR:-$HOME/.local/lib/fleet}"
+REL_BIN="$RELEASE_DIR/current/bin"
 
 # Resolve the Claude profile dirs to wire hooks/guard into. Kept in parity with
 # claude_profiles() in bin/fleet (cmd_setup uses the same env + config file).
@@ -37,6 +45,24 @@ mapfile -t PROFILES < <(claude_profiles)
 
 HOOK_CMD="$BIN_DIR/fleet-hook"
 
+# Build the release BEFORE anything is linked at it. Runs the promote gate
+# (git-in-progress refusal, anchored conflict-marker grep, parse checks, smoke
+# invocation) — so an install from a mid-merge worktree refuses loudly instead of
+# publishing markers to every agent.
+promote_release() {
+  echo "  promoting release tree -> $RELEASE_DIR/current"
+  if FLEET_SOURCE="$FLEET_DIR" FLEET_RELEASE_DIR="$RELEASE_DIR" \
+     "$FLEET_DIR/bin/fleet" promote; then
+    return 0
+  fi
+  echo "ERROR: promote refused — NOT installing." >&2
+  [ -f "$RELEASE_DIR/drift" ] && sed 's/^/       /' "$RELEASE_DIR/drift" >&2
+  echo "       Your worktree does not validate (mid-merge? conflict markers?)." >&2
+  echo "       Finish the merge and re-run, or install the committed state with:" >&2
+  echo "         ./bin/fleet promote --from-head && ./install.sh" >&2
+  exit 1
+}
+
 # The implementation-pipeline skill is CONTENT rather than infrastructure, but it
 # is read by the same sub-orchestrator that reads FLEET_SUBORCH.md, and the two
 # must agree or the agent is holding contradictory instructions. Keeping the only
@@ -51,7 +77,9 @@ link_skill() { # link_skill <profile-dir>
   # see the vars it is assigning, so `dest="$p/…"` would silently resolve to
   # "/…" — an absolute path outside the profile.
   local p="$1"
-  local src="$FLEET_DIR/$SKILL_REL"
+  # Through the release, like every other installed path: a CONFLICTED SKILL.md
+  # mis-instructs every sub-orchestrator QUIETLY, which is worse than a crash.
+  local src="$RELEASE_DIR/current/$SKILL_REL"
   local dest="$p/$SKILL_REL"
   [ -f "$src" ] || return 0
   mkdir -p "$(dirname "$dest")"
@@ -158,16 +186,30 @@ PY
 if [ "${1:-}" = "--uninstall" ]; then
   systemctl --user disable --now fleetd 2>/dev/null || true
   rm -f "$UNIT_DIR/fleetd.service" "$BIN_DIR/fleet" "$BIN_DIR/fleetd" "$BIN_DIR/fleet-hook" "$BIN_DIR/fleet-guard"
+  # fleet-tile was dropped in 443674b but its symlink was never reaped, so it
+  # has sat in ~/.local/bin dangling ever since. Named explicitly, NOT globbed:
+  # any glob-driven repair over ~/.local/bin trips on exactly this corpse.
+  [ -L "$BIN_DIR/fleet-tile" ] && [ ! -e "$BIN_DIR/fleet-tile" ] \
+    && rm -f "$BIN_DIR/fleet-tile" && echo "  reaped dangling $BIN_DIR/fleet-tile"
   systemctl --user daemon-reload 2>/dev/null || true
   for p in "${PROFILES[@]}"; do
     [ -f "$p/settings.json" ] && unwire_hooks "$p/settings.json"
     # Remove ONLY our own symlink. A real file there is the user's (or a parked
     # pre-fleet backup) and must survive an uninstall untouched.
+    # Ours whether it was linked at the worktree (pre-release-tree installs) or
+    # through the release — both resolve to a skill file we own.
     d="$p/$SKILL_REL"
-    if [ -L "$d" ] && [ "$(readlink -f "$d")" = "$(readlink -f "$FLEET_DIR/$SKILL_REL")" ]; then
+    if [ -L "$d" ] && { [ "$(readlink -f "$d")" = "$(readlink -f "$FLEET_DIR/$SKILL_REL")" ] \
+                     || [ "$(readlink -f "$d")" = "$(readlink -f "$RELEASE_DIR/current/$SKILL_REL")" ]; }; then
       rm -f "$d"; echo "  unlinked $d"
     fi
   done
+  # The release trees are ours and nothing else reads them; leaving them behind
+  # makes an uninstall/reinstall cycle resurrect a stale `current`. Named path,
+  # never a glob.
+  if [ -d "$RELEASE_DIR" ]; then
+    rm -rf "$RELEASE_DIR" && echo "  removed release trees at $RELEASE_DIR"
+  fi
   echo "fleet uninstalled"
   exit 0
 fi
@@ -199,17 +241,19 @@ PY
 }
 
 mkdir -p "$BIN_DIR" "$UNIT_DIR"
+promote_release
 for b in fleet fleetd fleet-hook fleet-guard; do
   chmod +x "$FLEET_DIR/bin/$b"
-  ln -sf "$FLEET_DIR/bin/$b" "$BIN_DIR/$b"
-  echo "  linked $BIN_DIR/$b"
+  # -n/-T so a pre-existing symlink is REPLACED, never followed into.
+  ln -sfnT "$REL_BIN/$b" "$BIN_DIR/$b"
+  echo "  linked $BIN_DIR/$b -> $REL_BIN/$b"
 done
 
 if [ "$NO_SYSTEMD" = 1 ]; then
   echo "  skipping systemd unit (--no-systemd); fleetd starts on demand via 'fleet up'"
   # start it now so 'fleet doctor' is green immediately
   if ! { [ -S "${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/fleet.sock" ]; }; then
-    nohup "$FLEET_DIR/bin/fleetd" >/dev/null 2>&1 &
+    nohup "$REL_BIN/fleetd" >/dev/null 2>&1 &
     echo "  started fleetd (nohup, pid $!)"
   fi
 else
