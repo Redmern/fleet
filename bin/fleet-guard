@@ -51,13 +51,20 @@ def deny(reason):
 # separators with a naive `seg.split()` and matched `git` ANYWHERE in the token
 # list, so any quoted body containing "git merge"/"git push" was falsely denied.
 #
-# The fix tokenizes QUOTE-AWARE *once* per line (shlex), so a quoted "git push"
-# stays a single token and never matches; it then segments on the shell operator
-# tokens (; & | && ||) and takes the first non-`VAR=value` token of each run as the
-# command word. A separator INSIDE a quote can no longer desync the parse (the bug
-# a split-before-parse scheme reintroduces). Newlines are real statement separators
-# in the common (unquoted) case, so we split on them first; a newline buried inside
-# a quoted string is data, not a command, so splitting it is harmless.
+# The fix tokenizes QUOTE-AWARE *once* over the WHOLE text (shlex), so a quoted
+# "git push" stays a single token and never matches; it then segments on the shell
+# operator tokens (; & | && ||) and takes the first non-`VAR=value` token of each
+# run as the command word. A separator INSIDE a quote can no longer desync the
+# parse (the bug a split-before-parse scheme reintroduces).
+#
+# A NEWLINE is a separator only when it is OUTSIDE quotes. Splitting on `\n` before
+# parsing threw that away: a multi-line quoted payload (the normal shape of
+# `fleet new -p "…"`) was cut into fragments, each with unbalanced quotes, and an
+# indented payload line read as a command word -> false DENY. So statement
+# separation comes from the same quote-aware walk that lifts substitutions: an
+# unquoted newline is emitted as "\n;" (the newline still terminates a `#` comment,
+# the `;` is the real separator token), while a newline inside quotes stays data
+# inside its token.
 #
 # fail-CLOSED for THIS block (the inverse of the guard's general "on any doubt,
 # allow"): the always-on merge/push floor is an integrity control, so on an
@@ -118,10 +125,10 @@ def is_op(tok):  # an operator token is made solely of shell metacharacters
     return tok != "" and all(c in "();<>|&" for c in tok)
 
 
-def tokenize(line):
+def tokenize(text):
     """Quote-aware tokens, or None when the input does not parse."""
     try:
-        lex = shlex.shlex(line, posix=True, punctuation_chars=True)
+        lex = shlex.shlex(text, posix=True, punctuation_chars=True)
         lex.whitespace_split = True
         return list(lex)
     except ValueError:
@@ -174,6 +181,11 @@ def lift_substitutions(text):
     statements in place — is what keeps quoting intact: the surrounding string
     stays exactly as balanced as it was, so a payload is still one inert token
     while the substituted body is scanned as the command it is.
+
+    The same walk marks statement boundaries: a newline OUTSIDE quotes becomes
+    "\\n;" (newline kept so a `#` comment still ends there, `;` as the separator
+    token shlex will emit); a newline inside quotes is left alone, so a multi-line
+    quoted payload stays one inert token.
     """
     out, bodies, i, sq, dq = [], [], 0, False, False
     while i < len(text):
@@ -200,6 +212,8 @@ def lift_substitutions(text):
             bodies.append(body)
             out.append("_fleetsub_")
             continue
+        elif c == "\n" and not dq:      # unquoted newline = statement separator
+            out.append("\n;")
         else:
             out.append(c)
         i += 1
@@ -287,21 +301,20 @@ def scan_text(text, env, depth, out):
     text, bodies = lifted
     for body in bodies:                         # `…` / $(…) bodies ARE executed
         scan_text(body, env, depth + 1, out)
-    for line in text.split("\n"):
-        toks = tokenize(line)
-        if toks is None:                        # fall CLOSED: unparseable input
-            m = RAW_GIT.search(line)
-            if m:
-                out.append(m.group(1))
-            continue
-        run = []
-        for tok in toks + ["\n"]:               # sentinel flushes the final run
-            if tok == "\n" or is_op(tok):
-                if run:
-                    scan_run(run, env, depth, out)
-                run = []
-            else:
-                run.append(tok)
+    toks = tokenize(text)                       # ONE parse over the whole text
+    if toks is None:                            # fall CLOSED: unparseable input
+        m = RAW_GIT.search(text)
+        if m:
+            out.append(m.group(1))
+        return
+    run = []
+    for tok in toks + [";"]:                    # sentinel flushes the final run
+        if is_op(tok):
+            if run:
+                scan_run(run, env, depth, out)
+            run = []
+        else:
+            run.append(tok)
 
 
 if tool == "Bash" and role == "worker":
