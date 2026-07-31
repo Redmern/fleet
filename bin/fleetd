@@ -23,6 +23,26 @@ import time
 RUNTIME_DIR = os.environ.get("XDG_RUNTIME_DIR") or f"/run/user/{os.getuid()}"
 SOCKET_PATH = os.path.join(RUNTIME_DIR, "fleet.sock")
 
+
+def _self_sha():
+    """sha256 of the source this daemon was started from ('' if unreadable).
+
+    Computed lazily and cached: it is only ever asked for by `fleet doctor`.
+    Never fatal — fleetd must not die over a version string.
+    """
+    global _SELF_SHA
+    if _SELF_SHA is None:
+        try:
+            import hashlib
+            with open(os.path.abspath(__file__), "rb") as fh:
+                _SELF_SHA = hashlib.sha256(fh.read()).hexdigest()
+        except Exception:
+            _SELF_SHA = ""
+    return _SELF_SHA
+
+
+_SELF_SHA = None
+
 SEVERITY = {"blocked": 3, "working": 2, "idle": 1}
 GLYPH_COLOR = {"working": "colour4", "blocked": "colour1", "idle": "colour2"}
 
@@ -448,7 +468,12 @@ def handle_request(fleet, line):
     elif method == "fleet.list":
         result = fleet.list_agents()
     elif method == "fleet.ping":
-        result = {"pong": True}
+        # Report the hash of the source THIS daemon compiled at import, so
+        # `fleet doctor` can see daemon-vs-release skew. fleetd is immune to
+        # file changes until restarted, and lazy promote deliberately never
+        # restarts it (a dropped socket loses state edges), so the skew is
+        # expected, benign, and must be VISIBLE.
+        result = {"pong": True, "fleetd_sha": _self_sha()}
     else:
         return {"id": rid, "ok": False, "error": f"unknown method {method}"}
     return {"id": rid, "ok": True, "result": result}

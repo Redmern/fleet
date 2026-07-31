@@ -7,6 +7,32 @@
 
 set -eu
 
+# ---- lazy promote prologue -----------------------------------------------------
+# Identical in shape and in every constraint to the one at the top of
+# bin/fleet-guard — see the long comment there for why each guard exists. Kept
+# BEFORE the action parse so an edit to this file goes live on the very next
+# hook event, and before any read of stdin so the re-exec inherits it intact.
+# fleet-hook's fast path is 0.9 ms, so this must stay pure builtins: two stats.
+if [ -z "${FLEET_NO_PROMOTE:-}" ] && [ -z "${FLEET_PROMOTED:-}" ]; then
+  __fr="${FLEET_RELEASE_DIR:-${HOME:-/nonexistent}/.local/lib/fleet}"
+  __fs=""
+  if [ -f "$__fr/source" ]; then read -r __fs < "$__fr/source" || __fs=""; fi
+  # Third stat = the negative cache; see the long note in bin/fleet-guard. Without
+  # it, a broken worktree turns every hook event into a full gate run.
+  if [ -n "$__fs" ] && [ "$0" -ef "$__fr/current/bin/fleet-hook" ] \
+     && [ "$__fs/bin/fleet-hook" -nt "$__fr/current/.stamp" ] \
+     && { [ ! -f "$__fr/drift" ] || [ "$__fs/bin/fleet-hook" -nt "$__fr/drift" ]; }; then
+    FLEET_PROMOTED=1 FLEET_NO_PROMOTE=1 "$__fs/bin/fleet" promote --lazy </dev/null >/dev/null 2>&1 || true
+    if [ -x "$__fr/current/bin/fleet-hook" ]; then
+      FLEET_PROMOTED=1 exec "$__fr/current/bin/fleet-hook" "$@"
+    fi
+  fi
+  unset __fr __fs
+fi
+# See the note in bin/fleet-guard: the marker arrives in the environment, so it
+# is dropped here rather than inherited by the python child.
+unset FLEET_PROMOTED 2>/dev/null || true
+
 action="${1:-}"
 case "$action" in
   working|blocked|idle|release) ;;

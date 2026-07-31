@@ -107,6 +107,22 @@ this project with the `fleet` CLI.
 - `fleet diff-view [<dir>]` — the honest diff of a worktree's uncommitted work:
   diffstat + staged + unstaged + **untracked new files** (which a bare `git diff
   HEAD` silently omits). This is what the dashboard's **`v`** key runs.
+- `fleet promote [--from-head|--rollback|--status]` — publish the worktree to the
+  **release tree** that `~/.local/bin/{fleet,fleetd,fleet-hook,fleet-guard}`
+  actually point at (`~/.local/lib/fleet/current`). **You almost never run this:**
+  it happens by itself. Every entry point asks "is my source newer than my
+  release?" and promotes if so, so you save a file and the next invocation runs
+  it — instant-live, unchanged. What promote adds is a **validity gate**: no
+  merge in progress, no conflict markers, everything parses, embedded python
+  compiles, and `fleet-guard`/`fleet-hook` actually run. If the gate fails,
+  nothing is published and the fleet keeps running the last good release —
+  instead of a conflicted merge taking every agent down, which is what happened
+  on 2026-07-30. `fleet` then prints **one** stderr line saying so; `fleet
+  doctor`'s `--- release ---` section says which file and which check.
+  `--rollback` swaps back to the previous release (≥3 are kept), `--from-head`
+  builds from `git archive HEAD` instead of the worktree (the escape hatch: no
+  commit has ever contained a conflict marker), `--status` prints the doctor
+  section alone.
 
 ## Leader menu (which-key)
 

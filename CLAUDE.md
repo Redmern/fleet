@@ -336,6 +336,147 @@ Locked in by `test/agent-task-proof.sh` (22 cases / 36 assertions; the regressio
 group asserting the 9-field shapes and the absent `done` pill is the highest-value
 part).
 
+### Release tree + lazy promote (`cmd_promote`, the hot-path prologues)
+
+`~/.local/bin/{fleet,fleetd,fleet-hook,fleet-guard}` no longer symlink into the
+dev worktree. They point at `$RELEASE_DIR/current/bin/*`
+(`~/.local/lib/fleet`, overridable via `FLEET_RELEASE_DIR`, which is how the
+proofs stay out of the live install).
+
+The bug this removes is not "a symlink pointed at a worktree". It is that **the
+artifact every agent EXECUTES and the artifact the human EDITS were the same
+bytes, with no validity gate between them.** Git is *designed* to write
+syntactically invalid files into a working tree; on 2026-07-30 that working tree
+was the production install, so a conflicted merge published `<<<<<<<` into
+`bin/fleet` **and** `bin/fleet-guard` — the latter running before every tool call
+of every agent — and the fleet was down until the merge was committed.
+
+Two properties are in tension and both are kept: **live** (my edit takes effect
+with no ceremony) and **valid** (what agents execute parses and runs). An
+explicit `fleet promote` per edit would buy `valid` by spending `live`, trading a
+rare, loud, 60-second outage for a frequent silent one ("I'm debugging stale
+code"). So promote is **lazy**: every entry point asks "is my source newer than
+my release?" and promotes if so. Save a file, next invocation runs it. The only
+time you run older code is while your working copy does not validate — exactly
+the old outage window, except now the fleet keeps working.
+
+Five things that are load-bearing and were each a measured failure mode:
+
+- **The release is a TREE, not four files.** `fleet:10` derives `FLEET_DIR` from
+  the resolved script path, so `FLEET_DIR` becomes the release root and every
+  `$FLEET_DIR/…` read must ship: `harness.d/*.conf`, `nvim/fleet.lua`, `FLEET.md`,
+  `FLEET_SUBORCH.md`, `systemd/`, `lib/` (not `node_modules`), `skills/`, and all
+  of `bin/` (`fleet-dash:15` derives `FLEET_BIN` from its own dirname). That is
+  `release_manifest`, and it converges with what `packaging/PKGBUILD:61-113`
+  already installs into `/usr/lib/fleet` — `test/release-manifest-proof.sh`
+  cross-checks the two so the shapes cannot drift apart silently.
+- **One atomic `ln -sfnT`, never a per-file loop.** `-n`/`-T` are mandatory: bare
+  `ln -sf` onto an existing dir symlink creates the link *inside* the target.
+  Nothing is ever rewritten in place — bash reads a script incrementally by byte
+  offset, so `cp` over a RUNNING script corrupts the running process (`unexpected
+  EOF`, rc=2); `cp` succeeds and *is* the hazard. And a **half-promote is worse
+  than the outage it replaces**: new `fleet` + old `fleet-guard` is silent, and a
+  stale fail-silent guard *allows* what it should deny.
+- **`bash -n` is provably insufficient**, which is why `release_gate` has five
+  checks: git-in-progress refusal (fires on the actual incident condition before
+  a byte is read) → anchored marker grep → shebang-dispatched `bash -n`/`sh -n`/
+  `py_compile` → **compile every embedded python heredoc** → **behavioural smoke**.
+  A quoted heredoc is an opaque string to a shell parser, so markers or a
+  SyntaxError inside one give rc=0 and die at runtime — the exact shape of
+  `fleet-guard`/`fleet-hook`. The smoke is behavioural (assert a worker `git push`
+  is DENIED), not exit-code, because the guard ends its python with `|| exit 0`:
+  a guard whose python is dead still exits 0 while silently allowing everything.
+  `test/conflicted-worktree-proof.sh` variants 4 and 5 are those two cases.
+- **Lazy promote NEVER restarts `fleetd`.** It compiles its source once at import,
+  so it is immune until restarted; an unconditional restart drops the socket ~2 s
+  and `fleet-hook` silently discards transitions in that window — one lost edge
+  leaves an agent stuck "working" forever. Skew is reported by `doctor` (fleetd
+  returns its own source sha256 in `fleet.ping`) and restarted only by an explicit
+  promote / `fleet up`. Benign and visible beats a dropped socket.
+- **Recovery may not depend on what it repairs.** `./bin/fleet promote` works from
+  the worktree with no dependence on `current`; `--rollback` toggles back (≥3
+  trees retained); `--from-head` materialises via `git archive HEAD`, which is
+  structurally immune since no commit has ever contained a marker — an escape
+  hatch, never the default, because HEAD-only would kill instant-live.
+
+The **prologue** in `fleet-guard`/`fleet-hook` is the risky part: new code on the
+hottest path in the system. It sits at the very top, **before stdin is read and
+before any output**, so a re-exec inherits an untouched stdin and the hook
+protocol is byte-identical either way; it is silent on every path including
+failure; and every steady-state check is a shell **builtin** (two stats, no
+fork) — a wrapper *process* was measured at +0.60 ms, which is +88% of the hook's
+0.9 ms fast path, and was rejected on that number. It fires **only when `$0` is
+inode-identical (`-ef`) to `current/bin/<name>`**, so running a worktree copy by
+hand — or from any other proof in `test/` — exercises *that* file and is never
+hijacked into the release. `FLEET_PROMOTED` bounds the re-exec to one hop;
+`FLEET_NO_PROMOTE=1` disables the mechanism entirely and is what the gate's own
+smoke run sets, so a staged tree can never recurse back into promote.
+
+Four sharp edges found in review, each now load-bearing:
+
+- **`FLEET_PROMOTED` must be CONSUMED, not merely tested.** It is passed through
+  `exec`, so it lands in the new process's *environment* — and `fleet up` starts
+  the tmux **server**. Testing it without `unset` meant one `fleet up` after an
+  edit stamped it on every agent pane for the session, silently disabling every
+  guard/hook prologue fleet-wide: the design's promise quietly stops holding with
+  no symptom but stale code. `release_lazy_self` unsets it **first**, before even
+  the `FLEET_NO_PROMOTE` early return (the promote child is invoked with both set
+  and spawns git/tar/python of its own); the hook prologues unset it too. Note a
+  prefix assignment on `exec` does *not* avoid this — only `unset` does.
+- **The negative cache is not an optimisation.** The trigger stays true for as
+  long as the worktree is broken, so without it every PreToolUse of every agent
+  re-ran the whole gate — measured **15 ms → 88 ms, indefinitely, precisely while
+  mid-merge**. The degraded mode would be the incident mode. The prologues take a
+  third stat: retry only if the source is newer than the `drift` marker.
+- **The gate fails CLOSED, in both places it previously did not.** `cmd_promote`
+  keys on `release_gate`'s *exit status*, not on whether it printed (a check
+  returning non-zero with no detail — python3 OOM-killed — would have published);
+  and a smoke sandbox that cannot be created is a refusal, not a skip. Everywhere
+  else in fleet doubt means allow; here it means refuse.
+- **Pruning is cold-only.** `release_prune` keeps ≥3 and reaps nothing younger
+  than 10 minutes, because a long-running `fleet` may still be reading
+  `harness.d/` or `FLEET.md` out of the tree its `FLEET_DIR` resolved to. It also
+  reaps abandoned `.stage-*` trees older than an hour — a SIGKILL'd promote leaks
+  its whole private stage and nothing else would ever collect them.
+
+Two smaller ones: `harness.d/*.conf` is `bash -n`'d as well as marker-grepped
+(it is `.`-sourced on every invocation, so a marker-free syntax error there
+breaks every `fleet` call from an otherwise valid release); and the prefix tests
+for "am I running from the release" resolve **both** sides through `readlink -f`
+(`release_running_from_release`) — `FLEET_DIR` is resolved while `RELEASE_DIR` is
+a literal `$HOME` path, so a symlinked `$HOME`/`/home`/`~/.local` silently made
+every one of them false, disabling lazy promote and baking a soon-to-be-pruned
+`rel-<stamp>` into `settings.json`. It is a `${x#…}` prefix test, not a `case`
+glob, because `$RELEASE_DIR` is data and a `[` or `*` in it would be a pattern.
+
+Anything **written to disk** must name `current/`, not the `rel-<stamp>` this
+process happens to be running from (immutable *and* eventually pruned): that is
+`release_stable_dir`, used by `cmd_setup`'s hook paths and systemd `ExecStart`,
+`ensure_daemon`'s nohup fallback, and `install.sh`'s symlinks + skill link.
+`install.sh` promotes *first* and refuses to install at all if the gate rejects —
+adviser B rates a re-run of the old `install.sh` the highest-probability path
+back to the bug. Everything here is manifest-driven, never glob-driven: the
+dangling `~/.local/bin/fleet-tile` (a binary removed in `443674b` whose symlink
+was never reaped — `--uninstall` now reaps it) would otherwise abort a `set -e`
+repair midway, i.e. a half-promote caused by the repair tool.
+
+`fleet setup`'s dev-shadow guard needed widening: the `fleet` on PATH now
+legitimately resolves into the release, so comparing it against `$FLEET_DIR/bin/
+fleet` made `./bin/fleet setup` from the canonical worktree — the normal case —
+abort with "another fleet shadows this one". It now also accepts "the release
+built from this worktree".
+
+Locked in by `test/{conflicted-worktree,promote-atomicity,release-manifest,
+hot-path-budget}-proof.sh`. The first is the headline: it reproduces 07-30 five
+ways and then asserts the *other* half — resolve the conflict, and with **no
+human promote step** the released bytes equal the worktree bytes. A design that
+passed the first half and failed that one is the explicit-promote design that was
+rejected. The atomicity proof was checked against a deliberately non-atomic
+implementation (publish file-by-file into a live `current`) and goes red on 7
+assertions, including 2,821 failed reads — it is not vacuous. The budget proof is
+**soft** (reports, `STRICT=1` to harden), because "we added an invisible 5 ms to
+every tool call" is precisely how this design would fail quietly.
+
 ### Guard: executed command vs inert argument (`fleet-guard` block 1)
 
 The always-on worker merge/push floor asks exactly one question: **is this text a
@@ -649,6 +790,22 @@ this project with the `fleet` CLI.
 - `fleet diff-view [<dir>]` — the honest diff of a worktree's uncommitted work:
   diffstat + staged + unstaged + **untracked new files** (which a bare `git diff
   HEAD` silently omits). This is what the dashboard's **`v`** key runs.
+- `fleet promote [--from-head|--rollback|--status]` — publish the worktree to the
+  **release tree** that `~/.local/bin/{fleet,fleetd,fleet-hook,fleet-guard}`
+  actually point at (`~/.local/lib/fleet/current`). **You almost never run this:**
+  it happens by itself. Every entry point asks "is my source newer than my
+  release?" and promotes if so, so you save a file and the next invocation runs
+  it — instant-live, unchanged. What promote adds is a **validity gate**: no
+  merge in progress, no conflict markers, everything parses, embedded python
+  compiles, and `fleet-guard`/`fleet-hook` actually run. If the gate fails,
+  nothing is published and the fleet keeps running the last good release —
+  instead of a conflicted merge taking every agent down, which is what happened
+  on 2026-07-30. `fleet` then prints **one** stderr line saying so; `fleet
+  doctor`'s `--- release ---` section says which file and which check.
+  `--rollback` swaps back to the previous release (≥3 are kept), `--from-head`
+  builds from `git archive HEAD` instead of the worktree (the escape hatch: no
+  commit has ever contained a conflict marker), `--status` prints the doctor
+  section alone.
 
 ## Leader menu (which-key)
 
