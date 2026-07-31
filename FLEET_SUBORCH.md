@@ -604,15 +604,73 @@ printf '%s' "$INCOMING_PROMPT" | fleet gate parse    # rc 0 + "gate=N action=…
 | Parsed sentinel | What you do |
 |---|---|
 | `gate=1 action=implement slug=S` | Proceed to **Phase 3 (TDD)** for slug S using PLAN.md/SYNTHESIS.md. |
-| `gate=2 action=merge slug=S target=T` | Review the diff, then **delegate integration** — spawn a SHIP worker with `--self-merge` to merge S → T and push T — watch it, report, then `fleet ready`. |
+| `gate=2 action=merge slug=S target=T` | Review the diff, then **delegate integration** — spawn a SHIP worker with `--self-merge` that merges S → T. **It does not push; the human pushes.** Watch it, terminate the ledger, report, then `fleet ready`. |
 
 **You never commit, push or merge yourself.** Your pane is `FLEET_ROLE=worker`, so
 fleet-guard denies integration there — a sub-orch that tries it just gets blocked. That
 restraint is not lifted by a gate; what a popped GATE 2 gives you is the human's
-instruction to **have it done**. So spawn a SHIP worker on the feature branch with
-`--self-merge` (its `-p` prompt carries the exact commit/merge/push steps and the
-authorisation), `fleet watch` it, and report the result. Same rule for the ordinary
-commit of returned work: it goes through a worker, not through you.
+instruction to **have it done**. Same rule for the ordinary commit of returned work: it
+goes through a worker, not through you.
+
+### 7.1 The SHIP worker — how to spawn it, exactly
+
+**Write the steps to a file; put a POINTER in the prompt.** A `-p` string carrying the
+merge verb is the one shape that reliably fails: fleet-guard reads the command you are
+executing, and a prompt that *looks* like a merge statement is a coin-flip you do not
+need to take — and the harness's own auto-mode classifier denies it a second time. So
+the prompt is ONE SHORT LINE naming a file, and the file carries everything.
+
+```
+# 1. steps to a file INSIDE the feature worktree's scratch-docs dir (git-ignored)
+#    — write it with your editor/Write tool, never by echoing a merge verb through a shell.
+#    Path: <feature-worktree>/.fleet/notes/SHIP.md
+# 2. spawn the SHIP worker on the FEATURE branch, distinct window name, merge permitted
+fleet new <repo> <S> --self-merge --task impl --name ship-<slug> \
+  -p "Read .fleet/notes/SHIP.md in this worktree and do exactly what it says."
+fleet watch ship-<slug> -m "SHIP worker for <slug> finished — verify the merge, then terminate the ledger"
+```
+
+The window name is `ship-<slug>`, **never the impl worker's name**: a second spawn on the
+same repo/branch produces a byte-identical window name, so `fleet send`/`fleet ready`/
+`fleet watch` would hit whichever pane tmux resolves first. `--name` fixes that
+**routing** collision and only that — the impl worker's `.fleet/ready` marker lives in
+the shared worktree dir, which no window name enters, and is protected separately by the
+spawn's pane-liveness check (a marker whose writing pane is still alive is left alone).
+The name is persisted and re-passed by `fleet restore`, so it survives a tmux restart.
+
+`SHIP.md` says, in full:
+
+> 1. Verify the working tree is clean and everything intended is committed on `S`.
+> 2. **Refuse to merge a branch with zero commits ahead of `T`.** Check
+>    `git rev-list --count T..S` first — if it is `0`, stop and report: a silent
+>    `Already up to date` that gets marked shipped is worse than a failure.
+> 3. Merge `S` into `T` — `git merge --no-ff` in the worktree that has `T` checked out.
+>    On a conflict: `git merge --abort`, leave the tree exactly as you found it, and
+>    report the conflict. Do not resolve it yourself.
+> 4. **Do NOT push.** Pushing is the human's step: it is outward-facing, it triggers CI
+>    and the package republish, undoing it means a force-push, and it needs a
+>    non-default credential helper to work headless at all.
+> 5. Report what you did and `fleet ready`.
+
+**Then terminate the ledger — every path.** A dispatch that merges and says nothing
+parks forever (there are four such immortal entries on this machine):
+
+```
+# verified: T advanced to S's tip, nothing pushed
+fleet dispatch done <id>
+# SHIP failed / conflicted / refused (zero commits ahead) — SHOUT, never park silently
+fleet send --needs-human main "SHIP <slug> FAILED: <what broke>. Nothing merged, nothing pushed."
+```
+
+Use `--needs-human` for the failure: it raises the severity to `blocked` so the desktop
+notify fires. A silent park at GATE 2 is indistinguishable from a wedged pipeline, which
+is exactly the state this section exists to end.
+
+> **What this buys, stated honestly.** Delegating the merge is not a security boundary
+> and grants no new capability: any pane can already run `fleet new --self-merge`, and
+> everything here runs as one uid. What it buys is that the merge becomes a visible,
+> owned, recorded step with a pane you can look at — instead of something that either
+> silently never happens or happens off the books.
 
 **A prompt with NO sentinel is normal input — NEVER a gate crossing.** A typed
 course-correction at a gate is a fresh instruction: re-plan (loop Phase 1) with the new

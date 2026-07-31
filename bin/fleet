@@ -891,6 +891,15 @@ cmd_restore() { # respawn saved agents whose windows are gone
     # task_of re-validates, so a garbage file just omits the flag.
     local _task; _task=$(task_of '' "$root" "$matchname")
     [ -n "$_task" ] && args+=(--task "$_task")
+    # Re-pass the PERSISTED window name. Without this a restored agent came back
+    # under the derived <repo>/<branchdir> — so after a tmux server restart, the
+    # exact event restore exists for, a SHIP worker's window collided with the impl
+    # worker's again (the whole reason --name exists) — and the respawn then
+    # re-persisted over col 8, destroying the recorded name for good. Legacy 7-field
+    # lines read col 8 empty and are omitted, so the matchname fallback above still
+    # holds; IFS=$'\037' already preserves empty fields, so no requoting is needed.
+    # Safe against the d<N>- owner prefix only because that prefix is idempotent.
+    [ -n "$wname" ] && args+=(--name "$wname")
     echo "restoring $matchname..."
     # Re-export the saved bare owner so cmd_new re-derives the d<N>- window prefix AND
     # re-stamps @fleet_owner — restore runs in main with no FLEET_SUBORCH_ID, so without
@@ -1095,7 +1104,7 @@ inject_secrets() { # <repo> <dir>
 # ---- new ----------------------------------------------------------------------
 
 cmd_new() {
-  local repo="" branch="" prompt="" bare=0 base="" harness="" scratch=0 switch=0 mode="" self_merge=1 sm_flag="" task=""
+  local repo="" branch="" prompt="" bare=0 base="" harness="" scratch=0 switch=0 mode="" self_merge=1 sm_flag="" task="" wname_flag=""
   while [ $# -gt 0 ]; do
     case "$1" in
       -p) prompt="$2"; shift 2 ;;
@@ -1108,6 +1117,7 @@ cmd_new() {
       --self-merge) sm_flag=1; shift ;;      # force merge/push ON for this worker (overrides the project default)
       --no-self-merge) sm_flag=0; shift ;;   # force merge/push OFF for this worker (overrides the project default)
       --mode) mode="$2"; shift 2 ;;   # override start --permission-mode (e.g. bypassPermissions) — not reachable via Shift+Tab
+      --name) wname_flag="$2"; shift 2 ;;  # window name override — see the SHIP-worker case below
       -*) die "unknown flag $1" ;;
       *) if [ -z "$repo" ]; then repo="$1"; elif [ -z "$branch" ]; then branch="$1"; else die "extra arg $1"; fi; shift ;;
     esac
@@ -1153,6 +1163,21 @@ cmd_new() {
     *) printf 'fleet: unknown --task %s (ignored; want: research|plan|impl|test|scratch)\n' "$task" >&2; task="" ;;
   esac
 
+  # --name is VALIDATED ONCE, HERE, before either spawn branch reads it. It used to
+  # be validated inside the non-scratch branch only, so `--scratch --name x` parsed
+  # the flag and then silently dropped it — and a silent drop is what produced two
+  # of this feature's blockers. Validated like @fleet_task is: the name reaches
+  # tmux's window-status-format, so a value carrying '#[' would corrupt the status
+  # bar for the WHOLE tmux server. Conservative charset; a rejected name warns and
+  # falls back to the derived one rather than mangling it silently.
+  if [ -n "$wname_flag" ]; then
+    case "$wname_flag" in
+      *[!A-Za-z0-9._/-]*)
+        printf 'fleet: --name %s rejected (want [A-Za-z0-9._/-]) — using the derived name\n' "$wname_flag" >&2
+        wname_flag="" ;;
+    esac
+  fi
+
   local root; root=$(fleet_root) || die "not inside tmux"
   local sess; sess=$(session_name) || die "not inside tmux"
   # THE session every spawn targets. `sess` is only this pane's identity; a
@@ -1191,7 +1216,7 @@ cmd_new() {
     # without the flag must behave exactly as it did before the flag existed.
     # Collision-check against the session the window will ACTUALLY land in
     # (the parked sibling), not the caller's.
-    wname=$(scratch_wname "$tsess" "${repo:-scratch}")
+    wname=$(scratch_wname "$tsess" "${wname_flag:-${repo:-scratch}}")
     # Repo-less, so no worktree/info-exclude — give it a sane scratch-docs dir
     # under the shared root anyway, so $FLEET_DOCS is always a real dir.
     docs="$root/.fleet/notes/scratch/${repo:-scratch}"
@@ -1246,6 +1271,22 @@ cmd_new() {
       fi
     fi
     wname="$(basename "$repo_base")/$branchdir"
+    # --name: a DISTINCT window name for a SECOND agent on a branch that already has
+    # one. The derived name is purely a function of repo+branch, so the GATE 2 SHIP
+    # worker — spawned on the feature branch the impl worker is still sitting on —
+    # gets a byte-identical name, and `fleet send`/`ready`/`watch` then hit whichever
+    # pane tmux resolves first. --name fixes that ROUTING collision and only that:
+    # it does NOT protect the `.fleet/ready` marker, which lives in $dir (a function
+    # of repo+branch alone, which the window name never enters) — see the pane-aware
+    # clear further down. Already validated above, for both spawn branches.
+    [ -n "$wname_flag" ] && wname="$wname_flag"
+    # UNIQUIFY. Impl and test roles on the same branch share the (repo,branch) key
+    # AND the derived window name, so a pipeline can build a pane pair it cannot
+    # then address individually. The addressing key is the WINDOW NAME, made unique
+    # at spawn and persisted in col 8 — deliberately NOT a 10th TSV column, which
+    # three positional parsers would fail silently wrong on. No-op when the name is
+    # already free, so nothing changes for the ordinary single-agent case.
+    wname=$(scratch_wname "$psess" "$wname")
     # Per-branch scratch-docs dir, present before the agent starts. mkdir is
     # idempotent across reuse of an existing worktree.
     docs="$dir/.fleet/notes"
@@ -1283,7 +1324,15 @@ cmd_new() {
   if [ -n "${FLEET_SUBORCH_ID:-}" ] && [ -z "${FLEET_NEW_SUBORCH_ID:-}" ]; then
     _owner="$FLEET_SUBORCH_ID"
     local _did="${FLEET_SUBORCH_ID#so-}"; _did="${_did%%-*}"   # so-d11[-slug] -> d11
-    case "$_did" in d[0-9]*) wname="$_did-$wname" ;; esac       # d11-<repo>/<branchdir>
+    # IDEMPOTENT. cmd_restore re-exports FLEET_SUBORCH_ID *and* re-passes the
+    # persisted name, so a plain prepend would yield d11-d11-… , growing one segment
+    # per restart. The name keys `.fleet/tasks/<wname>`, restore's own
+    # already-running match and cmd_forget — an unstable name makes restore
+    # duplicate-respawn forever. The `case` form also survives an empty $_did
+    # without reordering the argument-parsing block above it.
+    case "$_did" in
+      d[0-9]*) case "$wname" in "$_did-"*) ;; *) wname="$_did-$wname" ;; esac ;;
+    esac                                                        # d11-<repo>/<branchdir>
   fi
 
   # Seed the completion instruction onto the worker's first prompt, so being told
@@ -1306,7 +1355,25 @@ $(ready_instructions)"
   # not done, so clear it. REAP-SAFETY: an inherited marker would otherwise let
   # `fleet reap` tear down the new agent's worktree mid-work. $dir is the cwd in
   # both the scratch (dir=$root) and worktree paths.
-  rm -f "$dir/.fleet/ready" 2>/dev/null || true
+  #
+  # PANE-AWARE, NOT UNCONDITIONAL. $dir is a function of repo+branch only, so a
+  # SECOND agent on the same branch — exactly the GATE 2 SHIP worker — reuses the
+  # impl worker's worktree and used to erase its `.fleet/ready` whatever either
+  # window was called. --name cannot fix that: the window name never enters $dir.
+  # The marker records the pane that wrote it (`pane=`, see cmd_ready), the same
+  # predicate agents_tsv already uses to decide whether a marker belongs to a given
+  # occupant. Keep it while that pane is ALIVE — a live sibling's "I am done" is
+  # not ours to erase — and clear it otherwise, which is the inherited-stale-marker
+  # case this clear exists for. Unstamped (legacy) markers clear exactly as before.
+  # RESIDUAL, stated: cmd_ready writes with `>`, so two live agents flagging the
+  # same worktree still race and the last writer wins.
+  local _rmk="$dir/.fleet/ready" _rpane=""
+  [ -e "$_rmk" ] && _rpane=$(sed -n 's/^pane=//p' "$_rmk" 2>/dev/null | head -1)
+  if [ -n "$_rpane" ] && tmux list-panes -a -F '#{pane_id}' 2>/dev/null | grep -qxF "$_rpane"; then
+    : # a LIVE sibling wrote it — leave the marker alone
+  else
+    rm -f "$_rmk" 2>/dev/null || true
+  fi
 
   local win_id
   if [ "$bare" = 1 ]; then
@@ -2351,22 +2418,39 @@ cmd_gate() {
     post)    gate_post    "$@" ;;   # compose + enqueue a gate message (sev warn)
     park)    gate_park    "$@" ;;   # mark a sub-orch ledger gate{1,2}-wait (reap-guard)
     waiting) gate_waiting "$@" ;;   # list sub-orchs parked at a gate (reap consults this)
-    *) die "usage: fleet gate parse|post <1|2>|park <id> <1|2>|waiting" ;;
+    popped)  gate_record_pop "$@" ;; # internal: audit-stamp a popped gate message
+    *) die "usage: fleet gate parse|post <1|2>|park <id> <1|2>|waiting|popped <msg>" ;;
   esac
 }
 
-# Detect the gate sentinel on the FIRST line of a body (file arg or stdin). Prints
+# Detect the gate sentinel in the HEAD of a body (file arg or stdin). Prints
 # `gate=N <k>=<v> …` and returns 0 when present; returns 1 for any non-sentinel input
-# (a typed course-correction is normal input, NEVER a gate crossing). Honoured ONLY on
-# the first line so a sentinel quoted lower in a body can't forge an approval.
+# (a typed course-correction is normal input, NEVER a gate crossing).
+#
+# BOUNDED AND ANCHORED, not first-line-only and not a free line allowance.
+# `gate post` does put the sentinel on body line 1 — but the human never feeds the
+# bare body to this oracle: they POP, and `inbox_pop_text` is
+# `printf '%s\n%s\n\n' "$head" "$body"`, i.e. the header then the body IMMEDIATELY,
+# with the blank AFTER. So a first-line-only scan returned rc 1 for EVERY genuine
+# approval, and §7 tells the sub-orch to trust this oracle and never eyeball the
+# sentinel — while a genuine popped sentinel is on LINE 2 and never lower.
+#
+# The offset is therefore a CONSEQUENCE OF THE HEADER, not an allowance: line 2 is
+# honoured only when line 1 is an actual pop header. `fleet inbox put` has NO role
+# check, so any pane can enqueue an arbitrary body; a bare bound of N would hand an
+# attacker N-1 lines of camouflage lead-in to bury a forged sentinel behind.
+GATE_SCAN_LINES=2
 gate_parse() { # parse [file]
-  local first
-  if [ -n "${1:-}" ] && [ -f "$1" ]; then first=$(sed -n '1p' "$1" 2>/dev/null)
-  else first=$(sed -n '1p' 2>/dev/null); fi
-  case "$first" in
-    \[FLEET-GATE:*\]*) ;;            # must START with the sentinel
-    *) return 1 ;;
+  local head l1 l2 first=""
+  if [ -n "${1:-}" ] && [ -f "$1" ]; then head=$(sed -n "1,${GATE_SCAN_LINES}p" "$1" 2>/dev/null)
+  else head=$(sed -n "1,${GATE_SCAN_LINES}p" 2>/dev/null); fi
+  l1=$(printf '%s\n' "$head" | sed -n 1p)
+  l2=$(printf '%s\n' "$head" | sed -n 2p)
+  case "$l1" in
+    \[FLEET-GATE:*\]*) first="$l1" ;;                                  # a bare body
+    "From "*) case "$l2" in \[FLEET-GATE:*\]*) first="$l2" ;; esac ;;  # a popped message
   esac
+  [ -n "$first" ] || return 1
   local inner="${first#\[FLEET-GATE:}"; inner="${inner%%\]*}"   # "1 slug=x action=implement"
   local n="${inner%% *}" rest="${inner#* }" kv
   printf 'gate=%s' "$n"
@@ -2431,7 +2515,7 @@ In one paragraph: ${summary:-<see plan>}.
 $reorient
 Details: $plan
 HOW THE TESTS PROVE IT: ${summary:-<see details>}.
-▸ POP this message = \"merge + push to $target\".
+▸ POP this message = \"get it merged into $target\" — a SHIP worker merges; you push.
 ▸ Or run the manual steps, then pop to ship, or reply with what's broken to loop."
   fi
   inbox_put -d "$disp" --sev warn -t "$title" -m "$body"
@@ -2448,7 +2532,37 @@ gate_park() { # park <dispatch-id> <1|2>
   local d="$r/.fleet/dispatch/$id"
   [ -d "$d" ] || die "no such dispatch $id"
   meta_set "$d" state "gate${gate}-wait"
+  # AGE STAMP (audit/observability, S7). A parked entry and a WEDGED one look
+  # identical in the ledger — both just sit at gate2-wait — so the dashboard has
+  # nothing to distinguish "waiting on the human since 3 minutes ago" from
+  # "waiting since Tuesday". Epoch seconds: the only consumer does arithmetic.
+  meta_set "$d" parked_at "$(date +%s 2>/dev/null)"
   echo "parked $id at gate${gate}-wait"
+}
+
+# Record on disk that the human POPPED a gate message: `gate<N>_popped <ISO ts>` in
+# that dispatch's meta.tsv. Called by `inbox_pop` after a VERIFIED paste, and exposed
+# as `fleet gate popped <msgfile>` so the proof harness drives the real path.
+#
+# This is an AUDIT FACT, NOT A GATE. Everything runs as one uid: the ledger this
+# writes is writable by the very agent it records, so nothing may ever *authorise*
+# off it. What it buys is that an approval becomes an observable event with a
+# timestamp instead of a thing that happened only in a tmux scrollback. Fail-silent
+# and rc 0 throughout — a pop must never fail because bookkeeping did.
+gate_record_pop() { # popped <msgfile>
+  local f="${1:-}" disp parsed n
+  [ -e "$f" ] || return 0
+  disp=$(inbox_field "$f" dispatch 2>/dev/null)
+  case "$disp" in ""|-) return 0 ;; esac
+  # Parse the BODY through the same oracle the sub-orch uses — never a private regex.
+  parsed=$(inbox_body "$f" 2>/dev/null | gate_parse 2>/dev/null) || return 0
+  n="${parsed#gate=}"; n="${n%% *}"
+  case "$n" in 1|2) ;; *) return 0 ;; esac
+  local r; r=$(fleet_root 2>/dev/null) || return 0
+  local d="$r/.fleet/dispatch/$disp"
+  [ -d "$d" ] || return 0
+  meta_set "$d" "gate${n}_popped" "$(date -Is 2>/dev/null || date)" 2>/dev/null || true
+  return 0
 }
 
 # ---- ledger state classification (THE single source) --------------------------
@@ -3405,6 +3519,11 @@ inbox_pop() { # pop [file] — no file = global-oldest FIFO
   # failed paste returns here with the message STILL LIVE — never archive on a failed
   # paste (that would be the silent loss archive-as-truth prevents).
   inbox_paste_to "$orch" "$f" "$submit" || return 0
+  # AUDIT (S7): a popped gate message is an approval EVENT — stamp it in the ledger
+  # while the file is still readable (the archive mv below moves it). Ordered AFTER
+  # the paste rc-guard for the same reason the archive is: nothing is recorded for a
+  # pop that did not actually land. Not a gate: same uid, agent-writable ledger.
+  gate_record_pop "$f" 2>/dev/null || true
   if [ "$archived" = 1 ]; then
     # Already archived (re-pop): no mv. TOUCH-ON-POP so `inbox unpop` (newest-by-pop-time)
     # treats this re-pop as the most-recently-popped message.
@@ -3512,6 +3631,7 @@ cmd_inbox() { # inbox [put|list|read|count|gc|clear|pop|unpop|archive] — bare 
     unpop) inbox_unpop "$@" ;;   # re-paste the most-recently-popped archived msg (recovery)
     archive) inbox_archive "$@" ;; # browse popped msgs; archive pop <n> re-pops an older one
     route) inbox_route "$@" ;;   # internal: where a from= routes (dest/submit/pane)
+    pop-text) inbox_pop_text "$@" ;; # internal: the EXACT text a pop pastes (proof harness)
     orch-busy) inbox_orch_busy "$(cmd_main_pane 2>/dev/null)" ;;  # internal: triage's batch gate (rc0+state if busy)
     needs-human) inbox_has_needs_human_from "$@" ;; # internal: reap-guard predicate (rc 0 = block)
     list)  inbox_list  "$@" ;;   # non-destructive peek
@@ -3750,6 +3870,8 @@ cmd_reap() { # reap [<target>] [--force] — remove worktrees flagged ready
   # tab (an IFS *whitespace* char) and drops empty fields, mis-parsing the rest.
   local lines; lines=$(tr '\t' '\037' <"$f" 2>/dev/null)   # snapshot: cmd_forget mutates $f
   local gatewait; gatewait=$(gate_waiting 2>/dev/null)     # sub-orchs parked at a gate (skip)
+  local ibranch; ibranch=$(cmd_integration_branch 2>/dev/null)  # never-reaped merge target (see the guard below)
+  [ -n "$ibranch" ] || ibranch=main   # an EMPTY pattern would match an empty branch field, not "no target"
   local any=0 reaped=0 dir repo branch base
   while IFS=$'\037' read -r dir repo branch _bare base _rest; do
     [ -n "$dir" ] || continue
@@ -3770,6 +3892,56 @@ cmd_reap() { # reap [<target>] [--force] — remove worktrees flagged ready
     any=1
     if [ ! -d "$dir" ]; then
       cmd_forget "$dir"; echo "drop   $lbl: dir gone (stale)"; continue
+    fi
+    # INTEGRATION-BRANCH GUARD — checked BEFORE --force, and NOT overridable by it.
+    # Merging INTO the target requires the target checked out, and the only worktree
+    # holding it is a LINKED one (the bare fleet container ⇒ `fleet/main`). Every
+    # other guard below passes trivially for it: it is clean, and `merge-base
+    # --is-ancestor HEAD main` is true of `main` itself — so reap would `worktree
+    # remove` the integration worktree and then `git branch -D main`. A SHIP worker
+    # running the `fleet ready` every worker is seeded to run arms exactly that.
+    # --force means "discard THIS work item's dirty/unmerged state", never "delete
+    # the branch everything merges into"; there is no recovery story worth the
+    # convenience, and `git worktree remove` + `git branch -D` by hand is two lines
+    # for the human who genuinely means it.
+    #
+    # THE RECORD IS NOT THE TRUTH. Field 3 is a saved-agents line written at spawn
+    # time; nothing re-writes it when the worktree is later switched, and an
+    # observed real record was `'main '` — with a trailing space, which a case
+    # pattern misses outright. A stale or padded record made the guard silently
+    # not fire, and on this machine the worktree it protects is `fleet/main`, i.e.
+    # the file `~/.local/bin/fleet` symlinks to: the live CLI for the whole box.
+    # So TRIM the record and cross-check the CHECKED-OUT HEAD; either name matching
+    # is decisive, and --force does not override the HEAD-derived case any more
+    # than the recorded one (or the fix would be bypassable by the same stale
+    # record that caused the bug).
+    branch="${branch#"${branch%%[![:space:]]*}"}"; branch="${branch%"${branch##*[![:space:]]}"}"
+    local hbranch=""
+    if ! hbranch=$(git -C "$dir" symbolic-ref --short HEAD 2>/dev/null); then
+      hbranch=""
+      # Detached, or symbolic-ref failed for another reason. The NAME is
+      # undeterminable, so fall back to COMMIT equality: a worktree parked on the
+      # integration branch's tip is that worktree however HEAD is spelled. If even
+      # rev-parse cannot answer, the repo is unreadable — FAIL CLOSED and skip,
+      # mirroring the base-ref precedent below. Detached somewhere ELSE stays
+      # reapable: a guard that refuses every detached worktree is unworkaroundable.
+      local _h; _h=$(git -C "$dir" rev-parse --verify -q HEAD 2>/dev/null)
+      if [ -z "$_h" ]; then
+        echo "skip   $lbl: cannot resolve HEAD — refusing to reap on an unreadable worktree"
+        continue
+      fi
+      local _b _i
+      for _b in "$ibranch" main master; do
+        _i=$(git -C "$dir" rev-parse --verify -q "refs/heads/$_b" 2>/dev/null)
+        [ -n "$_i" ] && [ "$_i" = "$_h" ] && { hbranch="$_b"; break; }
+      done
+    fi
+    local _prot=""
+    case "$branch"  in "$ibranch"|main|master) [ -n "$branch" ]  && _prot="$branch" ;; esac
+    case "$hbranch" in "$ibranch"|main|master) [ -n "$hbranch" ] && [ -z "$_prot" ] && _prot="$hbranch (checked-out HEAD)" ;; esac
+    if [ -n "$_prot" ]; then
+      echo "skip   $lbl: integration branch ($_prot) — never reaped, not even with --force"
+      continue
     fi
     local gd; gd=$(git -C "$dir" rev-parse --git-dir 2>/dev/null)
     case "$gd" in *"/worktrees/"*) ;; *) echo "skip   $lbl: not a linked worktree"; continue ;; esac
@@ -3931,7 +4103,15 @@ cmd_reap() { # reap [<target>] [--force] — remove worktrees flagged ready
         # branch is no longer checked out anywhere after worktree remove, so
         # deletion is not blocked by a checkout in either layout.
         local derr
-        if ! derr=$(git -C "$main" branch -D "$branch" 2>&1); then
+        if [ -n "$hbranch" ] && [ "$hbranch" != "$branch" ]; then
+          # SAME ROOT CAUSE AS THE GUARD ABOVE: `-D` is force-delete, and $branch is
+          # the RECORDED name. When the record and the checked-out HEAD disagree,
+          # the recorded name is some OTHER branch — one nobody asked to delete, and
+          # `-D` does not check mergedness. Never guess: skip the delete and SAY the
+          # names disagree, so the leftover branch is a visible loose end instead of
+          # a silently destroyed one.
+          bnote=" (branch $branch NOT deleted: record and checked-out HEAD disagree — HEAD was $hbranch)"
+        elif ! derr=$(git -C "$main" branch -D "$branch" 2>&1); then
           bnote=" (branch $branch kept: $(printf '%s' "$derr" | head -1))"
         fi
       fi

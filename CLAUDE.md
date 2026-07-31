@@ -336,6 +336,138 @@ Locked in by `test/agent-task-proof.sh` (22 cases / 36 assertions; the regressio
 group asserting the 9-field shapes and the absent `done` pill is the highest-value
 part).
 
+### GATE 2 integration: the SHIP worker, and why the oracle rejected every approval
+
+At a popped GATE 2 a sub-orch must get feature branch `S` into target `T`, and it
+cannot do that in its own pane (`FLEET_ROLE=worker`). The ruled answer — already
+documented in `FLEET_SUBORCH.md` §7 — is to **delegate to a SHIP worker spawned
+with `--self-merge`**. That was paper: never executed, and broken in four places.
+
+- **`gate_parse` read only line 1.** `gate post` does put the sentinel on body
+  line 1, but the human never feeds the oracle a bare body — they POP, and
+  `inbox_pop_text` prepends `From <from>: <title>` + a blank line. So the oracle
+  returned **rc 1 for every genuine approval**, while §7 says "run it through the
+  oracle, never eyeball it". `inbox_pop_text` is `printf '%s\n%s\n\n' head body` —
+  header then body *immediately*, blank *after* — so a genuine popped sentinel is on
+  **line 2 and never lower**. The scan is `GATE_SCAN_LINES=2` and, decisively,
+  **anchored**: line 2 is honoured only when line 1 is an actual pop header. The
+  offset is then a consequence of the format rather than a free allowance, which
+  matters because `fleet inbox put` has **no role check** — any pane can enqueue a
+  body, so a bare bound of N hands an attacker N−1 lines of camouflage lead-in to
+  bury a forged sentinel behind. Pinned by three proof cases (line 2 parses, line 3
+  does not, a non-header lead-in does not) plus a byte-pin of the popped line
+  against the sentinel — the only assertion that catches the header format drifting
+  again, which is what produced this bug in the first place.
+- **The prompt shape.** §7 told the sub-orch to put "the exact commit/merge/push
+  steps" in the SHIP worker's `-p` string. §7 now writes them to
+  `<worktree>/.fleet/notes/SHIP.md` and the prompt is **one line naming the file**.
+  This is a **necessary workaround for a live guard defect, not a style preference,
+  and reverting it re-breaks the spawn**: `bin/fleet-guard:286` splits the text on
+  newlines *before* the quote-aware tokenizer, so any line of a **quoted** prompt
+  whose first word is `git merge`/`git push` is judged an executed command and
+  DENIED. `ecd71fe` did **not** fix this — it fixed the *mid-line* case, which is
+  why the suite's old "MULTILINE" row (command word `step`) passed while proving
+  nothing. Group B now carries both: that row relabelled as an ALLOW **control**,
+  and its honest companion — the verb at **column 0 of line 2** — pinned as a
+  `KNOWN DEFECT` DENY. The pointer shape also sidesteps the harness's own auto-mode
+  classifier. Fixing the tokenizer is out of scope here (the always-on block is not
+  touched by this feature); this section only stops the prose lying about it.
+- **Nothing terminated the ledger.** §7 now ends in `fleet dispatch done <id>` after
+  a *verified* merge, and `fleet send --needs-human main` on failure — a silent park
+  at GATE 2 is indistinguishable from a wedged pipeline.
+- **Reap would delete `main`.** See below.
+
+Two rules the docs must keep. First, the SHIP worker **integrates and the human
+publishes** — and that split is an **operational instruction, not a grant**: merge is
+local and reflog-recoverable, while push is outward-facing, triggers CI + the pacman
+republish, and needs a non-default credential helper to work headless. There is no
+merge-only permission and there cannot be one at a single uid; measured, `git push`
+under `FLEET_SELF_MERGE=1` is **allowed**, and group B pins that measurement so this
+paragraph goes red if it ever changes. Second, this design does **not claim tamper-resistance**: everything runs as the
+same uid, the ledger is writable by the very agents it records, the hook fails open, so
+no unforgeable approval grant is achievable — and it adds **zero capability**: any
+pane could already run `fleet new --self-merge`. What it buys is that the merge
+becomes a visible, owned, recorded step. `bin/fleet-guard` is deliberately
+**untouched** by this feature, and the proof byte-compares it to prove that.
+
+`--name <window>` on `cmd_new` exists for **routing, and only routing**: the derived
+window name is a pure function of repo+branch, so a SHIP worker on the impl worker's
+branch gets a byte-identical name and `send`/`ready`/`watch` hit whichever pane tmux
+resolves first. It does **not** protect the impl worker's `.fleet/ready` marker and
+never could — the marker lives in `$dir`, which the window name never enters. That is
+handled separately, by **pane liveness**: `cmd_new`'s reap-safety clear keeps a marker
+whose `pane=` writer is still alive (the same liveness predicate `agents_tsv` uses)
+and clearing it once that pane is gone. Residual, stated: `cmd_ready` writes with `>`,
+so two live agents flagging one worktree still race and the last writer wins. `--name`
+is validated on the same closed charset logic as `@fleet_task`, since the name reaches
+`window-status-format`, and it is validated **once for both spawn branches** — it used
+to be parsed and then silently dropped for `--scratch`. It is also **re-passed by
+`cmd_restore`**: without that a restored SHIP worker came back under the derived name
+(the collision returning at exactly the event restore exists for) and the respawn
+overwrote col 8, destroying the record. That re-pass is only safe because the `d<N>-`
+owner prefix is **idempotent** — a plain prepend grows the name a segment per restart,
+and the name keys `.fleet/tasks/<wname>`, restore's own match and `cmd_forget`.
+Window names are additionally **uniquified at spawn** (`scratch_wname`), so two roles
+on one branch stop sharing an address; the matcher rework their consumers want is
+deliberately deferred.
+
+### KNOWN, UNMITIGATED: a conflicted integration worktree takes the CLI down machine-wide
+
+`~/.local/bin/fleet` is a **symlink into `/home/red/proj/pc-tune/fleet/main/bin/fleet`**,
+so the integration worktree *is* the machine's `fleet` CLI. The moment a merge leaves
+conflict markers in that file, every `fleet` command on the box dies with a syntax
+error — every project, every concurrent dispatch, every running agent, not just the one
+merging. **This is not theoretical: it happened on 2026-07-30**, took the fleet down
+mid-resolution and broke d32's SHIP worker in flight.
+
+- **It is not mitigated.** SHIP.md step 3 ("on a conflict `git merge --abort`") is an
+  **instruction to an agent, not a control** — nothing enforces it and nothing detects
+  the window.
+- **Recovery, and it must be fleet-free** because `fleet` itself is what is broken:
+  `git -C /home/red/proj/pc-tune/fleet/main merge --abort`. Proven by group G (a
+  genuinely conflicted `bin/fleet` does not parse; the abort restores a clean,
+  parseable tree). That proves the *recovery path*, not the absence of the window.
+- **Do not close this by adding another be-quick instruction.** Every real fix is a
+  deployment-model change — an ephemeral integration worktree (which *contradicts* the
+  reap guard below) or serving the CLI from a snapshot — and both are out of scope
+  here. Descoped deliberately, in writing, rather than shipped in silence.
+
+**Audit, not authorisation (S7).** `gate_park` stamps `parked_at`, and `inbox_pop`
+calls `gate_record_pop` **after** the paste rc-guard (nothing is recorded for a pop
+that did not land) to write `gate<N>_popped <ts>` into that dispatch's `meta.tsv` —
+parsed through `gate_parse` itself, never a private regex. Both are facts on disk for
+a human to read; nothing may ever *authorise* off them, because the agent they
+describe can write them. `fleet-dash`'s `card_park_note` renders `gate2-wait 3h` on
+the card header so "waiting on you" is distinguishable from "wedged" (extracted by
+the proof between the `# >>> smg:parknote` markers — keep them).
+
+### Reap and the integration branch (`cmd_reap`)
+
+`cmd_reap` refuses any worktree whose branch is the project **integration branch**
+(`fleet integration-branch`, default `main`) or literally `main`/`master`, checked
+**before** the `--force` block and **not overridable by it**. The branch is
+identified by **both the `.agents` record (trimmed) and the checked-out HEAD** —
+either name matching is decisive, and `--force` overrides neither. Keying on the
+record alone was a live hole: nothing rewrites field 3 when a worktree is later
+switched, an observed real record was `'main '` (trailing space, which a `case`
+pattern misses outright), and the worktree this protects on this machine is
+`fleet/main`, i.e. the live CLI. When `symbolic-ref` cannot name HEAD the guard falls
+back to **commit equality** against the target's tip, so a worktree detached at that
+tip is still refused while one detached elsewhere stays reapable; if even `rev-parse`
+cannot answer, the repo is unreadable and reap **fails closed** and skips. The same
+disagreement also disarms the **`branch -D`**: `-D` is a force-delete of the
+*recorded* name, so when record and HEAD differ reap would silently destroy an
+unrelated real branch — it now skips the delete and prints the disagreement. This is not
+hypothetical: merging into `T` requires `T` checked out, the only worktree holding it
+is the *linked* `fleet/main`, and every existing guard passes for it trivially — it
+is clean, and `merge-base --is-ancestor HEAD main` is true of `main` itself. So reap
+would `git worktree remove` it and then `git branch -D main`, armed by the
+`fleet ready` every worker is seeded to run. `--force` means "discard THIS item's
+dirty/unmerged state", never "delete the branch everything merges into"; a human who
+genuinely means it has two lines of `git`. Locked in by
+`test/suborch-merge-gate-proof.sh` group C (including the `--force` pin and a
+narrowness case proving ordinary worktrees still reap).
+
 ### Guard: executed command vs inert argument (`fleet-guard` block 1)
 
 The always-on worker merge/push floor asks exactly one question: **is this text a
@@ -486,6 +618,14 @@ this project with the `fleet` CLI.
   status bar, the dashboard row, and `fleet ls`'s TASK column. Unset (or unknown,
   which warns and drops) renders blank. Display only: it is a separate namespace
   from the orchestrator/worker *role*, and `--task main` and `--task generic` are hard-rejected (error + non-zero exit, no spawn).
+  **`--name <window>`** overrides the derived `<repo>/<branch>` window name — needed
+  only when a SECOND agent lands on a branch that already has one (the GATE 2 SHIP
+  worker), where the identical name would misroute `send`/`ready`/`watch`. It fixes
+  **routing only**: the other agent's `.fleet/ready` marker lives in the shared
+  worktree dir, which the window name never enters, and is protected instead by the
+  spawn's pane-liveness check. Honoured for `--scratch` too, persisted, and re-passed
+  by `fleet restore` so it survives a tmux server restart. Rejected (warn + derived
+  name) unless `[A-Za-z0-9._/-]`.
 - `fleet selfmerge on|off|status` — project-wide worker self-merge toggle. `off`
   drops a `<root>/.fleet/no-self-merge` marker so newly-spawned workers in this
   project (all repos) are blocked from merge/push; `on` removes it (the default,
@@ -540,7 +680,14 @@ this project with the `fleet` CLI.
   with uncommitted changes, a branch not merged into its base, or a worker that
   still has an **unread needs-human message** (sev warn/blocked) in the inbox —
   pop/handle that message first so reaping can never orphan it — a **locked**
-  worktree is refused too — unless `--force`. **Reap is atomic:** every refusal,
+  worktree is refused too — unless `--force`. The **integration branch** (`fleet
+  integration-branch`, default `main`) and its worktree are refused **even with
+  `--force`**: it is the branch everything merges into, and merging into it requires
+  it checked out in a worktree that otherwise passes every reap guard trivially. It
+  is identified by **both the saved record and the checked-out HEAD** (a stale record
+  used to disarm the guard), falling back to commit-equality — and skipping outright —
+  when HEAD is undeterminable.
+  **Reap is atomic:** every refusal,
   early or late, leaves the worktree, its window, its saved-agents line and its
   `.fleet/ready` marker untouched, so a plain **re-run is the retry** — reach for
   `--force` only to genuinely discard dirty or unmerged work, never as the generic

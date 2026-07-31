@@ -23,6 +23,14 @@ this project with the `fleet` CLI.
   status bar, the dashboard row, and `fleet ls`'s TASK column. Unset (or unknown,
   which warns and drops) renders blank. Display only: it is a separate namespace
   from the orchestrator/worker *role*, and `--task main` and `--task generic` are hard-rejected (error + non-zero exit, no spawn).
+  **`--name <window>`** overrides the derived `<repo>/<branch>` window name — needed
+  only when a SECOND agent lands on a branch that already has one (the GATE 2 SHIP
+  worker), where the identical name would misroute `send`/`ready`/`watch`. It fixes
+  **routing only**: the other agent's `.fleet/ready` marker lives in the shared
+  worktree dir, which the window name never enters, and is protected instead by the
+  spawn's pane-liveness check. Honoured for `--scratch` too, persisted, and re-passed
+  by `fleet restore` so it survives a tmux server restart. Rejected (warn + derived
+  name) unless `[A-Za-z0-9._/-]`.
 - `fleet selfmerge on|off|status` — project-wide worker self-merge toggle. `off`
   drops a `<root>/.fleet/no-self-merge` marker so newly-spawned workers in this
   project (all repos) are blocked from merge/push; `on` removes it (the default,
@@ -77,7 +85,14 @@ this project with the `fleet` CLI.
   with uncommitted changes, a branch not merged into its base, or a worker that
   still has an **unread needs-human message** (sev warn/blocked) in the inbox —
   pop/handle that message first so reaping can never orphan it — a **locked**
-  worktree is refused too — unless `--force`. **Reap is atomic:** every refusal,
+  worktree is refused too — unless `--force`. The **integration branch** (`fleet
+  integration-branch`, default `main`) and its worktree are refused **even with
+  `--force`**: it is the branch everything merges into, and merging into it requires
+  it checked out in a worktree that otherwise passes every reap guard trivially. It
+  is identified by **both the saved record and the checked-out HEAD** (a stale record
+  used to disarm the guard), falling back to commit-equality — and skipping outright —
+  when HEAD is undeterminable.
+  **Reap is atomic:** every refusal,
   early or late, leaves the worktree, its window, its saved-agents line and its
   `.fleet/ready` marker untouched, so a plain **re-run is the retry** — reach for
   `--force` only to genuinely discard dirty or unmerged work, never as the generic
