@@ -4140,7 +4140,21 @@ cmd_reap() { # reap [<target>] [--force] — remove worktrees flagged ready
       *) target="$1"; shift ;;
     esac
   done
-  local sess; sess=$(session_name) || die "not inside a fleet session"
+  # project_session, NOT session_name: this is a TARGETING question ("which
+  # session does this PROJECT live in?"), and it must name the SAME file that
+  # persist_agent wrote and that cmd_restore / cmd_forget read — all three
+  # already key on project_session(). Under session_name a PARKED pane (every
+  # sub-orch lives in <sess>_hidden) read ~/.config/fleet/sessions/<sess>_hidden
+  # .agents, which holds none of the project's workers: reap was simply INERT
+  # from a sub-orch pane, printing "nothing flagged ready" for a worktree that
+  # was flagged, clean and merged. The wrong file is read BEFORE the ready
+  # marker or the <target> label is ever consulted, so no guard could catch it.
+  # This is the ONLY use of $sess in cmd_reap — the window to kill is resolved
+  # from `tmux list-panes -a` (server-global, session-agnostic), gate_waiting
+  # keys on fleet_root, and cmd_forget re-resolves project_session() itself, so
+  # the MUTATE phase strikes the line from exactly the file we selected from.
+  # cmd_quit deliberately stays on session_name() — see CLAUDE.md.
+  local sess; sess=$(project_session) || die "not inside a fleet session"
   local root; root=$(fleet_root 2>/dev/null)   # archive target for scratch-docs (fail-silent if empty)
   local f; f=$(agents_file "$sess")
   [ -f "$f" ] || { echo "no saved agents for this session"; return 0; }

@@ -157,7 +157,8 @@ Two questions look identical here and are not:
   (targeting). Every site that targets or scopes a session wants this one:
   `cmd_new`'s parking base, `--switch` move-in, **worker window target and
   `persist_agent`**, `cmd_hide`, `cmd_unhide`, `cmd_ls`'s scope, `cmd_send`'s
-  fan-out scope, `sessions_rows`, **`cmd_restore`**, **`cmd_forget`**.
+  fan-out scope, `sessions_rows`, **`cmd_restore`**, **`cmd_forget`**,
+  **`cmd_reap`**.
 
 `cmd_new` resolves it **once**, at the top, into `psess` (the project) and
 `tsess` (where the window will physically land — `psess` or its parked sibling).
@@ -169,7 +170,28 @@ was converted at first, so a sub-orch-spawned **code worker** still landed in
 to `<sess>_hidden.agents`, a file `cmd_restore` and `cmd_forget` never read. The
 worker was un-restorable after a tmux restart and its saved-agents line
 immortal. **Writer and readers must name the same file**, which is why
-`persist_agent`, `cmd_restore` and `cmd_forget` all key on `project_session()`.
+`persist_agent`, `cmd_restore`, `cmd_forget` and `cmd_reap` all key on
+`project_session()`.
+
+`cmd_reap` was the last reader still on `session_name()`, and that was a second
+live bug (d36): from a parked pane it opened
+`~/.config/fleet/sessions/<sess>_hidden.agents`, which holds none of the
+project's workers, so **reap was simply INERT from any sub-orch pane** —
+`fleet reap fleet/task-tag-off-bar` printed `nothing flagged ready` for a
+worktree that was flagged, clean, merged and pushed. The wrong file is read
+*before* the ready marker or the `<target>` label is ever consulted, so no
+per-worktree guard could catch it, and none was relying on the accidental
+scoping: `<target>` matches the repo/branch **label**, the window to kill is
+resolved from server-global `tmux list-panes -a`, `gate_waiting` keys on
+`fleet_root`, and every refusal (live-state, dirty, unmerged, unread
+needs-human, lock, gate-wait) is per-worktree. That is also the whole of
+`$sess`'s use in `cmd_reap` — it appears in exactly one place, and `cmd_forget`
+re-resolves `project_session()` itself, so DECIDE and MUTATE cannot disagree
+about which file the line is struck from. Locked in by
+`test/proof-reap-project-session.sh` (13 cases; 3-5 are the headline, 7-13 assert
+the guards still refuse from that same parked pane). **`cmd_quit` is the
+deliberate exception and must stay on `session_name()`** — see below; do not
+"make it consistent".
 
 Conflating them was a live bug. `FLEET_SESSION` is exported only by `fleet up` /
 `fleet main` / `fleet restore` — **never** into a spawned pane — so inside a
