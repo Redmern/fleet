@@ -251,6 +251,28 @@ card_meta_state() { # <so-d<N>[-slug]> -> ledger 'state' value (running/planning
   local id="${1#so-}" f; id="${id%%-*}"; f="$(dash_root)/.fleet/dispatch/$id/meta.tsv"
   [ -f "$f" ] && awk -F'\t' '$1=="state"{v=$2} END{print v}' "$f" 2>/dev/null
 }
+card_meta_key() { # <so-d<N>[-slug]> <key> -> that meta.tsv value, or ""
+  local id="${1#so-}" f; id="${id%%-*}"; f="$(dash_root)/.fleet/dispatch/$id/meta.tsv"
+  [ -f "$f" ] && awk -F'\t' -v k="$2" '$1==k{v=$2} END{print v}' "$f" 2>/dev/null
+}
+# >>> smg:parknote
+# A card PARKED at a human gate and a card WEDGED at one are the same ledger row —
+# `gate2-wait`, forever. The only thing that separates "waiting on you since a minute
+# ago" from "nobody has looked at this since Tuesday" is AGE, so the card header
+# carries it. Non-parked states render NOTHING (a task-less fleet is byte-identical to
+# before). Pure: state + epoch in, text out — no tmux, no ledger read, so the proof
+# harness evals this fragment directly.
+card_park_note() { # <ledger-state> <parked_at-epoch> -> "gate2-wait 3h" | ""
+  local st="${1:-}" at="${2:-}" now d
+  case "$st" in gate1-wait|gate2-wait) ;; *) return 0 ;; esac
+  case "$at" in ''|*[!0-9]*) printf '%s' "$st"; return 0 ;; esac
+  now=$(date +%s 2>/dev/null); d=$(( now - at )); (( d < 0 )) && d=0
+  if   (( d < 60 ));    then printf '%s %ds' "$st" "$d"
+  elif (( d < 3600 ));  then printf '%s %dm' "$st" "$(( d / 60 ))"
+  elif (( d < 86400 )); then printf '%s %dh' "$st" "$(( d / 3600 ))"
+  else                       printf '%s %dd' "$st" "$(( d / 86400 ))"; fi
+}
+# <<< smg:parknote
 unowned_rule() { # <inner-width> -> a '╶ unowned ╴' plain rule of exactly <inner> display chars
   local w="$1" lab=" unowned " n fill
   n=$(( w - ${#lab} - 2 )); (( n < 0 )) && n=0
@@ -1005,6 +1027,9 @@ render() {
           local dn=${CARD_NWORK[$cgid]:-0} dwarn=${CARD_WARN[$cgid]:-0} dlabel="$cgid"
           dlabel+=" · $dn worker$([ "$dn" = 1 ] || echo s)"  # state now lives in the pill, not the '· state' text
           (( dwarn > 0 )) && dlabel+=" · ⚠$dwarn"
+          # parked-at-a-gate: show the state AND its age (waiting-on-you vs wedged)
+          local dpark; dpark=$(card_park_note "${CARD_STATE[$cgid]:-}" "$(card_meta_key "$cgid" parked_at)")
+          [ -n "$dpark" ] && dlabel+=" · $dpark"
           # the so-<id> row IS the card header: render ITS OWN live state pill, same
           # stall/done overrides the worker path applies below.
           local hstate hsdisp hscol hage
