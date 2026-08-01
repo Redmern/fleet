@@ -48,6 +48,7 @@ GLYPH_COLOR = {"working": "colour4", "blocked": "colour1", "idle": "colour2"}
 
 SWEEP_INTERVAL = 60
 SCRAPE_INTERVAL = 2          # how often hookless harnesses (omp, …) are polled
+COURIER_INTERVAL = 2         # how often undelivered gate decisions are couriered out
 NOTIFY_COOLDOWN = 30
 IDLE_FLAP_GUARD = 2.0
 # A window stamped @fleet_harness that has never reported a hook is surfaced as a
@@ -120,6 +121,7 @@ class Fleet:
         self.last_working = {}  # pane_id -> ts of last working report
         self.last_sweep = 0.0
         self.last_scrape = 0.0
+        self.last_courier = 0.0
 
     # ---- state ingestion -------------------------------------------------
 
@@ -211,8 +213,14 @@ class Fleet:
                 return
         self.last_notify[key] = now
         label = agent_label(cur.get("cwd") or pane)
+        # SEVERITY, RIGHT WAY UP. This read ("Agent blocked", "low") — the one state
+        # that means "an agent is stuck waiting for YOU" was the QUIETEST desktop
+        # notification fleet sends, quieter than "turn finished", and on a daemon
+        # that time-expires low-urgency toasts it could vanish before being read.
+        # `inbox_put` has always used critical for blocked; these are the same event
+        # reaching the human by two routes and they must not disagree.
         title, urgency = (
-            ("Agent blocked", "low") if state == "blocked" else ("Agent done", "normal")
+            ("Agent blocked", "critical") if state == "blocked" else ("Agent done", "normal")
         )
         body = f"{label} — " + (
             "waiting for permission/input" if state == "blocked" else "turn finished"
@@ -245,6 +253,57 @@ class Fleet:
             self.effective.pop(pane, None)
         if self.panes:
             self.heal_status_format()
+
+    def courier(self, force=False):
+        """Trigger `fleet gate deliver <id>` for any dispatch with an UNDELIVERED
+        decision. Runs on the same 2s cadence as scrape_harnesses.
+
+        ALL THE LOGIC STAYS IN BASH — deliberately. fleetd learns exactly one fact
+        ("this ledger has `decision` and not `delivered`") from a tab-separated file
+        it already knows how to not-parse, and shells out. It does NOT learn the
+        sentinel grammar: that would be a second implementation of it, in a second
+        language, inside the one process with no try/except around method dispatch,
+        where a single exception exits the daemon and `Restart=on-failure` then
+        crash-loops it to permanently `failed` while everything silently degrades to
+        the stale tmux-option fallback.
+
+        Fail-silent and non-blocking throughout: a courier that raised, hung, or
+        waited on the delivery would take the daemon's whole event loop with it.
+        Back-off/retry/escalation all live in the bash side, so this may safely fire
+        every tick — `gate deliver` returns immediately when it is not due.
+        """
+        now = time.time()
+        if not force and now - self.last_courier < COURIER_INTERVAL:
+            return
+        self.last_courier = now
+        out = tmux("list-sessions", "-F", "#{@fleet_root}")
+        if not out:
+            return
+        for root in {r.strip() for r in out.splitlines() if r.strip()}:
+            led = os.path.join(root, ".fleet", "dispatch")
+            try:
+                ids = os.listdir(led)
+            except Exception:
+                continue
+            for did in ids:
+                meta = os.path.join(led, did, "meta.tsv")
+                try:
+                    with open(meta) as f:
+                        rows = [l.rstrip("\n").split("\t", 1) for l in f]
+                except Exception:
+                    continue
+                # last-wins, exactly like meta_get
+                kv = {r[0]: (r[1] if len(r) > 1 else "") for r in rows if r}
+                if not kv.get("decision") or kv.get("delivered") == "1":
+                    continue
+                try:
+                    subprocess.Popen(
+                        ("fleet", "gate", "deliver", did),
+                        cwd=root, stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL, start_new_session=True,
+                    )
+                except Exception:
+                    pass
 
     def scrape_harnesses(self, force=False):
         # Hookless harnesses (omp, …) can't report via Claude-style hooks. fleet
@@ -541,6 +600,7 @@ def main():
                     except OSError:
                         pass
         fleet.scrape_harnesses()
+        fleet.courier()
         fleet.sweep()
 
 

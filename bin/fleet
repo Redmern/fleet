@@ -1733,15 +1733,57 @@ suborch_pane_for() { # <owner-bare-name> -> pane_id, or rc 1
   return 1
 }
 
+# `fleet human on|off|status [<agent>]` — declare that a HUMAN, not an agent, is
+# working in this pane. Stored as the `@fleet_human` PANE option.
+#
+# WHY A PANE OPTION AND NOT A TSV COLUMN. The 9-field agents TSV has three
+# independent positional readers that each fail SILENTLY WRONG on a 10th field:
+# fleet-dash's tab-IFS read collapses the empty column and lands the 10th in
+# `ready`, so EVERY agent renders the `done` pill and a human reaps live work;
+# fleetd's hard `len(parts) == 9` blanks the dashboard; cmd_restore's last variable
+# absorbs the extras and mangles the owner prefix. There is no schema or migration
+# mechanism, and a pacman copy runs alongside the dev symlink, so version skew is
+# live. A pane option is invisible to all of them.
+#
+# WHY IT IS A DECLARATION AND NOT A DETECTION. There is no reliable way to tell a
+# human's shell from an agent's: fleet only ever knew "an agent reported a state
+# recently", which a human never does. That silence is exactly what made a
+# human-occupied worktree look abandoned. So the human says so, once.
+cmd_human() { # human on|off|status [<agent>]
+  local verb="${1:-status}" want="${2:-}" pane=""
+  if [ -n "$want" ]; then
+    pane=$(window_pane_for "$want" 2>/dev/null) \
+      || pane=$(agents_tsv 2>/dev/null | awk -F'\t' -v t="$want" '$5==t||$2==t{print $7; exit}')
+    [ -n "$pane" ] || die "fleet human: no agent matching '$want' (try: fleet ls)"
+  else
+    pane="${TMUX_PANE:-}"
+    [ -n "$pane" ] || die "fleet human: run inside a tmux pane, or name an agent"
+  fi
+  case "$verb" in
+    on)  tmux set -p -t "$pane" @fleet_human 1 2>/dev/null || true
+         echo "human present in $pane — reap will refuse this worktree and send will not type into it" ;;
+    off) tmux set -p -t "$pane" -u @fleet_human 2>/dev/null || true
+         echo "human presence cleared for $pane" ;;
+    status|"")
+         if [ "$(tmux show -pqv -t "$pane" @fleet_human 2>/dev/null)" = 1 ]; then
+           echo "on  — a human is present in $pane"
+         else
+           echo "off — no human declared in $pane"
+         fi ;;
+    *) die "usage: fleet human on|off|status [<agent>]" ;;
+  esac
+}
+
 cmd_send() {
   # Optional leading flags. --needs-human marks an orchestrator-bound message as a
   # hard block (sev=blocked -> critical desktop notify) instead of a routine summary
   # (sev=info, silent pill — preserves the documented "info summaries stay silent"
   # behavior). Flags must precede the target; everything after is target + message.
-  local needs_human=0
+  local needs_human=0 force_send=0
   while [ $# -gt 0 ]; do
     case "$1" in
       --needs-human) needs_human=1; shift ;;
+      --force) force_send=1; shift ;;   # override the draft/modal refusal only
       --) shift; break ;;
       *) break ;;
     esac
@@ -1813,6 +1855,32 @@ cmd_send() {
     echo "fleet send: '$wname' is the orchestrator pane — redirecting to the inbox (the human input is never clobbered)" >&2
     inbox_put --sev "$sev" -m "$text" >&2
     exit 0
+  fi
+
+  # NEVER-CLOBBER, EXTENDED TO THE WORKER PATH (S6). The guarantee that `fleet send`
+  # cannot destroy an in-progress prompt was orchestrator-ONLY: the two checks above
+  # redirect main-pane targets into the durable inbox for exactly that reason. The
+  # worker path had nothing — it is `send-keys -l` followed by Enter, which splices
+  # into a half-typed prompt AND SUBMITS IT. That is not a hypothetical now that a
+  # human may be hand-driving a worker pane.
+  #
+  # Two distinct refusals, and the distinction matters:
+  #   * @fleet_human — a person declared themselves here. Never type into it. There
+  #     is no --force for this; `fleet human off` is the escape hatch, and it is a
+  #     deliberate one.
+  #   * a DRAFT or a MODAL — someone (or something) has unsubmitted text on screen.
+  #     Overridable with --force, because an agent that merely left a draft behind
+  #     is a normal thing to want to interrupt.
+  # `generating` is deliberately NOT refused: an agent mid-turn is the ordinary case
+  # for `fleet send`, the harness queues the input, and nothing is lost.
+  if [ "$(tmux show -pqv -t "$pane" @fleet_human 2>/dev/null)" = 1 ]; then
+    die "fleet send: a HUMAN is present in '$wname' — refusing to type into their terminal (clear it with 'fleet human off')"
+  fi
+  if [ "$force_send" != 1 ]; then
+    case "$(orch_input_state "$pane" 2>/dev/null)" in
+      draft|modal)
+        die "fleet send: '$wname' has unsubmitted text on screen — refusing to splice into and submit an in-progress prompt (retry, or --force)" ;;
+    esac
   fi
 
   # Re-tasking un-readies the target's worktree: it is going back to work, so a
@@ -1889,6 +1957,19 @@ cmd_watch() {
   echo "watching ${targets[*]} in the background — this pane gets pinged when they're all idle. End your turn; you'll be woken."
 }
 
+# `fleet unwatch [<pane>]` — disarm the watcher armed on a pane (default: mine).
+# Sets a one-shot pane option the detached watcher consumes on its next tick, so
+# there is no pid to track, nothing to kill, and a watcher that has already exited
+# leaves a flag its successor consumes harmlessly. Fail-silent, rc 0 always: asking
+# to cancel something that is not running is not an error.
+cmd_unwatch() {
+  local pane="${1:-${TMUX_PANE:-}}"
+  [ -n "$pane" ] || { echo "fleet unwatch: no pane (run inside tmux, or name one)" >&2; return 0; }
+  tmux set -p -t "$pane" @fleet_watch_stop 1 2>/dev/null || true
+  echo "unwatch armed for $pane — the watcher stops on its next tick (within ~2s)"
+  return 0
+}
+
 cmd_watch_run() { # watch-run <pane> <msg> <soid> <target...>  (detached; internal)
   local pane="$1" msg="$2" soid="${3:-}"; shift 3
   # soid resolution: explicit argv (cmd_watch passes FLEET_SUBORCH_ID) -> env fallback
@@ -1899,9 +1980,17 @@ cmd_watch_run() { # watch-run <pane> <msg> <soid> <target...>  (detached; intern
     local wn; wn=$(tmux display -p -t "$pane" '#{window_name}' 2>/dev/null)
     case "$wn" in so-*) soid="$wn" ;; esac
   fi
-  local targets=("$@") streak=0 i tsv state t alldone blocked
+  local targets=("$@") streak=0 i tsv state t alldone blocked gonestreak=0
   for (( i=0; i<2700; i++ )); do          # ~90min cap at 2s/iteration
     sleep 2
+    # DISARM (S6). Until now an armed watcher could not be cancelled at all: the
+    # only exits were "all idle", "one blocked", or the ~90 minute cap. `fleet
+    # unwatch` sets this one-shot pane option, which is consumed here so a second
+    # watcher on the same pane is not silently killed by a stale flag.
+    if [ "$(tmux show -pqv -t "$pane" @fleet_watch_stop 2>/dev/null)" = 1 ]; then
+      tmux set -p -t "$pane" -u @fleet_watch_stop 2>/dev/null || true
+      return 0
+    fi
     if ! tmux display -p -t "$pane" '#{pane_id}' >/dev/null 2>&1; then
       # Pane gone. R-3: a SUB-ORCH pane that vanished while its dispatch is still active
       # (non-terminal ledger) must not silently swallow the wake — escalate durably.
@@ -1912,11 +2001,32 @@ cmd_watch_run() { # watch-run <pane> <msg> <soid> <target...>  (detached; intern
     fi
     tsv=$(agents_tsv 2>/dev/null)
     alldone=1; blocked=""
+    local gone=1
     for t in "${targets[@]}"; do
       state=$(printf '%s\n' "$tsv" | awk -F'\t' -v x="$t" 'index($2,x)||index($5,x){print $1; exit}')
+      [ -n "$state" ] && gone=0
       [ "$state" = idle ] || alldone=0
       [ "$state" = blocked ] && blocked="$t"
     done
+    # A VANISHED TARGET IS TERMINAL (S6). A killed worker window matches nothing, so
+    # it is never `idle`, so `alldone` never latches and the watcher spins to the
+    # ~90 minute cap — burning a process and, worse, leaving the orchestrator
+    # waiting for a wake that is never coming. The vanished SUB-ORCH case was
+    # handled (the pane-gone branch above); workers were not.
+    #
+    # Streaked, not immediate: `agents_tsv` falls back to tmux options when the
+    # daemon is down, and a single empty read during a fleetd restart is a blip,
+    # not a death. Three consecutive misses (~6s) is the same evidence bar the
+    # idle path already uses.
+    if [ "$gone" = 1 ]; then
+      gonestreak=$((gonestreak+1))
+      if [ "$gonestreak" -ge 3 ]; then
+        deliver_wake "$pane" "fleet watch: ${targets[*]} — window(s) gone; nothing left to wait for. $msg" normal "$soid"
+        return 0
+      fi
+    else
+      gonestreak=0
+    fi
     if [ -n "$blocked" ]; then            # an agent needs input — stop waiting and say so
       # Route through the wake COMPOSER: main pane stays OOB (byte-for-byte today), every
       # non-main pane gets bounded in-band retry + F1-confirmed delivery, falling through
@@ -1991,21 +2101,55 @@ meta_get() { # <dispatch-dir> <key> -> value (tab-separated meta.tsv)
   # both modern upsert (single line) and legacy stacked files.
   awk -F'\t' -v k="$2" '$1==k{v=$2} END{if(v!="")print v}' "$1/meta.tsv" 2>/dev/null
 }
-meta_set() { # <dispatch-dir> <key> <value> — upsert one key, atomic tmp+mv
+# UPSERT ONE KEY UNDER AN EXCLUSIVE LOCK. This was an unlocked read-modify-write
+# through a FIXED tmp path whose own comment called it "atomic tmp+mv" — neither
+# half was true. Two writers each read the pre-state and each drop the other's key
+# (measured 29 lost of 30 concurrent writes), and one shared `$f.tmp` lets A's `mv`
+# publish B's half-written file. It only became load-bearing at d34: the courier
+# writes six keys per delivery on fleetd's 2s cadence while the sub-orch writes the
+# same file. Worst outcome is the silent one — `decision-<N>.txt` on disk but the
+# ledger `decision` key empty, so `gate_deliver` bails at `[ -n "$dec" ]` forever and
+# the dispatch sits PARKED FOREVER with nothing able to notice (54/60 rounds).
+#
+# Four things, each necessary:
+#   * `flock` is the fix. A unique tmp path ALONE still loses 153/200 — the shared
+#     tmp is real but it is the lesser half.
+#   * `mktemp` IN THE SAME DIRECTORY, so `mv` is a genuine atomic rename(2). `$$` is
+#     not sufficient: fleetd forks subshells that share a PID lineage.
+#   * `( … ) 9>>`, a SUBSHELL, never `{ … } 9>>` — with the brace form the `exit 1`
+#     on lock failure kills `fleet` itself. Pinned by meta-concurrency-proof case 4.
+#   * a REAL exit status. Returning 0 unconditionally is what let a truncated
+#     meta.tsv fail silently in `gate_decide`, the one verb designed to die loudly.
+# Callers stay fail-soft (~30 of ~40 sites are telemetry); only the decision keys
+# and the un-park write check the status.
+meta_set() { # <dispatch-dir> <key> <value> — upsert one key under an exclusive lock
   local d="$1" k="$2" v="$3" f="$1/meta.tsv"
-  mkdir -p "$d" 2>/dev/null || return 0
-  { [ -f "$f" ] && awk -F'\t' -v k="$k" '$1!=k' "$f"; printf '%s\t%s\n' "$k" "$v"; } \
-    > "$f.tmp" 2>/dev/null && mv "$f.tmp" "$f" 2>/dev/null
+  mkdir -p "$d" 2>/dev/null || return 1
+  (
+    flock -w "${FLEET_META_LOCK_WAIT:-5}" 9 2>/dev/null || exit 1
+    local t; t=$(mktemp "$f.tmp.XXXXXX" 2>/dev/null) || exit 1
+    { [ -f "$f" ] && awk -F'\t' -v k="$k" '$1!=k' "$f"; printf '%s\t%s\n' "$k" "$v"; } \
+      > "$t" 2>/dev/null && mv "$t" "$f" 2>/dev/null || { rm -f "$t" 2>/dev/null; exit 1; }
+  ) 9>>"$d/.meta.lock"
 }
 # Collapse a legacy stacked meta.tsv to one last-wins line per key. One-time
-# defensive pass (meta_get already reads correctly); atomic tmp+mv, fail-silent.
+# defensive pass (meta_get already reads correctly).
+#
+# IDENTICAL treatment to meta_set, and not optional: this had the same fixed `$f.tmp`
+# and the same missing lock, and it runs from `cmd_reconcile` — i.e. concurrently
+# with the courier by construction. Fixing only meta_set would leave a writer that
+# still `mv`s over a locked writer's file (measured: 7 keys lost).
 meta_compact() { # <dispatch-dir>
-  local f="$1/meta.tsv"
+  local d="$1" f="$1/meta.tsv"
   [ -f "$f" ] || return 0
-  # last-wins per key, preserve first-seen key order for stable output
-  awk -F'\t' '{v[$1]=$2; if(!($1 in seen)){seen[$1]=1; order[++n]=$1}}
-              END{for(i=1;i<=n;i++) printf "%s\t%s\n", order[i], v[order[i]]}' \
-    "$f" > "$f.tmp" 2>/dev/null && mv "$f.tmp" "$f" 2>/dev/null || return 0
+  (
+    flock -w "${FLEET_META_LOCK_WAIT:-5}" 9 2>/dev/null || exit 1
+    local t; t=$(mktemp "$f.tmp.XXXXXX" 2>/dev/null) || exit 1
+    # last-wins per key, preserve first-seen key order for stable output
+    awk -F'\t' '{v[$1]=$2; if(!($1 in seen)){seen[$1]=1; order[++n]=$1}}
+                END{for(i=1;i<=n;i++) printf "%s\t%s\n", order[i], v[order[i]]}' \
+      "$f" > "$t" 2>/dev/null && mv "$t" "$f" 2>/dev/null || { rm -f "$t" 2>/dev/null; exit 1; }
+  ) 9>>"$d/.meta.lock"
 }
 
 # Record an optional pane-role registry entry (cross-check for the hook's env gate).
@@ -2134,6 +2278,88 @@ suborch_harness_pane() { # <window_id> -> "<pane_id> <pane_current_command>", or
 #   * no --cmd nvim/fleet.lua and no FLEET_AUTOCLAUDE → the viewer must never
 #               autostart a harness of its own.
 #   * -c <dir> is independent of the harness cwd, which stays $root.
+# Write the viewer's Ex commands into the dispatch dir and echo the file path.
+#
+# WHY EX COMMANDS AND NOT KEYMAPS OR RPC. The viewer is plain `nvim .` running the
+# HUMAN'S OWN CONFIG, and it has no `--listen` socket — the `--listen` elsewhere in
+# this file belongs to the AGENT nvim, a different thing, and
+# `test/suborch-viewer-send.sh` asserts `@fleet_nvim_sock` stays unset (setting it
+# flips cmd_send to RPC-only, which then dies). So there is nothing to drive it
+# with from outside, and grabbing keys in someone else's editor is not ours to do.
+# `:Fleet*` commands collide with nothing, tab-complete, and are discoverable.
+# Deliberately NOT fleet.lua, NOT exrc, NOT .nvim.lua.
+#
+# ECHOERR, NOT FAIL-SILENT. The whole attach path is fail-silent end to end, so a
+# command that never installed would be indistinguishable from an approval that
+# worked — a human pressing enter on nothing and walking away. This is the same
+# deliberate exception the headless `fleet gate` verbs make.
+suborch_viewer_vimrc() { # <dispatch-dir> <id> -> prints file path
+  local d="${1:-}" id="${2:-}" f="${1:-}/.fleet-viewer.vim"
+  [ -d "$d" ] || return 1
+  # `fleet` is resolved through PATH at RUN time, not baked in: this file outlives a
+  # release promote, and a baked rel-<stamp> path would be pruned out from under it.
+  cat > "$f" <<VIMEOF || return 1
+" Generated by fleet (suborch_viewer_vimrc) — regenerated on every viewer attach.
+" Additive and namespaced only. This file must never map a key: it is loaded into
+" the human's own nvim, and their keys are theirs.
+let g:fleet_dispatch = '$id'
+
+function! s:FleetRun(args) abort
+  let l:out = system('fleet gate ' . a:args . ' 2>&1')
+  if v:shell_error
+    echohl ErrorMsg | echom 'fleet gate ' . a:args . ': ' . trim(l:out) | echohl None
+    return 0
+  endif
+  echom trim(l:out)
+  return 1
+endfunction
+
+" GATE 2 IS THE APPROVAL THAT MOVES CODE, so the viewer asks for the slug back.
+" It must do the asking ITSELF: system() gives the CLI no tty, so the CLI's own
+" prompt could never run here — it would refuse (deliberately), and a viewer that
+" merely relayed that refusal would make :FleetApprove useless at the one gate it
+" matters at. The slug is compared HERE and the CLI is then called with --yes,
+" which is the explicit, recorded escape hatch. Gates 1 and 3 approve unchanged.
+function! s:FleetGateInfo() abort
+  let l:out = system('fleet gate show ' . g:fleet_dispatch . ' 2>/dev/null')
+  return [matchstr(l:out, 'gate \zs\d'), matchstr(l:out, 'slug=\zs[^ \]]\+')]
+endfunction
+
+function! s:FleetApprove() abort
+  let [l:n, l:slug] = s:FleetGateInfo()
+  if l:n !=# '2'
+    return s:FleetRun('approve ' . g:fleet_dispatch)
+  endif
+  echo ' '
+  echo 'GATE 2 — approving MERGES ' . l:slug
+  call s:FleetRun('show ' . g:fleet_dispatch)
+  let l:typed = input('Type the slug to confirm the merge: ')
+  if l:typed !=# l:slug
+    echohl ErrorMsg | echom 'FleetApprove: slug mismatch — ABORTED, nothing written.' | echohl None
+    return 0
+  endif
+  return s:FleetRun('approve ' . g:fleet_dispatch . ' --yes')
+endfunction
+
+command! -bar FleetApprove call s:FleetApprove()
+command! -bar FleetGate    call s:FleetRun('show ' . g:fleet_dispatch)
+
+" :FleetReject opens a scratch buffer for the reason; :wq sends it. An EMPTY reason
+" aborts — the CLI refuses it (rc 2) and says so here. Reject is never reasonless.
+function! s:FleetRejectBuf() abort
+  let l:tmp = tempname()
+  execute 'botright split ' . fnameescape(l:tmp)
+  setlocal filetype=markdown
+  call setline(1, ['# Why is this rejected? (lines starting with # are ignored)',
+        \ '# Write the revision guidance for the agent one rung back, then :wq.',
+        \ '# An EMPTY reason aborts — nothing is written.', ''])
+  execute 'autocmd BufWritePost <buffer> call s:FleetRun("reject " . g:fleet_dispatch . " --file " . shellescape(expand("%:p")))'
+endfunction
+command! -bar FleetReject call s:FleetRejectBuf()
+VIMEOF
+  printf '%s\n' "$f"
+}
+
 suborch_attach_viewer() { # <window_id> <dir>
   local wid="${1:-}" dir="${2:-}" v harness
   [ -n "$wid" ] && [ -n "$dir" ] && [ -d "$dir" ] || return 0
@@ -2151,8 +2377,17 @@ suborch_attach_viewer() { # <window_id> <dir>
   [ "${npanes:-0}" -ge 2 ] && return 0
   harness=$(tmux list-panes -t "$wid" -F '#{pane_id}' 2>/dev/null | head -1)
   [ -n "$harness" ] || return 0
+  # tmux joins the trailing argv into ONE shell command string, so every path that
+  # reaches it is %q-escaped here rather than trusted to be space-free.
+  local vimf cmd
+  vimf=$(suborch_viewer_vimrc "$dir" "$(basename "$dir")" 2>/dev/null) || vimf=""
+  if [ -n "$vimf" ]; then
+    printf -v cmd 'nvim -c %q .' "source $vimf"
+  else
+    cmd='nvim .'                                # no Ex commands is degraded, not broken
+  fi
   v=$(tmux split-window -d -P -F '#{pane_id}' -h -t "$harness" -l '40%' \
-        -c "$dir" nvim . 2>/dev/null) || return 0
+        -c "$dir" "$cmd" 2>/dev/null) || return 0
   [ -n "$v" ] || return 0
   tmux set -p -t "$v" @fleet_viewer 1 2>/dev/null || true
   # Read the flag back. An unflagged viewer is worse than no viewer: every filter added
@@ -2399,6 +2634,7 @@ cmd_dispatch() { # dispatch <id> | enable | disable | status | rename <id> <slug
     disable) shift; dispatch_disable "$@"; return $? ;;
     status)  shift; dispatch_status  "$@"; return $? ;;
     rename)  shift; cmd_dispatch_rename "$@"; return $? ;;
+    farm)    shift; dispatch_farm "$@"; return $? ;;   # (re)build the symlink farm in bash
     mode)    shift; if [ $# -eq 0 ]; then dispatch_mode_get; echo; return 0; else dispatch_mode_set "$1"; return $?; fi ;;
     done|fail|failed|cancel|cancelled) cmd_dispatch_finish "$@"; return $? ;;
   esac
@@ -2466,7 +2702,55 @@ cmd_dispatch_rename() {
   # worktrees), which is what makes crash recovery mis-read the pipeline phase.
   meta_set "$d" reports "$root/_reports/$slug"
   release_lock "$led/.spawnlock-$id"
+  dispatch_farm "$id" 2>/dev/null || true   # the farm is BASH-built, not model prose
   echo "renamed $id → $new"
+}
+
+# `fleet dispatch farm <id>` — (re)build the per-dispatch SYMLINK FARM in bash.
+#
+# WHY THIS IS BASH AND NOT PROSE. The farm is the entire content of the sub-orch
+# window's viewer pane, which is rooted at `.fleet/dispatch/<id>/`. Until now the
+# farm was built only by FLEET_SUBORCH.md §3.0.6 — instructions a model executes —
+# so the human's "I go to that window and everything is there" premise rode on an
+# LLM remembering a chore, and an empty farm is indistinguishable from a dispatch
+# with no workers. `test/dispatch-symlink-farm.sh` case 6 evals the manual's own
+# commands, which proves the COMMANDS work and never that a live sub-orch ran them.
+#
+# Pure function of two inputs already on disk: the ledger `reports` key (absolute,
+# written by cmd_dispatch_rename — the only point where d<N> and <slug> are both in
+# hand) and `workers.tsv` (`<repo>\t<branch>[\t<label>]`, appended by the sub-orch).
+# `ln -sfn` is re-pointable and idempotent, so this is safe to run on every rename
+# and every gate post — which is exactly when the human is about to look. Prose in
+# §3.0.6 stays as belt-and-braces; a sub-orch that also runs `ln` changes nothing.
+#
+# Fail-silent and rc 0 throughout: a missing reports key, an absent workers.tsv, or
+# a worktree that has since been reaped must never fail a rename or a gate post. A
+# dangling link is an intended tombstone, not an error.
+dispatch_farm() { # <dispatch-id>
+  local id="${1:-}"; [ -n "$id" ] || return 0
+  local root; root=$(fleet_root 2>/dev/null) || return 0
+  local d="$root/.fleet/dispatch/$id"; [ -d "$d" ] || return 0
+  local rep; rep=$(meta_get "$d" reports 2>/dev/null)
+  case "$rep" in
+    /*) mkdir -p "$rep" 2>/dev/null || true
+        ln -sfn "$rep" "$d/reports" 2>/dev/null || true ;;
+  esac
+  [ -f "$d/workers.tsv" ] || return 0
+  local repo branch label wt safe
+  while IFS=$'\t' read -r repo branch label _rest; do
+    [ -n "${repo:-}" ] && [ -n "${branch:-}" ] || continue
+    safe=${branch//\//_}                       # cmd_new's own dir/window convention
+    wt="$root/$repo/$safe"
+    # Link names must not escape the farm dir: a `/` or `..` reaching `ln` would
+    # place the link outside the dir the viewer is rooted at. Both components are
+    # already slash-free by construction; refuse anything else rather than trust it.
+    case "$repo$safe" in *[/]*|*..*) continue ;; esac
+    ln -sfn "$wt" "$d/$repo-$safe" 2>/dev/null || true
+    [ -n "${label:-}" ] || label="$safe"
+    case "$label" in *[/]*|*..*) continue ;; esac
+    ln -sfn "$wt/.fleet/notes" "$d/notes-$label" 2>/dev/null || true
+  done < "$d/workers.tsv"
+  return 0
 }
 
 # `fleet dispatch-alloc` (internal, called by the hook): allocate an id, create its
@@ -2510,7 +2794,15 @@ cmd_gate() {
     park)    gate_park    "$@" ;;   # mark a sub-orch ledger gate{1,2}-wait (reap-guard)
     waiting) gate_waiting "$@" ;;   # list sub-orchs parked at a gate (reap consults this)
     popped)  gate_record_pop "$@" ;; # internal: audit-stamp a popped gate message
-    *) die "usage: fleet gate parse|post <1|2> [-w <worktree>]|park <id> <1|2>|waiting|popped <msg>" ;;
+    approve) gate_decide approve "$@" ;;  # THE decision verb — writes, never un-parks
+    reject)  gate_decide reject  "$@" ;;  # …and reject is never reasonless
+    show)    gate_show    "$@" ;;   # print the pending question (+ any decision)
+    deck)    gate_deck    "$@" ;;   # the leader-menu popup surface over the same verbs
+    deliver) gate_deliver "$@" ;;   # the courier — the ONLY thing that un-parks
+    list)    gate_list    "$@" ;;   # every dispatch parked at a gate, with age
+    *) die "usage: fleet gate approve|reject [<id|slug>] [--gate N] [-m reason]
+       fleet gate show|list [<id|slug>]
+       fleet gate parse|post <1|2> [--park] [-w <worktree>]|park <id> <1|2>|waiting|popped <msg>" ;;
   esac
 }
 
@@ -2564,12 +2856,13 @@ gate_worktree_for_slug() { # <slug>
 # (info would be silent). Body is SHORT (sentinel + pointer + digest) because the body
 # is what gets pasted into the sub-orch on pop. The GATE 2 target defaults to the
 # project integration-branch and is frozen into the sentinel.
-gate_post() { # post <1|2> --slug S [--target T] [--summary "…"] [--plan FILE] [-d <id>] [-w <worktree>]
+gate_post() { # post <1|2|3> [--park] --slug S [--target T] [--summary "…"] [--plan FILE] [-d <id>] [-w <worktree>]
   local gate="${1:-}"; [ $# -gt 0 ] && shift
-  case "$gate" in 1|2) ;; *) die "usage: fleet gate post <1|2> --slug S [--target T] [--summary …]" ;; esac
-  local slug="" target="" summary="" plan="" disp="-" wt=""
+  case "$gate" in 1|2|3) ;; *) die "usage: fleet gate post <1|2|3> [--park] --slug S [--target T] [--summary …]" ;; esac
+  local slug="" target="" summary="" plan="" disp="-" wt="" park=0
   while [ $# -gt 0 ]; do
     case "$1" in
+      --park)        park=1; shift ;;
       -w|--worktree) wt="$2"; shift 2 ;;
       --slug)        slug="$2"; shift 2 ;;
       --target)      target="$2"; shift 2 ;;
@@ -2598,8 +2891,13 @@ gate_post() { # post <1|2> --slug S [--target T] [--summary "…"] [--plan FILE]
     *)    reorient="$reorient
 ⟳ then cross-check .fleet/dispatch/$disp/meta.tsv role-phase against the _reports/$slug/ artifacts on disk BEFORE acting." ;;
   esac
+  # CASE-DISPATCHED on the gate, not if/else. Three arms now (the third is GATE 3,
+  # implement -> commit), and each arm owns its own preconditions: the gate-2
+  # zero-commit refusal below is scoped to action=merge and must not fire for a gate
+  # whose whole point is that the work is NOT yet committed.
   local sentinel title body
-  if [ "$gate" = 1 ]; then
+  case "$gate" in
+  1)
     sentinel="[FLEET-GATE:1 slug=$slug action=implement]"
     [ -n "$plan" ] || plan="_reports/$slug/PLAN-PLAIN.md"
     title="GATE 1 — plan ready: ${summary:-$slug}"
@@ -2609,7 +2907,29 @@ Plain plan: $plan
 In one paragraph: ${summary:-<see plan>}.
 ▸ POP this message to APPROVE and start test-first implementation.
 ▸ Or reply with changes to revise the plan (nothing is built yet)."
-  else
+    ;;
+  3)
+    # GATE 3 — implement -> commit. Numerically 3, CHRONOLOGICALLY SECOND. The number
+    # is deliberately not 2: renumbering would change the GATE 1 / GATE 2 sentinel
+    # strings that shipped, and those exact bytes are pinned by
+    # test/gate-unpark-pointer-proof.sh. A confusing ordinal is cheaper than a
+    # migration of every live ledger and proof.
+    #
+    # This does not INVENT a commit step — d31 already made committing a human duty
+    # (workers stage and stop). What it does is promote that duty from an ordinary
+    # stretch of pipeline into a PARKED gate, so reconcile leaves it alone and reap
+    # refuses it while the human still owes the commit.
+    [ -n "$plan" ] || plan="_reports/$slug/PLAN-PLAIN.md"
+    sentinel="[FLEET-GATE:3 slug=$slug action=commit]"
+    title="GATE 3 — $slug implemented: review the staged diff and commit"
+    body="$sentinel
+$reorient
+Review the diff: fleet diff-view${wt:+ $wt}
+The work is STAGED and deliberately NOT committed — agents do not commit (fleet autocommit).
+▸ APPROVE = \"the diff is right, commit it and carry on to testing\".
+▸ REJECT (with a reason) sends revision guidance back to the Implementation agent in the SAME worktree."
+    ;;
+  *)
     [ -n "$target" ] || target=$(cmd_integration_branch)
     # ZERO-COMMIT PRECONDITION. Popping a GATE 2 message is what makes the sub-orch
     # merge S -> T and push. With a no-commit worker the merge is a silent
@@ -2631,14 +2951,18 @@ In one paragraph: ${summary:-<see plan>}.
           printf '  Review them (fleet diff-view %s), commit them yourself (git -C %s commit), then re-post gate 2.\n' "$wt" "$wt" >&2
           # stderr reaches the SUB-ORCH, not the human — and the thing being waited
           # on is a human commit, so a refusal that only the machine can see stalls
-          # the dispatch in silence. Escalate it as a needs-human inbox message
-          # (sev blocked => desktop notify), same channel the gate itself uses.
-          inbox_put -d "$disp" --sev blocked \
-            -t "GATE 2 blocked — $slug has nothing committed" \
-            -m "The implementation is finished and STAGED, but nothing is committed, so merging $slug -> $target would ship nothing.
-Review it:  fleet diff-view $wt
-Commit it:  git -C $wt commit
-Then the sub-orch can re-post GATE 2. (Agents no longer commit — see 'fleet autocommit'.)" 2>/dev/null || true
+          # the dispatch in silence.
+          #
+          # PROMOTED TO GATE 3 (S4). This IS the implement -> commit decision point;
+          # it was just not represented as one. Refusing and escalating told the
+          # human, but marked nothing, so reconcile still read the dispatch as
+          # ordinary (dead pane => stranded => respawn, straight past the thing the
+          # human was in the middle of) and reap still read the worktree as ordinary.
+          # Posting gate 3 --park puts the same message on the same channel AND
+          # records it in the one place the machinery reads. The rc stays 3 so any
+          # existing caller branching on it is unaffected.
+          gate_post 3 --slug "$slug" --summary "${summary:-}" -d "$disp" -w "$wt" --park \
+            >/dev/null 2>&1 || true
           return 3
         fi
       fi
@@ -2653,21 +2977,97 @@ HOW THE TESTS PROVE IT: ${summary:-<see details>}.
 Review the diff before you pop${wt:+ (worktree: $wt)} — nothing merges until you do.
 ▸ POP this message = \"get it merged into $target\" — a SHIP worker merges; you push.
 ▸ Or run the manual steps, then pop to ship, or reply with what's broken to loop."
+    ;;
+  esac
+  gate_write_artifact "$disp" "$gate" "$body"
+  # POST + PARK AS ONE TRANSACTION, AND THE PARK IS FIRST. Two commands meant a
+  # window — however short — in which the gate message existed but the ledger did not
+  # say "parked", and in that window reap could take the worktree and reconcile could
+  # respawn the sub-orch past the gate. That is the July-19 bug and it was the
+  # REACHABLE half: the park ran last AND its failure was swallowed by `|| true`,
+  # while the comment here claimed the opposite of what its own code did.
+  #
+  # Parking first eliminates the partial state rather than reordering it: `gate_park`
+  # contains `die`s, so a park that cannot succeed aborts BEFORE any message exists.
+  # De-swallowing is the other half and neither is sufficient alone — with `|| true`
+  # still in place a silent park failure followed by a successful `inbox_put` reaches
+  # message-with-no-park by a new route.
+  #
+  # Park-with-no-message is the safe side, but not for the reason the old comment
+  # gave: `gate_write_artifact` above has already put GATE-<N>.md in the folder the
+  # sub-orch's nvim viewer shows, so the question is visible even with no message. The
+  # asymmetry is park-no-message = a visible, reap-guarded wedge a human can resolve;
+  # message-no-park = invisible, and reap eats the worktree.
+  if [ "$park" = 1 ]; then
+    case "$disp" in ""|-) ;; *) gate_park "$disp" "$gate" >/dev/null ;; esac
   fi
   inbox_put -d "$disp" --sev warn -t "$title" -m "$body"
+}
+
+# Put THE QUESTION where the human is already looking. The sub-orch window is
+# harness pane + nvim viewer rooted at `.fleet/dispatch/<id>/` — it holds the
+# EVIDENCE (the symlink farm) but the gate body went only to `.fleet/inbox/*.msg`,
+# outside that dir. So the window showed everything except the thing being asked.
+#
+# The artifact is a BARE BODY with the sentinel on line 1, byte-identical to what
+# goes in the inbox — deliberately the inbox's own bytes, so `gate_parse` (the sole
+# advance oracle) reads it with no second grammar, and so a decision made from the
+# file can never differ from one made from the message. The `From ` two-line form is
+# the INBOX's shape and is not reproduced here; that offset is a consequence of the
+# pop header, never a free allowance (see gate_parse).
+#
+# Last-wins, never append: a re-posted gate replaces the question, it does not stack
+# two of them in the pane. No -d ⇒ no dispatch dir ⇒ nothing to write into, and a
+# GATE file written somewhere invented would be a lie aimed at the reader least able
+# to catch it. Fail-silent: a gate must never fail to POST because a file did not land.
+gate_write_artifact() { # <dispatch-id|-> <gate-n> <body>
+  local disp="${1:-}" n="${2:-}" body="${3:-}"
+  case "$disp" in ""|-) return 0 ;; esac
+  case "$n" in 1|2|3) ;; *) return 0 ;; esac
+  local root; root=$(fleet_root 2>/dev/null) || return 0
+  local d="$root/.fleet/dispatch/$disp"; [ -d "$d" ] || return 0
+  printf '%s\n' "$body" > "$d/GATE-$n.md" 2>/dev/null || true
+  # A RE-POSTED GATE IS A NEW QUESTION, so it re-opens the decision. Without this the
+  # idempotency guard in gate_decide — which exists so a double-approve can never
+  # silently overwrite the first decision — would also make the SECOND lap of a
+  # reject loop undecidable: the human rejects, the sub-orch revises and re-posts,
+  # and every further decision is refused as "already decided". The attempt counter
+  # (rejects_g<N>) is deliberately NOT cleared: the lap count is the thing the cap
+  # is made of, and a pipeline must not be able to reset its own cap by re-posting.
+  if [ "$(meta_get "$d" decision_gate)" = "$n" ]; then
+    meta_set "$d" decision ""
+    meta_set "$d" decision_gate ""
+    meta_set "$d" decision_msg ""
+    meta_set "$d" delivered ""
+    # ...AND THE ARTIFACT, not only the keys. Leaving `decision-<N>.txt` on disk beside
+    # cleared keys is a split-brain that needs NO concurrency to reach, and its worst
+    # outcome is the silent one: a decision file that looks decided while
+    # `gate_deliver` bails at `[ -n "$dec" ]` forever — parked forever, unnoticed.
+    # Two files are not one transaction just because one of them is locked, so the
+    # only fix at this layer is to clear both in the block that already clears one.
+    rm -f "$d/decision-$n.txt" 2>/dev/null || true
+  fi
+  dispatch_farm "$disp" 2>/dev/null || true   # the evidence, refreshed at the same moment
+  return 0
 }
 
 # Mark a sub-orch's ledger as parked at a gate so `fleet reap` won't tear its
 # pipeline down before the human pops (the gate message would orphan). The sub-orch
 # calls this right after posting + verifying its gate message, then ends its turn.
-gate_park() { # park <dispatch-id> <1|2>
+gate_park() { # park <dispatch-id> <1|2|3>
   local id="${1:-}" gate="${2:-}"
-  case "$gate" in 1|2) ;; *) die "usage: fleet gate park <dispatch-id> <1|2>" ;; esac
-  [ -n "$id" ] || die "usage: fleet gate park <dispatch-id> <1|2>"
+  case "$gate" in 1|2|3) ;; *) die "usage: fleet gate park <dispatch-id> <1|2|3>" ;; esac
+  [ -n "$id" ] || die "usage: fleet gate park <dispatch-id> <1|2|3>"
   local r; r=$(fleet_root 2>/dev/null) || die "no project root"
   local d="$r/.fleet/dispatch/$id"
   [ -d "$d" ] || die "no such dispatch $id"
-  meta_set "$d" state "gate${gate}-wait"
+  # CHECKED, and this is the other half of B5's de-swallow: `gate_post` now stops
+  # swallowing a park failure, but that buys nothing if the park itself reports
+  # success after losing the one write that IS the park. A lost `state` write here
+  # would let gate_post go on to `inbox_put` — message-with-no-park, the invisible
+  # July-19 half, where reap eats the worktree.
+  meta_set "$d" state "gate${gate}-wait" \
+    || die "fleet gate park: cannot write state gate${gate}-wait to $d/meta.tsv — NOT parked"
   # AGE STAMP (audit/observability, S7). A parked entry and a WEDGED one look
   # identical in the ledger — both just sit at gate2-wait — so the dashboard has
   # nothing to distinguish "waiting on the human since 3 minutes ago" from
@@ -2693,12 +3093,548 @@ gate_record_pop() { # popped <msgfile>
   # Parse the BODY through the same oracle the sub-orch uses — never a private regex.
   parsed=$(inbox_body "$f" 2>/dev/null | gate_parse 2>/dev/null) || return 0
   n="${parsed#gate=}"; n="${n%% *}"
-  case "$n" in 1|2) ;; *) return 0 ;; esac
+  # 3 included: gate 3 is the gate this slice ADDED, and shipping it with no audit
+  # stamp ships it half-built. Still a closed enum, never a numeric range.
+  case "$n" in 1|2|3) ;; *) return 0 ;; esac
   local r; r=$(fleet_root 2>/dev/null) || return 0
   local d="$r/.fleet/dispatch/$disp"
   [ -d "$d" ] || return 0
   meta_set "$d" "gate${n}_popped" "$(date -Is 2>/dev/null || date)" 2>/dev/null || true
   return 0
+}
+
+# ---- the DECISION OBJECT (S1) -------------------------------------------------
+#
+# Until now a gate decision was not an object. Approval existed only as a human
+# popping a message into a pane — i.e. as tmux scrollback — and REJECTION had no
+# representation at all, so there was no routing, no attempt counter and no cap.
+# `fleet gate approve|reject` makes the decision a durable, inspectable artifact.
+#
+# THREE RULES THAT ARE LOAD-BEARING, each pinned by a proof case:
+#
+#  1. DECIDING DOES NOT UN-PARK. Un-parking belongs to the courier (`gate deliver`),
+#     and only on CONFIRMED landing. A decision that cleared the parked state on
+#     write would drop the reap guard and the reconcile exemption while the sub-orch
+#     has not yet heard anything — the precise shape of the gate-park bug, where a
+#     parked dispatch read as stranded, got respawned, and ran straight PAST the gate.
+#     Fails safe: undelivered ⇒ still parked ⇒ still guarded.
+#  2. THE DECISION FILE IS A BARE BODY, SENTINEL ON LINE 1. `gate_parse` stays the
+#     sole advance oracle and needs no change. The `From `-header two-line form is
+#     the INBOX's shape; reproducing it here would be treating a consequence of the
+#     pop header as a free allowance.
+#  3. REJECT IS NEVER REASONLESS. A rejection with no reason routes the pipeline
+#     backwards with nothing for the next agent to act on, which is how a loop
+#     becomes an infinite one. No reason ⇒ rc 2 ⇒ nothing written.
+#
+# NON-FAIL-SILENT, DELIBERATELY. Everywhere else in fleet, doubt means allow or skip.
+# Here an unresolvable target `die`s: a silent no-op is a human who believes they
+# approved something and walks away.
+
+# Resolve a decision target to a dispatch dir. Explicit `d<N>`, else an explicit
+# slug (matched against the ledger `window` suffix, which `dispatch rename` sets to
+# so-<id>-<slug>), else THE DISPATCH WHOSE SUB-ORCH WINDOW I AM IN — the ordinary
+# case, since the human decides at that window. Ambiguity is never guessed.
+gate_resolve_dir() { # [<id|slug>] -> prints dir, or dies
+  local want="${1:-}" root led d id wn
+  root=$(fleet_root 2>/dev/null) || die "fleet gate: not inside a fleet project"
+  led="$root/.fleet/dispatch"
+  [ -d "$led" ] || die "fleet gate: no dispatch ledger at $led"
+  if [ -n "$want" ]; then
+    case "$want" in
+      d[0-9]*) [ -d "$led/$want" ] || die "fleet gate: no such dispatch $want"
+               printf '%s\n' "$led/$want"; return 0 ;;
+    esac
+    for d in "$led"/d*/; do
+      [ -d "$d" ] || continue
+      wn=$(meta_get "$d" window)
+      case "$wn" in *"-$want") printf '%s\n' "${d%/}"; return 0 ;; esac
+    done
+    die "fleet gate: cannot resolve '$want' to a dispatch (no id, no slug match)"
+  fi
+  # No argument: infer from the window I am in. `dispatch rename` makes the name
+  # so-<id>-<slug>, so the id is the second field — prefix-tolerant, like
+  # suborch_pane_for.
+  wn=$(tmux display -p '#{window_name}' 2>/dev/null)
+  case "$wn" in
+    so-d[0-9]*) id=${wn#so-}; id=${id%%-*}
+                [ -d "$led/$id" ] && { printf '%s\n' "$led/$id"; return 0 ; } ;;
+  esac
+  # Last resort: exactly ONE dispatch is parked at a gate. More than one is genuinely
+  # ambiguous and must be named — guessing would approve the wrong pipeline.
+  local hits="" n=0
+  for d in "$led"/d*/; do
+    [ -d "$d" ] || continue
+    ledger_parked "$(meta_get "$d" state)" || continue
+    hits="${d%/}"; n=$((n+1))
+  done
+  [ "$n" = 1 ] && { printf '%s\n' "$hits"; return 0; }
+  die "fleet gate: no target given and $n dispatches are parked — name one (fleet gate list)"
+}
+
+# Which gate is being decided? Explicit --gate wins; else the parked state names it
+# (gate1-wait -> 1); else the highest GATE-<n>.md artifact present.
+gate_pending_n() { # <dir> [<explicit-n>]
+  local d="${1:-}" n="${2:-}"
+  case "$n" in 1|2|3) printf '%s\n' "$n"; return 0 ;; esac
+  local st; st=$(meta_get "$d" state)
+  case "$st" in gate1-wait) echo 1; return 0 ;; gate2-wait) echo 2; return 0 ;; gate3-wait) echo 3; return 0 ;; esac
+  local f
+  for n in 3 2 1; do [ -f "$d/GATE-$n.md" ] && { printf '%s\n' "$n"; return 0; }; done
+  return 1
+}
+
+gate_decide() { # <approve|reject> [<id|slug>] [--gate N] [-m reason] [--file F] [--yes]
+  local verb="${1:-}"; shift
+  local want="" gn="" reason="" rfile="" have_reason=0 assume_yes=0
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --yes|-y) assume_yes=1; shift ;;
+      --gate)   gn="$2"; shift 2 ;;
+      -m|--message) reason="$2"; have_reason=1; shift 2 ;;
+      --file)   rfile="$2"; shift 2 ;;
+      -*)       die "fleet gate $verb: unknown arg $1" ;;
+      *)        [ -n "$want" ] && die "fleet gate $verb: two targets given ($want, $1)"
+                want="$1"; shift ;;
+    esac
+  done
+  local d; d=$(gate_resolve_dir "$want") || return 1
+  local id; id=$(basename "$d")
+  local n; n=$(gate_pending_n "$d" "$gn") \
+    || die "fleet gate $verb: $id has no pending gate (no GATE-<n>.md, no gate<n>-wait state)"
+
+  # AN EXPLICIT --gate MUST AGREE WITH THE PARKED STATE. `gate_pending_n` lets an
+  # explicit N win outright, so `approve --gate 1` was accepted against a dispatch
+  # parked at gate 3: a decision recorded for a gate the human never saw, which the
+  # courier then faithfully delivers and un-parks on. Same unsafe-advance class as
+  # the courier's false confirm, so it dies rather than warns. Only checked when the
+  # ledger actually names a gate — an unparked dispatch decided from its artifacts is
+  # the ordinary headless case and stays allowed.
+  if [ -n "$gn" ]; then
+    local pst; pst=$(meta_get "$d" state)
+    case "$pst" in
+      gate1-wait|gate2-wait|gate3-wait)
+        local pn="${pst#gate}"; pn="${pn%-wait}"
+        [ "$gn" = "$pn" ] || die "fleet gate $verb: $id is parked at gate $pn, not gate $gn — refusing to decide a gate the human was never shown (drop --gate, or pass --gate $pn)" ;;
+    esac
+  fi
+
+  # Idempotent: a decided gate is not re-decidable. rc 0 — re-running a decision must
+  # never look like a failure, and must never silently overwrite the first one.
+  if [ "$(meta_get "$d" decision)" != "" ] && [ "$(meta_get "$d" decision_gate)" = "$n" ]; then
+    printf 'fleet gate %s: %s gate %s was already decided (%s) at %s — no change.\n' \
+      "$verb" "$id" "$n" "$(meta_get "$d" decision)" "$(meta_get "$d" decided_at)" >&2
+    return 0
+  fi
+
+  # The question. Approve reproduces ITS OWN sentinel verbatim rather than
+  # re-deriving one: the artifact the human read and the instruction the sub-orch
+  # acts on are then the same bytes by construction, not by two code paths agreeing.
+  local q="$d/GATE-$n.md" qline=""
+  [ -f "$q" ] && qline=$(sed -n 1p "$q" 2>/dev/null)
+  case "$qline" in \[FLEET-GATE:*\]*) ;; *) qline="" ;; esac
+  [ -n "$qline" ] || die "fleet gate $verb: $id has no readable GATE-$n.md sentinel to decide on"
+  local inner="${qline#\[FLEET-GATE:}"; inner="${inner%%\]*}"
+  local slug="" kv
+  for kv in $inner; do case "$kv" in slug=*) slug="${kv#slug=}" ;; esac; done
+
+  local sentinel="" note=""
+  if [ "$verb" = approve ]; then
+    sentinel="$qline"
+    # ---- GATE 2 ONLY: show the merge preview and make the human type the slug ----
+    # Gate 2 is the approval that actually moves code, so it is the one gate where a
+    # pop-shaped reflex is not enough. Gates 1 and 3 are deliberately untouched.
+    #
+    # NO TTY AND NO --yes IS A REFUSAL, NOT A SKIP. A tty-GATED prompt that proceeds
+    # when there is no terminal makes the promise a lie in exactly the case that
+    # matters, and is indistinguishable from never having built it. `--yes` is the
+    # explicit, auditable escape hatch for scripts; the absence of a terminal is not
+    # consent. This costs the courier nothing: the courier never calls gate_decide,
+    # it delivers a decision that was already recorded.
+    if [ "$n" = 2 ] && [ "$assume_yes" != 1 ]; then
+      # A sentinel with no `slug=` would leave the expected answer EMPTY, so a bare
+      # Enter would approve the merge — the confirmation inverted into a rubber stamp.
+      [ -n "$slug" ] || die "fleet gate approve: gate 2 on $id has no slug in its sentinel — refusing to confirm a merge with nothing to type back"
+      if [ -t 0 ] && [ -t 1 ]; then
+        printf '── %s  GATE 2 — approving this MERGES %s\n\n' "$id" "${slug:-?}"
+        [ -f "$q" ] && cat "$q"
+        # Best-effort preview, and best-effort is load-bearing: a worktree that has
+        # gone away must not block the approval path — print what we can and still ask.
+        local wt; wt=$(gate_worktree_for_slug "$slug" 2>/dev/null)
+        if [ -n "$wt" ] && [ -d "$wt" ]; then
+          local tgt; tgt=$(cmd_integration_branch 2>/dev/null); tgt="${tgt:-main}"
+          printf '\n── diff vs %s\n' "$tgt"
+          # The rc of a pipeline is the LAST command's, so `git … | tail || fallback`
+          # can never reach the fallback. Capture, then branch on the text.
+          local dstat; dstat=$(git -C "$wt" diff --stat "$tgt"...HEAD 2>/dev/null | tail -25)
+          if [ -n "$dstat" ]; then printf '%s\n' "$dstat"
+          else printf '  (no diff available — worktree %s)\n' "$wt"; fi
+        else
+          printf '\n  (no worktree resolved for %s — preview unavailable)\n' "${slug:-?}"
+        fi
+        local typed=""
+        printf '\nType the slug to confirm the merge (anything else aborts): '
+        read -r typed </dev/tty 2>/dev/null || typed=""
+        if [ "$typed" != "$slug" ]; then
+          printf 'fleet gate approve: slug mismatch (got "%s", expected "%s") — ABORTED, nothing written.\n' \
+            "$typed" "$slug" >&2
+          return 2
+        fi
+      else
+        printf 'fleet gate approve: gate 2 MERGES %s — it requires typing the slug back on a terminal.\n' "${slug:-?}" >&2
+        printf '  No tty here. Re-run interactively, or pass --yes to approve deliberately from a script.\n' >&2
+        return 2
+      fi
+    fi
+  else
+    # ---- reject: reason first, and nothing is written without one ----
+    # `#` lines are stripped on BOTH reason paths — the viewer's :FleetReject buffer
+    # and the $EDITOR path seed the same comment header, and a reason that is only
+    # the instructions must count as empty, not as guidance.
+    if [ -n "$rfile" ] && [ -f "$rfile" ]; then reason=$(grep -v '^#' "$rfile" 2>/dev/null); have_reason=1; fi
+    if [ "$have_reason" = 0 ]; then
+      if [ -t 0 ] && [ -t 1 ] && [ -n "${EDITOR:-}" ]; then
+        local tmp="$d/.reason.$$"
+        printf '# Why is this rejected? Lines starting with # are ignored.\n# An empty reason ABORTS — a rejection with no reason routes the pipeline\n# backwards with nothing for the next agent to act on.\n' > "$tmp" 2>/dev/null
+        "$EDITOR" "$tmp" </dev/tty >/dev/tty 2>&1 || true
+        reason=$(grep -v '^#' "$tmp" 2>/dev/null); rm -f "$tmp" 2>/dev/null
+      else
+        printf 'fleet gate reject: a reason is REQUIRED (-m "…", --file F, or $EDITOR on a tty).\n' >&2
+        printf '  Rejecting with no reason routes the pipeline back a rung with nothing to act on.\n' >&2
+        return 2
+      fi
+    fi
+    reason=$(printf '%s' "$reason" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
+    if [ -z "$reason" ]; then
+      printf 'fleet gate reject: empty reason — ABORTED, nothing written.\n' >&2
+      return 2
+    fi
+    # Cap the loop. Three rejections of the same gate is not a pipeline converging;
+    # it is a human and a model failing to understand each other, and the next lap
+    # will not fix that. Escalate to a person instead of spending another one.
+    local r; r=$(meta_get "$d" "rejects_g$n"); r=${r:-0}
+    case "$r" in ''|*[!0-9]*) r=0 ;; esac
+    r=$((r+1))
+    if [ "$r" -gt 3 ]; then
+      meta_set "$d" state blocked
+      inbox_put --from - --sev blocked -d "$id" \
+        -t "gate $n on $id rejected $((r-1))x — escalating" \
+        -m "GATE $n of $id (${slug:-?}) has now been rejected $((r-1)) times. The loop is capped:
+fleet will not route another revision automatically.
+Latest reason: $reason
+▸ Decide it by hand, or close the ledger with \`fleet dispatch fail $id\`." >/dev/null 2>&1 || true
+      append_dashboard_alert "gate: $id rejected $((r-1))x at gate $n — capped, escalated" 2>/dev/null || true
+      printf 'fleet gate reject: %s has hit the 3-rejection cap at gate %s — escalated, not routed.\n' "$id" "$n" >&2
+      return 4
+    fi
+    meta_set "$d" "rejects_g$n" "$r"
+    # attempt = the lap the next agent is starting: first rejection begins attempt 2.
+    sentinel="[FLEET-GATE:$n slug=$slug action=revise attempt=$((r+1))]"
+    # Route back exactly ONE rung. `bin/fleet` never parses role-phase (it is written
+    # and read by the models), so this is a cursor for the sub-orch, not a dispatch
+    # table — which is exactly why it must be written from one place rather than
+    # inferred by prose at three.
+    case "$n" in
+      1) meta_set "$d" role-phase plan ;;
+      2) # A gate-2 rejection means "do not ship". After the SHIP worker has merged
+         # there is nothing to withhold, and pretending otherwise would send an agent
+         # to un-merge. The terminal ledger state is the honest signal that the ship
+         # path ran; refuse, and point at the verb that actually reverses a merge.
+         ledger_terminal "$(meta_get "$d" state)" && {
+           printf 'fleet gate reject: %s already concluded (%s) — gate 2 reject is PRE-MERGE only.\n' \
+             "$id" "$(meta_get "$d" state)" >&2
+           printf '  A merge is reversed with git revert, not by rejecting a gate.\n' >&2
+           return 5; }
+         meta_set "$d" role-phase test ;;
+      3) meta_set "$d" role-phase impl ;;
+    esac
+    local rf="$d/reason-g$n-$r.txt"
+    printf '%s\n' "$reason" > "$rf" 2>/dev/null || true
+    note="$rf"
+  fi
+
+  printf '%s\n' "$sentinel" > "$d/decision-$n.txt" 2>/dev/null \
+    || die "fleet gate $verb: cannot write $d/decision-$n.txt"
+  # THE TWO KEYS THAT MAKE THE DECISION REAL — checked, unlike the ~30 telemetry
+  # call sites, which stay fail-soft on purpose (making meta_set globally fatal turns
+  # a full disk into a fleet-wide outage). Without a real status here a broken or
+  # contended ledger left `fleet gate approve` reporting SUCCESS with nothing
+  # recorded: silent failure in the one verb deliberately built to die loudly, and a
+  # human who believes they approved and walks away.
+  # The ARTIFACT is removed on the way out, not left behind: the file is written
+  # above, so dying here would produce decision-<N>.txt with no ledger key — the same
+  # split-brain B-6 closes, created by the very branch that reports "NOT decided".
+  meta_set "$d" decision "$verb" \
+    || { rm -f "$d/decision-$n.txt" 2>/dev/null
+         die "fleet gate $verb: cannot record the decision in $d/meta.tsv — NOT decided (the ledger is unwritable or locked)"; }
+  meta_set "$d" decision_gate "$n" \
+    || { rm -f "$d/decision-$n.txt" 2>/dev/null; meta_set "$d" decision "" 2>/dev/null
+         die "fleet gate $verb: cannot record decision_gate in $d/meta.tsv — NOT decided"; }
+  meta_set "$d" decided_at "$(date -Is 2>/dev/null || date)"
+  # WHO decided. Same-uid world, so this is an audit fact and never an authorisation
+  # — identical status to parked_at / gate<N>_popped.
+  meta_set "$d" decided_by "$(tmux display -p '#{window_name}' 2>/dev/null || echo "${USER:--}")"
+  [ -n "$note" ] && meta_set "$d" decision_msg "$note"
+  dispatch_farm "$id" 2>/dev/null || true
+  printf '%s %s gate %s — %s\n' "${verb}d" "$id" "$n" "$sentinel"
+  printf '  (still parked: the courier delivers it and un-parks only once the sub-orch has it)\n'
+  return 0
+}
+
+# `fleet gate show [<id|slug>]` — the pending question, and any decision on it.
+gate_show() {
+  local d; d=$(gate_resolve_dir "${1:-}") || return 1
+  local id n; id=$(basename "$d"); n=$(gate_pending_n "$d") \
+    || die "fleet gate show: $id has no gate"
+  printf '── %s  gate %s  state=%s\n' "$id" "$n" "$(meta_get "$d" state)"
+  [ -f "$d/GATE-$n.md" ] && cat "$d/GATE-$n.md"
+  local dec; dec=$(meta_get "$d" decision)
+  if [ -n "$dec" ]; then
+    printf '\n── decided: %s at %s by %s%s\n' "$dec" "$(meta_get "$d" decided_at)" \
+      "$(meta_get "$d" decided_by)" \
+      "$( [ -n "$(meta_get "$d" decision_msg)" ] && printf ' (%s)' "$(meta_get "$d" decision_msg)")"
+    printf '   delivered: %s\n' "$( [ "$(meta_get "$d" delivered)" = 1 ] && echo yes || echo 'not yet' )"
+  else
+    printf '\n── undecided — fleet gate approve %s | fleet gate reject %s -m "…"\n' "$id" "$id"
+  fi
+}
+
+# ---- THE COURIER (S2) ---------------------------------------------------------
+#
+# `ledger_parked` enumerates the gate<N>-wait states and NOTHING EVER CLEARED THEM.
+# `parked_at` and `gate<N>_popped` are audit facts and say so in their own comments.
+# A dispatch that reached a gate therefore stayed parked forever — reconcile-exempt
+# and reap-refused by design, with no writer able to say "the human answered". The
+# courier is that writer, and it is the ONLY one.
+#
+# UN-PARK ONLY ON CONFIRMED LANDING. Not on decision (S1 deliberately does not
+# un-park), not on paste, not on the pane looking busy. Because:
+#
+#   `wake_confirmed` infers landing from the pane going `working`, AND A HUMAN
+#   TYPING IN THAT PANE PRODUCES EXACTLY THE SAME SIGNAL.
+#
+# Accepting it would mean a human who happened to be mid-prompt when the sweep fired
+# un-parks a dispatch that received nothing — dropping the reap guard and the
+# reconcile exemption on live gated work, which is the gate-park bug wearing a new
+# hat. So confirmation is CONJUNCTIVE: the agent went `working` AND the courier's own
+# sentinel APPEARED — a delta against a baseline sampled before the paste, never the
+# mere presence of the sentinel, which the sub-orch's own `gate post` already put on
+# that screen. See `gate_landed`. Undelivered ⇒ still parked ⇒ still guarded.
+# Every failure mode here fails towards "still parked", which is the safe direction.
+gate_deliver() { # deliver <id>
+  local id="${1:-}"; [ -n "$id" ] || die "usage: fleet gate deliver <dispatch-id>"
+  local root; root=$(fleet_root 2>/dev/null) || return 1
+  local d="$root/.fleet/dispatch/$id"; [ -d "$d" ] || return 1
+  # ONE COURIER PER DISPATCH. fleetd `Popen`s a fresh `fleet gate deliver` every 2s
+  # with NO in-flight dedup, while this function blocks >=6s inside `gate_landed` —
+  # so couriers overlap on EVERY delivery whose confirm window exceeds the tick, i.e.
+  # all of them. That is also what makes the `delivered` read below a TOCTOU (read
+  # here, written after the paste) and `deliver_attempts` a caller-level RMW. One
+  # lock closes all three. `-n`, never `-w`: a second courier arriving mid-delivery
+  # must GO HOME, not queue behind a 6s confirm and then paste a second time —
+  # fleetd calls again in 2s. A double delivery double-spawns SHIP workers at gate 2
+  # and its decoupled Enter can submit a human's half-written draft.
+  # THE THREE OUTCOMES MUST NOT COLLAPSE INTO ONE. `exec … || true` + `flock -n 9
+  # 2>/dev/null || return 0` reads real contention, a failed `exec` (unwritable dir ⇒
+  # bad fd) and `flock` NOT INSTALLED (rc 127) as the same silent success — and in the
+  # last two the courier would return 0 on every 2s tick forever, never stamping
+  # `delivered`: a recorded decision parked forever, exactly the class this round closes.
+  # So: a bad fd is a real failure (deferred, retried, escalated like any other), and a
+  # missing flock degrades to UNLOCKED delivery rather than to no delivery — fleet's
+  # fail-silent rule, and the pre-existing behaviour.
+  exec 9>>"$d/.deliver.lock" 2>/dev/null || { gate_deliver_defer "$d" 0 "$(date +%s 2>/dev/null)"; return 1; }
+  if command -v flock >/dev/null 2>&1; then
+    flock -n 9 || return 0                                # another courier owns this
+  fi
+  [ "$(meta_get "$d" delivered)" = 1 ] && return 0        # idempotent
+  local dec n; dec=$(meta_get "$d" decision); n=$(meta_get "$d" decision_gate)
+  [ -n "$dec" ] || return 1
+  case "$n" in 1|2|3) ;; *) return 1 ;; esac
+  local f="$d/decision-$n.txt"; [ -f "$f" ] || return 1
+  # BACKOFF. This runs on fleetd's 2s cadence, so a permanently-undeliverable
+  # decision would otherwise re-attempt every 2s forever: capture-pane and
+  # send-keys on every tick, for as long as the sub-orch is gone. Exponential,
+  # capped, and checked BEFORE any tmux call.
+  local now att after; now=$(date +%s 2>/dev/null)
+  att=$(meta_get "$d" deliver_attempts); case "$att" in ''|*[!0-9]*) att=0 ;; esac
+  after=$(meta_get "$d" deliver_after);  case "$after" in ''|*[!0-9]*) after=0 ;; esac
+  [ "$now" -lt "$after" ] && return 1
+  local wn; wn=$(meta_get "$d" window); [ -n "$wn" ] || wn="so-$id"
+  local pane; pane=$(suborch_pane_for "$wn" 2>/dev/null)   # filters @fleet_viewer
+  if [ -z "$pane" ]; then
+    gate_deliver_defer "$d" "$att" "$now"
+    # A parked dispatch whose sub-orch is GONE can never be answered by anyone: the
+    # decision is written and there is nothing left to give it to. Same shape as the
+    # reconcile orphan — surfaced ONCE, durably, never respawned.
+    [ "$att" -ge 3 ] && gate_orphan_escalate "$id" "$d" "$wn" "$(meta_get "$d" state)" 2>/dev/null || true
+    return 1
+  fi
+  # NEVER SPLICE INTO A HALF-TYPED PROMPT. The never-clobber guarantee is the whole
+  # reason `fleet send main` exists; a courier that pastes over a human's draft would
+  # reintroduce it on the one pane where the human is most likely to be typing.
+  # Deferring costs 2 seconds; clobbering costs the prompt.
+  case "$(orch_input_state "$pane" 2>/dev/null)" in
+    draft|generating|modal) gate_deliver_defer "$d" "$att" "$now"; return 1 ;;
+  esac
+  local sentinel; sentinel=$(sed -n 1p "$f" 2>/dev/null)
+  [ -n "$sentinel" ] || { gate_deliver_defer "$d" "$att" "$now"; return 1; }
+  local text; text="$(cat "$f" 2>/dev/null; printf x)"; text="${text%x}"
+  # PRE-SEND BASELINE. Sampled BEFORE the paste, with the same capture the
+  # confirmation uses, so the two are comparable. Without it the sentinel half of
+  # the conjunction is an ABSOLUTE test, and the sub-orch ran `gate post` in this
+  # very pane — so its own sentinel is already in the scrollback and the test is
+  # true before we send a byte. Measured 20/20 false confirm.
+  local base; base=$(gate_sentinel_count "$pane" "$sentinel")
+  tmux set-buffer -b fleet-gate-deliver -- "$text" 2>/dev/null \
+    && tmux paste-buffer -t "$pane" -b fleet-gate-deliver -p -d 2>/dev/null \
+    || { gate_deliver_defer "$d" "$att" "$now"; return 1; }
+  # Same decoupled submit as inbox_paste_to: an Enter in the same flush races the
+  # bracketed-paste block and is swallowed, so the message lands and never submits.
+  tmux run-shell -b -d "${FLEET_POP_SUBMIT_DELAY:-0.4}" "tmux send-keys -t $pane Enter" 2>/dev/null || true
+  if gate_landed "$pane" "$sentinel" "$base"; then
+    # THE UN-PARK, AND IT IS WRITTEN FIRST. `running` is deliberately a plain
+    # non-terminal, non-parked state: the sub-orch is working again, so reconcile
+    # SHOULD revive it if its pane dies and reap should treat it as ordinary live work.
+    #
+    # ORDER IS THE SAFETY, and it used to be the reverse. With `delivered 1` first, a
+    # failed `state running` write left the dispatch delivered=1 + gate1-wait — and in
+    # that state this function short-circuits at the idempotency check and fleetd skips
+    # it, so THE ONLY WRITER THAT COULD EVER UN-PARK IT HAS PERMANENTLY RETIRED.
+    # Terminal, silent, and in the unsafe direction. Written this way round, a tear
+    # anywhere leaves the dispatch parked and undelivered — i.e. retryable. The write
+    # is CHECKED, not telemetry: on failure un-stamp and defer.
+    meta_set "$d" state running || { gate_deliver_defer "$d" "$att" "$now"; return 1; }
+    meta_set "$d" delivered_at "$(date -Is 2>/dev/null || date)"
+    meta_set "$d" deliver_attempts 0
+    meta_set "$d" deliver_after 0
+    meta_set "$d" gate_orphan ""     # it is alive and has been answered
+    # `delivered` LAST, and CHECKED — it is the loop terminator, so between the
+    # un-park above and this write the dispatch is un-parked AND undelivered: every
+    # reap/reconcile guard is off while fleetd re-Popens the courier every 2s and
+    # re-pastes the same approval. Losing this write silently is therefore not the
+    # safe direction either; roll the un-park back and let the next tick retry.
+    meta_set "$d" delivered 1 || {
+      meta_set "$d" state "gate${n}-wait" 2>/dev/null
+      gate_deliver_defer "$d" "$att" "$now"; return 1; }
+    printf 'delivered %s gate %s to %s\n' "$id" "$n" "$wn"
+    return 0
+  fi
+  gate_deliver_defer "$d" "$att" "$now"
+  return 1
+}
+
+# One place for "that did not land": bump the attempt count and push the next
+# attempt out. 5s, 10s, 20s … capped at 60 — long enough that a dead sub-orch costs
+# one tmux probe a minute, short enough that a busy human is not kept waiting.
+gate_deliver_defer() { # <dir> <attempts> <now>
+  local d="$1" att="$2" now="$3" back
+  att=$((att+1))
+  back=$(( 5 * (1 << (att < 4 ? att - 1 : 3)) )); [ "$back" -gt 60 ] && back=60
+  meta_set "$d" deliver_attempts "$att"
+  meta_set "$d" deliver_after "$((now + back))"
+  return 0
+}
+
+# How many lines of the pane's CURRENT capture carry the sentinel. Line count, not
+# occurrence count — deliberately: it is the number that has to be comparable across
+# two calls, and `grep -c` is stable where an occurrence count would depend on how
+# the terminal wrapped the line. `-F`/`--` because the sentinel is data.
+#
+# `-J` IS LOAD-BEARING, and it is a LIVENESS fix, not cosmetics. capture-pane returns
+# the pane AS DRAWN, so on a pane narrower than the ~66-char sentinel the marker is
+# split across two physical lines and `grep -cF` finds 0 — measured 0 vs 1 on a
+# 34-col pane, and sub-orch splits are routinely under 60 columns. A GENUINE landing
+# then false-negatives: `delivered` is never stamped and the courier re-pastes and
+# re-submits the same approval every backoff tick. At gate 2 that double-spawns SHIP
+# workers, and the second delivery's decoupled Enter fires against whatever is in the
+# pane — a human's half-written draft included. `-J` joins wrapped lines while
+# PRESERVING line structure, so `grep -c` stays the right primitive and the note
+# above still holds. The capture is deliberately NOT widened with `-S`: under a delta
+# test widening is harmless but buys only monotonicity against an unmeasured redraw
+# path, and it enlarges the window in which a PREVIOUS gate's identical sentinel sits.
+gate_sentinel_count() { # <pane> <sentinel>
+  local n
+  n=$(tmux capture-pane -p -J -t "$1" 2>/dev/null | grep -cF -- "$2" 2>/dev/null) || n=0
+  case "$n" in ''|*[!0-9]*) n=0 ;; esac
+  printf '%s' "$n"
+}
+
+# CONFIRMED LANDING = the agent went `working` AND our own sentinel APPEARED.
+# The conjunction is the point; either half alone is a false positive:
+#   * `working` alone is produced by a human typing (see the header comment);
+#   * the sentinel alone can be stale scrollback from a previous delivery.
+#
+# APPEARED, not "is present". The sentinel half must be a DELTA against a baseline
+# sampled before the paste, or it is not a second signal at all: the sub-orch posted
+# this very gate from this very pane, so the sentinel is already on screen and the
+# absolute test is true before we send anything. With a `working` pane — a human
+# typing, or any live turn — the conjunction then confirms a delivery that never
+# happened and UN-PARKS: the reap guard and the reconcile exemption drop while the
+# human has decided nothing. That is the gate-park bug wearing a third hat, and it
+# was measured 20/20 against the absolute form.
+#
+# Fails towards "still parked" in every ambiguous case, including a capture that
+# cannot be read (count 0 ⇒ never exceeds a 0 baseline ⇒ no confirm ⇒ deliver_defer
+# retries). A false negative costs one 5s backoff lap; a false positive costs the gate.
+gate_landed() { # <pane> <sentinel> <baseline-count>
+  local pane="$1" sentinel="$2" base="${3:-0}" waited=0 st
+  case "$base" in ''|*[!0-9]*) base=0 ;; esac
+  while :; do
+    st=$(tmux show -wqv -t "$pane" @agent_state 2>/dev/null)
+    [ "$st" = working ] && [ "$(gate_sentinel_count "$pane" "$sentinel")" -gt "$base" ] && return 0
+    [ "$waited" -lt "${FLEET_WAKE_CONFIRM:-6}" ] || return 1
+    sleep 1; waited=$((waited+1))
+  done
+}
+
+# `fleet gate deck` — the leader-menu (prefix+F, `g`) surface. A POPUP, deliberately:
+# a third pane in a sub-orch window permanently disables the viewer's self-heal.
+#
+# It adds NO authority and no second decision path — every key funnels into the same
+# `gate_decide` the CLI and the viewer's Ex commands call. Three surfaces, one verb;
+# that is the whole design, and it is why approving with amendments (just talking to
+# the harness pane) costs zero code and no popup can offer it.
+gate_deck() {
+  local d id n
+  if ! d=$(gate_resolve_dir "${1:-}" 2>/dev/null); then
+    printf 'No gate is waiting on you.\n\n'
+    gate_list 2>/dev/null | sed 's/^/  /'
+    printf '\nPress any key to close.'; read -r -n 1 _k </dev/tty 2>/dev/null || true
+    return 0
+  fi
+  id=$(basename "$d"); n=$(gate_pending_n "$d") || n="?"
+  gate_show "$id" 2>/dev/null | head -40
+  printf '\n──\n[a] approve   [r] reject (asks for a reason)   [j] jump to the sub-orch   [q] close\n> '
+  local k=""; read -r -n 1 k </dev/tty 2>/dev/null || return 0
+  printf '\n'
+  case "$k" in
+    a) gate_decide approve "$id" ;;
+    r) local reason=""
+       printf 'Reason (empty aborts — reject is never reasonless): '
+       read -r reason </dev/tty 2>/dev/null || true
+       [ -n "$reason" ] || { printf 'aborted — nothing written.\n'; return 0; }
+       gate_decide reject "$id" -m "$reason" ;;
+    j) local wn; wn=$(meta_get "$d" window)
+       [ -n "$wn" ] && tmux select-window -t "$wn" 2>/dev/null || true ;;
+    *) return 0 ;;
+  esac
+  printf '\nPress any key to close.'; read -r -n 1 _k </dev/tty 2>/dev/null || true
+  return 0
+}
+
+# `fleet gate list` — every dispatch parked at a gate, with age and decision state.
+gate_list() {
+  local root led d id st pa now age dec
+  root=$(fleet_root 2>/dev/null) || die "fleet gate list: not inside a fleet project"
+  led="$root/.fleet/dispatch"; [ -d "$led" ] || return 0
+  now=$(date +%s 2>/dev/null)
+  for d in "$led"/d*/; do
+    [ -d "$d" ] || continue
+    st=$(meta_get "$d" state); ledger_parked "$st" || continue
+    id=$(basename "$d"); pa=$(meta_get "$d" parked_at); dec=$(meta_get "$d" decision)
+    age="-"
+    case "$pa" in ''|*[!0-9]*) ;; *) age=$(fmt_age $(( now - pa )) 2>/dev/null) ;; esac
+    printf '%s\t%s\t%s\t%s\t%s\n' "$id" "$st" "$age" "${dec:-undecided}" "$(meta_get "$d" window)"
+  done
 }
 
 # ---- ledger state classification (THE single source) --------------------------
@@ -2712,7 +3648,22 @@ gate_record_pop() { # popped <msgfile>
 #              parked dispatch whose pane died must be SURFACED, not silently dropped.
 # parked != terminal != stranded.
 ledger_terminal() { case "${1:-}" in done|failed|cancelled) return 0 ;; *) return 1 ;; esac; }
-ledger_parked()   { case "${1:-}" in gate1-wait|gate2-wait) return 0 ;; *) return 1 ;; esac; }
+# gate3-wait is APPENDED, never substituted. This is the single classification site,
+# which is why one edit here fixes reconcile, reap and the orphan escalation together
+# — the three consumers that previously hand-rolled this predicate and diverged.
+# `blocked` (the 3-rejection cap) is PARKED, not terminal and not stranded. It is the
+# same fact as a gate<N>-wait — halted on purpose, waiting for a human — reached by a
+# different road, and every consumer of this predicate wants it treated identically:
+# reap must skip it, reconcile must never revive it (a fresh sub-orch reads the
+# instruction and runs straight past the cap that stopped it), `gate list` must show it,
+# and a dead pane under it must escalate rather than vanish. Left unclassified it was
+# neither — measured: `gate waiting` empty (reap guard LOST), `gate list` empty, and
+# reconcile flipping `blocked` → `failed`, i.e. the slice's own new writer of `state`
+# reintroducing exactly the class this slice exists to close.
+#
+# NOT terminal: nothing concluded. The human can still decide it by hand, and
+# `suborch_ledger_active` (which shares only the TERMINAL set) must keep nudging.
+ledger_parked()   { case "${1:-}" in gate1-wait|gate2-wait|gate3-wait|blocked) return 0 ;; *) return 1 ;; esac; }
 
 # List the sub-orch window names (so-<id>) currently parked at a gate. `fleet reap`
 # consults this set and skips any matching worktree/window (unless --force).
@@ -2759,6 +3710,22 @@ halted until you act.
 # `fleet reconcile` — one-shot sweep: re-animate stranded dispatches (unfinished
 # state + dead sub-orch window). Idempotent: resolve_or_spawn is a no-op when the
 # sub-orch is live. Invoked explicitly, opportunistically by the hook, or on a timer.
+# Does any pane of a sub-orch's window carry the @fleet_human declaration? Scoped
+# to the project session and its parked sibling, prefix-tolerant on the window name
+# (`dispatch rename` appends -<slug>), exactly like suborch_pane_for. Fail-silent:
+# no tmux, no answer, rc 1 — "I could not tell" must never mean "a human is here",
+# or a wedged tmux would freeze every dispatch in the project.
+suborch_human_present() { # <sess> <wname>
+  local sess="${1:-}" wn="${2:-}" s w h
+  [ -n "$wn" ] || return 1
+  while IFS=$'\t' read -r s w h; do
+    [ "$h" = 1 ] || continue
+    { [ "$s" = "$sess" ] || [ "$s" = "${sess}_hidden" ]; } || continue
+    case "$w" in "$wn"|"$wn"-*) return 0 ;; esac
+  done < <(tmux list-panes -a -F $'#{session_name}\t#{window_name}\t#{@fleet_human}' 2>/dev/null)
+  return 1
+}
+
 cmd_reconcile() {
   local sess root led d id state
   sess=$(session_name) || return 0
@@ -2804,6 +3771,14 @@ cmd_reconcile() {
       fi
       continue
     fi
+    # HUMAN PRESENT (S6) — never revive over them, never mark their work failed.
+    # `suborch_live` asks "is the foreground process a harness?", so a human who
+    # exited claude and is hand-driving the sub-orch window reads as DEAD. Reconcile
+    # would then either respawn a fresh sub-orch on top of them (which re-reads the
+    # instruction and redoes work the human already did by hand) or, at the respawn
+    # ceiling, mark the dispatch `failed` while a person is actively finishing it.
+    # A declared human means: leave this dispatch entirely alone.
+    if suborch_human_present "$sess" "$wn"; then continue; fi
     if ! suborch_live "$d" "$sess" "$wn"; then
       local n; n=$(meta_get "$d" respawns); case "$n" in ''|*[!0-9]*) n=0 ;; esac
       # tmux-responsiveness gate, shared by every abandon arm below: if tmux is wedged
@@ -4245,6 +5220,30 @@ cmd_reap() { # reap [<target>] [--force] — remove worktrees flagged ready
       echo "skip   $lbl: integration branch ($_prot) — never reaped, not even with --force"
       continue
     fi
+    # HUMAN PRESENCE (S6) — and NOT overridable by --force, deliberately.
+    #
+    # Every guard here keys on @agent_state, i.e. on fleetd's mirror of an AGENT's
+    # hook reports. A HUMAN sitting in a worktree with claude exited reports
+    # nothing at all, so to all of them the worktree reads as abandoned: reap kills
+    # their window and deletes the tree they are working in. `fleet human on` is
+    # the missing signal — a PANE option, never a 10th TSV column (three readers
+    # parse that TSV positionally as exactly 9 fields and all three fail silently
+    # wrong on a 10th).
+    #
+    # `--force` means "discard THIS item's dirty/unmerged state". It has never
+    # meant "delete the tree a person is typing in", and the escape hatch is one
+    # word (`fleet human off`) rather than a flag whose whole purpose elsewhere is
+    # to skip guards. Same reasoning as the integration-branch guard.
+    local _hp="" _gp="" _gpath="" _ghum=""
+    while IFS=$'\t' read -r _gp _gpath _ghum; do
+      [ "$_ghum" = 1 ] || continue
+      [ "$(realpath "$_gpath" 2>/dev/null || echo "$_gpath")" = "$(realpath "$dir" 2>/dev/null || echo "$dir")" ] || continue
+      _hp="$_gp"; break
+    done < <(tmux list-panes -a -F '#{pane_id}'$'\t''#{pane_current_path}'$'\t''#{@fleet_human}' 2>/dev/null)
+    if [ -n "$_hp" ]; then
+      echo "skip   $lbl: a human is present in this worktree (pane $_hp) — not even with --force; run 'fleet human off' when you are done"
+      continue
+    fi
     local gd; gd=$(git -C "$dir" rev-parse --git-dir 2>/dev/null)
     case "$gd" in *"/worktrees/"*) ;; *) echo "skip   $lbl: not a linked worktree"; continue ;; esac
     if [ "$force" != 1 ]; then
@@ -5249,6 +6248,7 @@ orch-jump|m|Agents|Orchestrator|Jump to the main window's orchestrator pane
 popmsg|p|Agents|Pop oldest message|Pop the oldest queued worker message into the orchestrator
 unpop|u|Agents|Unpop last message|Re-paste the most-recently-popped message back into the orchestrator (recover a lost pop)
 triage|t|Agents|Triage messages|Open the cross-agent message triage view (mark several, pop the set)
+gate|g|Agents|Gate deck|Approve / reject the gates waiting on you (defaults to the dispatch you are in)
 main|M|Agents|Rebuild command center|Re-tile the main window
 save|s|Session|Save project|Save this session as a reusable project alias (fleet up <name>)
 sessions|o|Session|Fleet sessions|Switch between open fleet sessions
@@ -5280,6 +6280,10 @@ action_tmux_command() { # tmux command string run when an action's key is presse
     reap)  echo "display-menu -b rounded -T '#[align=centre]Reap every worktree flagged ready?' -x C -y C 'Yes, reap' y \"run-shell '$self reap'\" 'Cancel' n ''" ;;
     main)   echo "run-shell '$self main'" ;;
     orch-jump) echo "run-shell '$self orch-jump'" ;;
+    # A POPUP, not a pane. A third pane in a sub-orch window would permanently
+    # disable the viewer's self-heal (suborch_attach_viewer's npanes>=2 guard), so
+    # the deck is structurally excluded from ever being one.
+    gate) echo "display-popup -E -b rounded -w 80% -h 60% '$self gate deck'" ;;
     popmsg) echo "run-shell '$self inbox pop'" ;;   # plain run-shell, composes with the close-then-dispatch flow
     unpop)  echo "run-shell '$self inbox unpop'" ;; # mirror popmsg: re-paste the most-recently-popped msg
     triage) echo "run-shell '$self dash-triage'" ;; # focus the dash + inject its triage key (NOT a popup) — same shape as 'new'
@@ -6316,7 +7320,11 @@ doctor_release() {
 
 cmd_doctor() {
   local ok=0
-  for dep in tmux nvim git python3 fzf; do
+  # `flock` is a real dependency of the dispatch ledger (meta_set/meta_compact) and of
+  # the courier's one-at-a-time guard, and it fails in OPPOSITE directions: without it
+  # `gate approve` dies loudly, while delivery degrades to unlocked and silent. Named
+  # here so the loud half is diagnosable and the silent half is visible at all.
+  for dep in tmux nvim git python3 fzf flock; do
     if command -v "$dep" >/dev/null; then echo "ok   $dep"; else echo "MISS $dep"; ok=1; fi
   done
   command -v notify-send >/dev/null && echo "ok   notify-send" || echo "warn notify-send missing (no desktop notifications)"
@@ -6829,6 +7837,8 @@ case "${1:-}" in
   pick)    shift; cmd_pick "$@" ;;
   send)    shift; cmd_send "$@" ;;
   watch)     shift; cmd_watch "$@" ;;
+  unwatch)   shift; cmd_unwatch "$@" ;;   # disarm a watcher armed on a pane
+  human)     shift; cmd_human "$@" ;;     # declare a HUMAN is working in this pane
   watch-run) shift; cmd_watch_run "$@" ;;  # internal: detached watcher
   deliver-wake) shift; deliver_wake "$@" ;;  # internal: watcher wake composer (also driven by the proof harness)
   ready)   shift; cmd_ready "$@" ;;        # flag a worktree done/ready for reap

@@ -28,7 +28,15 @@
 set -u
 
 HERE=$(cd "$(dirname "$0")/.." && pwd)
-HARNESSES="reap-teardown-safety.sh reap-tracked-notes-proof.sh suborch-wake-proof.sh"
+HARNESSES="reap-teardown-safety.sh reap-tracked-notes-proof.sh suborch-wake-proof.sh
+suborch-window-selfsufficient-proof.sh gate-decision-proof.sh gate-reject-routing-proof.sh
+viewer-excmd-proof.sh gate-courier-proof.sh gate3-state-proof.sh
+hand-drive-safety-proof.sh"
+# NOT listed: gate-visibility-proof.sh. It makes no tmux call and starts no server
+# (it eval's an extracted render fragment and reads bin/fleetd with the ast module),
+# so it has nothing to isolate — exactly like this file itself. Listing it would
+# demand a guard against a hazard it cannot create, which is how a contract stops
+# meaning anything.
 REAL_SOCK="/tmp/tmux-$(id -u)/default"
 # Snapshot the real server BEFORE anything runs — [5] compares against this. Read-only.
 BEFORE=$(command tmux -S "$REAL_SOCK" ls 2>/dev/null | sort)

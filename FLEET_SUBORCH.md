@@ -44,7 +44,7 @@ before** spawning the workers that depend on it:
 ## 3.0 Default decomposition: the ROLE PIPELINE (consult this FIRST)
 
 Before the flat per-repo decomposition in §3, **classify the instruction** and, for a
-genuine **feature**, run the **three-role pipeline** below. This is the default path for
+genuine **feature**, run the **four-role pipeline** below. This is the default path for
 any non-trivial implementation. §3's flat-worker model is the **fall-through** for
 genuinely flat, non-feature chores (and for attaching to an existing worker).
 
@@ -53,7 +53,7 @@ genuinely flat, non-feature chores (and for attaching to an existing worker).
 Decide which of three kinds the instruction is. **When unsure between two kinds, pick the
 cheaper one** — `question < trivial < feature`. The cost of error is asymmetric:
 misclassifying a feature as trivial costs only a re-dispatch, but carpet-bombing a
-one-liner with three role agents is the expensive, user-annoying mistake (the user's
+one-liner with four role agents is the expensive, user-annoying mistake (the user's
 explicit rule: *don't carpet-bomb a one-liner*). So **bias `trivial → flat`.**
 
 - **Question** — asks for a fact/status, changes no files ("which branch is X on?",
@@ -64,7 +64,7 @@ explicit rule: *don't carpet-bomb a one-liner*). So **bias `trivial → flat`.**
   it yourself, or spawn ONE plain worker via §3. **No pipeline.**
 - **Feature** — anything with design choices, multiple touch-points, edge cases, or that
   needs proving it works (a new behaviour, a rework, a bugfix with a non-obvious cause). →
-  **3 roles** (plan → implementation → test), below.
+  **4 roles** (research → plan → implementation → testing), below.
 
 Classify it in your own context from those three bullets — **there is no oracle** for this
 (`fleet dispatch-classify` is purely structural: sigil/bare/escape, no notion of
@@ -104,16 +104,16 @@ four unrelated `_reports` trees. The ledger key is only *true* if you make it tr
 `$reports` absolutely, so what the ledger records is where the artifacts actually land.
 Crash recovery (§3.0.5) and the viewer's symlink farm (§3.0.6) both depend on that.
 
-### 3.0.1b RECON — one cheap read-only look BEFORE you spawn the PLAN role
+### 3.0.1b RECON — one cheap read-only look BEFORE you spawn the RESEARCH role
 
 You are about to write a prompt for a role agent that will burn a whole context on this
-feature. Writing that prompt blind is the expensive mistake: a PLAN role pointed at the
+feature. Writing that prompt blind is the expensive mistake: a RESEARCH role pointed at the
 wrong subsystem spends its entire budget discovering that, and you only learn at GATE 1.
-So take **one** cheap, read-only look first and put the result in the PLAN role's prompt.
+So take **one** cheap, read-only look first and put the result in the RESEARCH role's prompt.
 
 **RECON folds INTO the `research` rung** — it is *not* a new phase and *not* a new
 `role-phase` value (see §3.0.5). Write `role-phase research` first, then recon, then spawn
-the PLAN role.
+the RESEARCH role.
 
 **How.** Spawn **exactly one** read-only sub-agent (your harness's sub-agent tool; claude:
 the Task tool) and have it return a **≤15-line digest**: which files/dirs the feature
@@ -199,14 +199,23 @@ throughout, the section still ships with every row reading `confirmed`. An absen
 `## Corrections`, or a row count lower than the number of claims in `RECON.md`, means the
 PLAN role did not check.
 
-### 3.0.2 The three roles (one fleet agent each; breadth lives INSIDE)
+### 3.0.2 The four roles (one fleet agent each; breadth lives INSIDE)
 
-A feature decomposes into **exactly three fleet agents, spawned in sequence**, one per
-role. **Breadth within a role comes from harness sub-agents that the role agent spawns**
+A feature decomposes into **exactly four fleet agents, spawned in sequence**, one per
+role: **RESEARCH · PLAN · IMPLEMENTATION · TESTING**.
+
+> **Why four and not three.** Reading the code and *arguing about what to do* are
+> different jobs with different failure modes, and merging them meant the debate ran on
+> whatever the explorer half happened to have context budget left for. Splitting them
+> costs one extra spawn and one extra `fleet watch` cycle per dispatch — a real cost,
+> named and accepted, not hidden. What it buys is that the adviser lenses argue over a
+> written, complete `RESEARCH.md` instead of over a half-spent context.
+
+**Breadth within a role comes from harness sub-agents that the role agent spawns**
 (claude calls the mechanism the **Task tool**; other harnesses name it differently — read
 "sub-agent" as *whatever your harness's in-context fan-out primitive is called*) — never
-from N sibling fleet agents. You spawn **three windows total**, not
-`3 + N advisers + 2 testers`. The wrapper buys you two real things: **turn-discipline**
+from N sibling fleet agents. You spawn **four windows total**, not
+`4 + N advisers + 2 testers`. The wrapper buys you two real things: **turn-discipline**
 (one watchable pane per phase, gates land cleanly) and **context-protection** (each
 sub-agent's bulk stays in its own context; the role agent keeps only digests) — *not*
 merely "fewer windows."
@@ -230,12 +239,11 @@ says in its report that it degraded. Same artifacts, same minimum lens count, sa
 quietly collapse three lenses into one pass; and it still must **not** `fleet new` (the
 escape valve in §3.0.3 runs through the sub-orch, never through the role agent).
 
-**Role 1 — PLAN** — `fleet new --scratch <slug>-plan --task plan -p "<prompt>"` (repo-less, reads code
-in place). Named for what it *produces* — a plan — not for the reading it does on the way
-there; the reading is the means, and §3.0.1b's RECON already did the cheap first pass.
-Seed its prompt with `$reports/RECON.md` (absolute, §3.0.1) under the handoff contract in §3.0.1b
-(cheap, unverified, overruled by this role; `## Corrections` is mandatory in `PLAN.md`).
-The role agent fans out via harness sub-agents:
+**Role 1 — RESEARCH** — `fleet new --scratch <slug>-rsch --task research -p "<prompt>"`
+(repo-less, reads code in place). Its job is to establish **what is true of the codebase
+today**, and nothing else: no proposal, no verdict, no debate. Seed its prompt with
+`$reports/RECON.md` (absolute, §3.0.1) under the handoff contract in §3.0.1b (cheap,
+unverified, overruled by this role). The role agent fans out via harness sub-agents:
 - 1–N **explorer** sub-agents (scope-scaled), each maps a subsystem and cites `file:line`.
   **Before spawning them, write `$reports/SCOPES.md`** — one line per explorer: its name and
   the RECON territory it owns. Use RECON's territory list to carve these, which is the one
@@ -244,8 +252,21 @@ The role agent fans out via harness sub-agents:
   than a compliance claim — that is what makes the partition checkable from artifacts alone,
   without a transcript and without asking an explorer whether it stayed in its lane (asking
   it would be worthless: a sub-agent has every reason to say yes).
+
+  Outputs: one `$reports/E<n>-<AREA>.md` per explorer, and **`$reports/RESEARCH.md`** — the
+  consolidated map, with a `## Corrections` section recording every RECON claim this role
+  found to be wrong. **`RESEARCH.md` is MANDATORY** and is the crash-recovery marker for
+  this rung (§3.0.5): without it a respawned sub-orch cannot tell "research finished" from
+  "plan started" and either re-runs a whole role or plans on nothing. On idle, advance the
+  cursor to `plan` and spawn Role 2.
+
+**Role 2 — PLAN** — `fleet new --scratch <slug>-plan --task plan -p "<prompt>"` (repo-less).
+Named for what it *produces* — a plan — not for reading, which Role 1 has now done. Seed
+its prompt with the absolute paths to `$reports/RESEARCH.md` and the `E<n>-*.md` files;
+it does **not** re-explore. The role agent fans out via harness sub-agents:
 - **≥2 adviser** sub-agents with distinct lenses — minimum **pro / con**; bigger scope
-  adds alternatives, security/abuse, UX, cost. This IS the debate, now in-agent.
+  adds alternatives, security/abuse, UX, cost. This IS the debate, now in-agent, and it
+  argues over a finished `RESEARCH.md` rather than over a half-spent explorer context.
 - a **synthesis** pass producing the verdict.
 
   Outputs (same artifact contract the gates expect — these three filenames are load-bearing
@@ -257,7 +278,7 @@ The role agent fans out via harness sub-agents:
   plan + **PROOF DESIGN**). **Planning only — no code.** On idle, read `SYNTHESIS.md`:
   REJECT/REVISE → handle per §7; **BUILD → GATE 1** (§7).
 
-**Role 2 — IMPLEMENTATION** — after the GATE 1 pop. `fleet new <repo> fleet/<slug>
+**Role 3 — IMPLEMENTATION** — after the GATE 1 pop. `fleet new <repo> fleet/<slug>
 --no-self-merge --task impl`, seeded with `PLAN.md` + `SYNTHESIS.md`. Does **TDD** (proving tests
 first → confirm RED → implement to green **without weakening a test**). Implements
 **directly by default**. Parallel implementation is **NOT** a sub-agent job: Task
@@ -277,7 +298,7 @@ reviewer sub-agent is fine. `--no-self-merge` because the human gate authorises 
 > deliberately never blocked. The human can lift it per-project with
 > `fleet autocommit on`.
 
-**Role 3 — TEST** — after implementation goes idle. One fleet agent on the impl branch
+**Role 4 — TESTING** — after GATE 3 (the human has committed the staged diff). One fleet agent on the impl branch
 (`fleet new <repo> fleet/<slug> --task test`), fanning out via harness sub-agents:
 - **≥2 independent tester** sub-agents that do **NOT** share context — the "two
   independent testers" guarantee, realized as two sub-agents. Each exercises the feature
@@ -330,19 +351,25 @@ loses its sub-agents' accumulated context. Guard against re-running completed ro
 spawn each role:
 
 ```
-research → gate1-wait → impl → test → gate2-wait → done
+research → plan → gate1-wait → impl → gate3-wait → test → gate2-wait → done
 # upsert the cursor by appending a tab-separated line (last-wins, like §6's state write):
 printf 'role-phase\t%s\n' impl >> .fleet/dispatch/<id>/meta.tsv
 ```
 
-**The first rung is still spelled `research`, and that is deliberate — do not "fix" it.**
-Role 1 is *called* PLAN (§3.0.2) and §3.0.1b's RECON runs inside the same rung, but the
-cursor **value stays the literal string `research`**: it is a machine token an in-flight
-ledger and `bin/fleet` already match on, not a label for humans. Renaming it to `plan`, or
-inserting a `recon` rung, gives the value no matching case arm — a dispatch that was
-mid-flight when you edited would fail to resolve its phase and **silently restart the
-pipeline**, which is the exact failure this whole section exists to prevent. The name/rung
-mismatch is the cheap price of that safety.
+**The rungs were APPENDED, never renamed — and that is the whole of the safety argument.**
+The pipeline is now four roles (RESEARCH · PLAN · IMPLEMENTATION · TESTING, §3.0.2), so
+`plan` and `gate3-wait` are new rungs. `research` **stays exactly where it was, as rung 0,
+spelled `research`.** Renaming it to `recon` — or renumbering anything — would strand every
+in-flight ledger: a dispatch mid-flight when you edited would read a cursor value that no
+longer sits in the sequence, fail to resolve its phase, and **silently restart the
+pipeline**, which is the exact failure this section exists to prevent. Appending is
+monotonic: every existing ledger's cursor is still a valid rung at the same relative
+position, so nothing in flight moves.
+
+**An unknown token is treated as ABSENT, never as an error.** The vocabulary has already
+drifted unchecked once (d32 wrote a `followups` value nothing recognises), and a reader
+that *fails* on an unrecognised rung turns a cosmetic drift into a stalled pipeline. Fall
+through to the artifact cross-check below — which is the real truth anyway — and carry on.
 
 `meta_get`/`meta_set` are **internal `bin/fleet` functions, not CLI verbs** — you cannot
 call them from your shell. The ledger is a plain tab-separated file; write it directly. A
@@ -359,19 +386,27 @@ worktrees). `fleet dispatch rename` records the absolute path for you:
 d=.fleet/dispatch/<id>
 reports=$(awk -F'\t' '$1=="reports"{v=$2} END{print v}' "$d/meta.tsv")   # last-wins, like meta_get
 [ -f "$reports/RECON.md" ]         && : recon banked
-[ -f "$reports/SYNTHESIS.md" ]     && : research done
+[ -f "$reports/RESEARCH.md" ]      && : research role done
+[ -f "$reports/SYNTHESIS.md" ]     && : plan done
 [ -f "$reports/TEST-VERDICT.md" ]  && : test done
 ```
 
 | Artifact present in `$reports/` | ⇒ what is already done | Resume at |
 |---|---|---|
-| `RECON.md` | the §3.0.1b recon ran — do **not** re-recon | spawn the **PLAN** role (rung stays `research`) |
-| `SYNTHESIS.md` | the PLAN role finished (research rung complete) | read the verdict → GATE 1 per §7 |
+| `RECON.md` | the §3.0.1b recon ran — do **not** re-recon | continue the **RESEARCH** role |
+| `RESEARCH.md` | the RESEARCH role finished | spawn the **PLAN** role (rung `plan`) |
+| `SYNTHESIS.md` | the PLAN role finished | read the verdict → GATE 1 per §7 |
 | `TEST-VERDICT.md` | the TEST role finished | read DONE/NEEDS-WORK → GATE 2 or loop per §7 |
 
-`RECON.md` without `SYNTHESIS.md` is the ordinary mid-`research` state: the recon is banked,
-the PLAN role is not finished. That is precisely why RECON needed no rung of its own — the
-artifact disambiguates the two halves of the rung, and the cursor never had to change.
+**`RESEARCH.md` is MANDATORY, and it exists because a 4th rung is not crash-recoverable
+without it.** With three roles, `SYNTHESIS.md` alone could stand in for the whole research
+rung. With four, "research finished" and "plan started" are different states of the world
+that a respawned sub-orch has to tell apart, and there was no artifact between them — so a
+crash in that window either re-ran the research (throwing away a role's worth of
+sub-agent context) or skipped it (planning on nothing). One file closes it.
+
+`RECON.md` without `RESEARCH.md` is the ordinary mid-`research` state: the recon is banked,
+the RESEARCH role is not finished — which is why RECON still needs no rung of its own.
 
 Then resume at the right role rather than restarting the pipeline. This is **not**
 optional — without the cursor a mid-pipeline crash re-runs completed roles. The cursor is
@@ -573,7 +608,12 @@ Every abandon logs a dashboard alert; `failed` stays hand-recoverable (re-dispat
 ## 7. GATED MODE — stop at a gate, wait for the human's POP
 
 When you run the `fleet-implementation-pipeline` skill for a dispatched feature, the
-pipeline has **two human gates**. A gate is **not** a new blocking primitive — it is a
+pipeline has **three human gates** — GATE 1 (plan → implement), **GATE 3 (implement →
+commit)**, and GATE 2 (merge). Note the ordinal: GATE 3 is **chronologically second**.
+The number is deliberately not 2, because renumbering would change the GATE 1 / GATE 2
+sentinel strings that already shipped and are pinned byte-for-byte by
+`test/gate-unpark-pointer-proof.sh` and read by every live ledger. A confusing ordinal is
+cheaper than migrating all of them. A gate is **not** a new blocking primitive — it is a
 deliberate break in your turn-chain: a claude pane only runs when input lands in it, so
 after you post a gate message you **END YOUR TURN** and sit parked. The ONLY thing that
 un-parks you is the human **popping** the gate message back into your pane.
@@ -590,6 +630,18 @@ fleet gate post 1 --slug "$slug" --summary "<one-line: what we'll build + how we
 fleet inbox list | grep -q "GATE 1" || fleet gate post 1 --slug "$slug" --summary "…" -d <id>  # verify; re-post if lost
 fleet gate park <id> 1     # ledger state=gate1-wait → `fleet reap` will NOT tear you down
 # …then END YOUR TURN. Do NOT spawn implementers. Nothing advances until the human pops.
+```
+
+```
+# GATE 3 — implement -> commit. CHRONOLOGICALLY SECOND. After the IMPLEMENTATION role
+# goes idle its work is STAGED and deliberately NOT committed (agents do not commit), so
+# the human owes exactly one commit before anything can be tested or merged. Until now
+# that duty was an ordinary stretch of pipeline the machinery knew nothing about — so
+# reconcile could respawn over it and reap could take the worktree.
+fleet gate post 3 --slug "$slug" --summary "<one line: what changed>" -d <id> -w <impl-worktree> --park
+# `--park` posts AND parks in one transaction: two commands left a window in which the
+# gate message existed but the ledger did not say parked, and in that window reap could
+# take the worktree. …then END YOUR TURN. Do NOT spawn the TESTING role.
 ```
 
 ```
@@ -618,6 +670,9 @@ printf '%s' "$INCOMING_PROMPT" | fleet gate parse    # rc 0 + "gate=N action=…
 | Parsed sentinel | What you do |
 |---|---|
 | `gate=1 action=implement slug=S` | Proceed to **Phase 3 (TDD)** for slug S using PLAN.md/SYNTHESIS.md. |
+| `gate=3 action=commit slug=S` | The human has committed the staged diff. Advance the cursor to `test` and spawn the **TESTING** role (Role 4). |
+| `gate=N action=revise attempt=K slug=S` | **REJECTED.** Read the newest `reason-g<N>-*.txt` in your dispatch dir — that is the human's revision guidance — and re-run the rung ONE back: gate 1 → the **PLAN** role, gate 3 → the **IMPLEMENTATION** role in the SAME worktree. Do not restart the pipeline and do not re-run the rungs before it. Re-post the gate when the lap finishes. |
+| anything else (unknown `action=`) | **HALT AND ESCALATE** — `fleet send --needs-human main "…"` — and end your turn. An action you do not recognise is a fleet newer than this manual, or a forgery; **never treat it as an approval.** The whole value of the sentinel is that unknown means stop. |
 | `gate=2 action=merge slug=S target=T` | Review the diff, then **delegate integration** — spawn a SHIP worker with `--self-merge` that merges S → T. **It does not push; the human pushes.** Watch it, terminate the ledger, report, then `fleet ready`. The human has already made the commit by the time they pop this — if `S` still has **no commits** ahead of `T`, do NOT dispatch the integration (the merge would be a silent `Already up to date` that marks the ledger `done` with nothing shipped): say so and end your turn. |
 
 **You never commit, push or merge yourself.** Your pane is `FLEET_ROLE=worker`, so
