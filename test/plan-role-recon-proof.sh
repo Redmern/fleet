@@ -61,32 +61,58 @@ hasi() { grep -qEi -- "$2" "$1"; }         # regex, case-insensitive
 
 [ -f "$MANUAL" ] || { echo "FATAL: $MANUAL missing"; exit 1; }
 
-# --- 1. role-phase value is still exactly `research` --------------------------
-echo "[1] role-phase rung unchanged (RECON folded into \`research\`)"
-if hasre "$MANUAL" '^research → gate1-wait → impl → test → gate2-wait → done$'; then
-  pass "cursor sequence line byte-identical"
+# --- 1. the rung list was APPENDED to, never renamed --------------------------
+# d34 S7 splits 3 roles into 4 (RESEARCH · PLAN · IMPLEMENTATION · TESTING) and adds
+# GATE 3, so `plan` and `gate3-wait` are new rungs. What must NOT change is where
+# `research` sits: it stays rung 0, spelled `research`. Appending is monotonic — every
+# in-flight ledger's cursor is still a valid rung at the same relative position — while
+# RENAMING strands a mid-flight dispatch, which fails to resolve its phase and silently
+# restarts the pipeline. That is the failure §3.0.5 exists to prevent, and it is the
+# only reason this case is written as an anchored full-line match rather than a
+# vocabulary spot-check.
+echo "[1] role-phase rungs APPENDED, research still rung 0"
+if hasre "$MANUAL" '^research → plan → gate1-wait → impl → gate3-wait → test → gate2-wait → done$'; then
+  pass "cursor sequence line is the 8-rung appended form"
 else
-  fail "cursor sequence line byte-identical" "the 6-value sequence line is gone or altered"
+  fail "cursor sequence line is the 8-rung appended form" \
+       "the sequence line is gone or altered — it must read: research → plan → gate1-wait → impl → gate3-wait → test → gate2-wait → done"
 fi
-# No new rung may be introduced anywhere in the cursor's own vocabulary.
+# `research` must be FIRST. A sequence that merely contains it is not enough: the whole
+# guarantee is that rung 0 did not move.
+if hasre "$MANUAL" '^research → '; then
+  pass "research is still rung 0"
+else
+  fail "research is still rung 0" "the first rung is no longer \`research\` — every in-flight ledger is stranded"
+fi
+# No `recon` rung may be introduced anywhere in the cursor's own vocabulary — RECON
+# still folds into the research rung and is disambiguated by RECON.md, not by a rung.
 if hasre "$MANUAL" 'role-phase[^\n]*\brecon\b|\brecon →|→ recon\b'; then
   fail "no recon rung" "a \`recon\` value appears in the role-phase cursor"
 else
   pass "no recon rung"
 fi
-# The rename must NOT have swept the cursor value to `plan`.
-if hasre "$MANUAL" '^plan → gate1-wait|role-phase.*\bplan\b.*gate1-wait'; then
-  fail "cursor not renamed to plan" "cursor value was renamed — bin/fleet has no case arm for it"
+# The rename-vs-append distinction must be stated OUT LOUD, or the next editor "tidies"
+# the sequence and strands every live ledger.
+if tr '\n' ' ' < "$MANUAL" | grep -qEi 'appended, never renamed|rungs were APPENDED|stays exactly where it was, as rung 0'; then
+  pass "append-not-rename is documented as deliberate"
 else
-  pass "cursor not renamed to plan"
+  fail "append-not-rename is documented as deliberate" \
+       "nothing explains why rungs are appended rather than renamed/renumbered"
 fi
-# The section must say OUT LOUD that the string stays `research` despite the rename,
-# otherwise the next editor 'fixes' the inconsistency and breaks recovery.
-# flattened: this explanation legitimately spans several wrapped lines.
-if tr '\n' ' ' < "$MANUAL" | grep -qEi 'rung is still spelled .?research|value stays the literal string .?research|(stays|remains) the (literal )?string .?research'; then
-  pass "mismatch is documented as deliberate"
+# An unknown token must be tolerated, not fatal. The vocabulary has drifted unchecked
+# before (d32's `followups`); a reader that errors turns cosmetic drift into a stall.
+if tr '\n' ' ' < "$MANUAL" | grep -qEi 'unknown token is treated as ABSENT|treated as ABSENT, never as an error'; then
+  pass "unknown rung tokens are documented as absent-not-error"
 else
-  fail "mismatch is documented as deliberate" "nothing explains why the rung stays \`research\` after the PLAN rename"
+  fail "unknown rung tokens are absent-not-error" "the manual does not say what to do with an unrecognised rung"
+fi
+# RESEARCH.md is the new mandatory crash-recovery marker for the research rung.
+if has "$MANUAL" 'RESEARCH.md' \
+   && tr '\n' ' ' < "$MANUAL" | grep -qEi '`?RESEARCH\.md`? is MANDATORY'; then
+  pass "RESEARCH.md is documented as the mandatory research-rung artifact"
+else
+  fail "RESEARCH.md is mandatory" \
+       "a 4th rung is not crash-recoverable without its own artifact — SYNTHESIS.md alone cannot distinguish 'research done' from 'plan started'"
 fi
 
 # --- 2. the three artifact filenames are byte-identical -----------------------
@@ -172,16 +198,34 @@ s5 '^\|.*RECON\.md.*\|' && pass "RECON.md row" || fail "RECON.md row" "no RECON.
 s5 '^\|.*SYNTHESIS\.md.*\|' && pass "SYNTHESIS.md row" || fail "SYNTHESIS.md row" "the pre-existing cross-check was lost"
 s5 '^\|.*TEST-VERDICT\.md.*\|' && pass "TEST-VERDICT.md row" || fail "TEST-VERDICT.md row" "the pre-existing cross-check was lost"
 
-# --- 6. the RESEARCH → PLAN rename landed, with no stale suffix ---------------
-echo "[6] Role 1 renamed RESEARCH → PLAN"
-hasre "$MANUAL" 'Role 1 — \*?\*?PLAN' && pass "Role 1 — PLAN" || fail "Role 1 — PLAN" "still 'Role 1 — RESEARCH'"
+# --- 6. the 3 -> 4 role SPLIT (d34 S7) ----------------------------------------
+# HISTORY, so this case is not misread as a flip-flop. d28 RENAMED Role 1 from RESEARCH
+# to PLAN because one role did both jobs and "research" named the means rather than the
+# product. d34 S7 SPLITS that role in two: reading the code and arguing about what to do
+# are different jobs, and merging them meant the adviser debate ran on whatever context
+# the explorer half had left. So Role 1 is RESEARCH again — but as a genuinely separate
+# agent with its own artifact, not as the old name for the planning role. Role 2 is PLAN,
+# and it does not re-explore.
+echo "[6] the 3 -> 4 role split: Role 1 RESEARCH, Role 2 PLAN"
+hasre "$MANUAL" 'Role 1 — \*?\*?RESEARCH' && pass "Role 1 — RESEARCH" \
+  || fail "Role 1 — RESEARCH" "Role 1 is not the RESEARCH role — the split did not land"
+hasre "$MANUAL" 'Role 2 — \*?\*?PLAN' && pass "Role 2 — PLAN" \
+  || fail "Role 2 — PLAN" "PLAN is not Role 2 — the split did not land"
+hasre "$MANUAL" 'Role 3 — \*?\*?IMPLEMENTATION' && pass "Role 3 — IMPLEMENTATION" \
+  || fail "Role 3 — IMPLEMENTATION" "the downstream roles were not renumbered"
+hasre "$MANUAL" 'Role 4 — \*?\*?TESTING' && pass "Role 4 — TESTING" \
+  || fail "Role 4 — TESTING" "the downstream roles were not renumbered"
+has "$MANUAL" '<slug>-rsch'   && pass "window suffix <slug>-rsch"   || fail "window suffix <slug>-rsch" "missing"
 has "$MANUAL" '<slug>-plan'   && pass "window suffix <slug>-plan"   || fail "window suffix <slug>-plan" "missing"
 has "$MANUAL" '<slug>-plan-2' && pass "loop key <slug>-plan-2"      || fail "loop key <slug>-plan-2" "missing"
-for f in "$MANUAL"; do
-  if grep -qF -- '<slug>-research' "$f"; then
-    fail "no stale <slug>-research ($(basename "$f"))" "$(grep -nF -- '<slug>-research' "$f" | head -3 | tr '\n' ' ')"
-  else pass "no stale <slug>-research ($(basename "$f"))"; fi
-done
+# The two role windows must not share a key, or the dedup in §3 collapses them into one.
+if [ "$(grep -cF -- '<slug>-rsch' "$MANUAL")" -ge 1 ] \
+   && ! grep -qF -- '<slug>-research' "$MANUAL"; then
+  pass "the research window key is <slug>-rsch, distinct from <slug>-plan"
+else
+  fail "the research window key is distinct" \
+       "$(grep -nF -- '<slug>-research' "$MANUAL" | head -3 | tr '\n' ' ')"
+fi
 
 # --- 7. handoff contract: trust asymmetry + mandatory ## Corrections ----------
 echo "[7] handoff contract"

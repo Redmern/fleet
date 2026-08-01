@@ -96,7 +96,8 @@ State lives in three places, none of them a database:
 ### Ledger state: terminal vs parked (`ledger_terminal` / `ledger_parked`)
 
 Dispatch ledger state is classified in **exactly one place**: `ledger_terminal`
-(`done|failed|cancelled`) and `ledger_parked` (`gate1-wait|gate2-wait`). Three
+(`done|failed|cancelled`) and `ledger_parked`
+(`gate1-wait|gate2-wait|gate3-wait|blocked`). Three
 consumers hand-rolled this before and diverged, which *was* a bug: `cmd_reconcile`
 skipped only the terminal set, so a sub-orch parked at a human gate looked
 "non-terminal + dead window = stranded" and got respawned — and the fresh sub-orch
@@ -425,7 +426,12 @@ paragraph goes red if it ever changes. Second, this design does **not claim tamp
 same uid, the ledger is writable by the very agents it records, the hook fails open, so
 no unforgeable approval grant is achievable — and it adds **zero capability**: any
 pane could already run `fleet new --self-merge`. What it buys is that the merge
-becomes a visible, owned, recorded step. `bin/fleet-guard` is deliberately
+becomes a visible, owned, recorded step. That claim was written before `fleet gate
+approve` existed and remains literally true, but the **cost** of a pane approving its
+own gate has dropped from "forge an inbox message and get a human to pop it" to one
+CLI call the courier then delivers autonomously — `gate_decide` has **no role check**,
+deliberately (a check at a single uid is a speed-bump, not a control, and the audit
+trail is the design). `bin/fleet-guard` is deliberately
 **untouched** by this feature, and the proof byte-compares it to prove that.
 
 `--name <window>` on `cmd_new` exists for **routing, and only routing**: the derived
@@ -664,6 +670,138 @@ implementation (publish file-by-file into a live `current`) and goes red on 7
 assertions, including 2,821 failed reads — it is not vacuous. The budget proof is
 **soft** (reports, `STRICT=1` to harden), because "we added an invisible 5 ms to
 every tool call" is precisely how this design would fail quietly.
+
+### The gate DECISION: three surfaces, one verb, and only the courier un-parks (d34)
+
+Before this, a gate decision was not an object. Approval existed **only** as a human
+popping a message into a pane — i.e. as tmux scrollback — and **rejection had no
+representation at all**, so there was no routing, no attempt counter and no cap. Worse,
+`ledger_parked` enumerated the `gate<N>-wait` states and **no writer ever cleared them**
+(`parked_at` / `gate<N>_popped` are labelled in-source as "AUDIT FACT, NOT A GATE"), so a
+dispatch that reached a gate stayed parked forever.
+
+`fleet gate approve|reject|show|list|deck|deliver` closes both. Load-bearing pieces:
+
+- **Three surfaces, ONE verb.** `gate_decide` is reached from the CLI, from the viewer's
+  `:FleetApprove`/`:FleetReject` Ex commands, and from the leader deck. Nothing else
+  decides. This is why approving *with amendments* — just talking to the harness pane —
+  costs zero code: it was never a fourth surface, it is the sub-orch running the verb.
+- **DECIDING DOES NOT UN-PARK.** Un-parking is `gate_deliver`'s alone, and only on
+  confirmed landing. A decision that cleared the parked state on write would drop the reap
+  guard and the reconcile exemption while the sub-orch has heard nothing — the gate-park
+  bug wearing a new hat. Every failure path here fails towards *still parked*.
+- **Confirmation is CONJUNCTIVE, and that is the whole of `gate_landed`.**
+  `wake_confirmed` infers landing from the pane going `working` — **and a human typing in
+  that pane produces exactly the same signal.** So the courier additionally requires its
+  own sentinel to **APPEAR** — a delta against a baseline `gate_sentinel_count` sampled
+  **before** the paste. Either half alone is a false positive: `working` alone is a busy
+  human; the sentinel alone is stale scrollback.
+
+  **The delta is the load-bearing half, and the first implementation did not have it.**
+  Both conjuncts were sampled only *after* the paste, as absolutes — and the sub-orch
+  posted the gate **from that very pane**, so its own sentinel is already on that screen
+  and the sentinel test is true before a byte is sent. Any live turn (or a human typing)
+  supplies `working`, so the conjunction confirmed a delivery that never happened and
+  **un-parked**, dropping the reap guard and the reconcile exemption on a gate the human
+  never answered: the gate-park bug wearing a third hat. Measured **20/20 false confirm**
+  by the independent test, against a control of 0/10 at `state=idle`.
+
+  Pinned by `gate-courier-proof.sh` case **4b**, not case 4 — and the distinction is the
+  point. Case 4 deletes `decision-<N>.txt` so the courier bails *before* it ever pastes:
+  it exercises the `working` half in isolation and is structurally blind to this defect,
+  which is how the defect shipped past a green suite. 4b is 3/3 RED against the pre-fix
+  tree (`delivered=1 state=running`) and 3/3 green after.
+
+  Two ways 4b passed **vacuously** while being written, both now guarded in-file: the
+  window must carry the name the **ledger** records (`dispatch rename` appends the slug —
+  a `so-<id>` window makes the courier resolve no pane and defer, refusing for the wrong
+  reason); and the pane needs **`stty -echo`**, because otherwise the tty renders the
+  paste, the sentinel count genuinely rises, and the case fails against the fix too,
+  discriminating nothing. The vacuity guard asserts both the pre-count and the resolved
+  pane before the case is allowed to claim anything.
+- **The decision file is a BARE body, sentinel on line 1.** `gate_parse` stays the sole
+  advance oracle and needs no change. The `From `-header two-line form is the *inbox's*
+  shape — a consequence of `inbox_pop_text`'s header, never a free two-line allowance
+  (`fleet inbox put` has no role check, so a bare bound of N hands a forger N−1 lines of
+  camouflage). Do **not** widen the `sed -n '1,2p'` head read.
+- **Reject is never reasonless, and the loop is capped at 3.** No reason ⇒ rc 2 ⇒ nothing
+  written. Each lap's reason is its own `reason-g<N>-<k>.txt`; `rejects_g<N>` is
+  deliberately **not** cleared by a re-post, so a pipeline cannot reset its own cap.
+  Gate-2 reject is pre-merge only (rc 5 once the ledger concluded) and points at revert.
+- **The cap's `blocked` is PARKED, and classifying it was not optional.** `gate_decide`
+  is a NEW writer of the ledger `state`, and `blocked` shipped in *neither* set — so the
+  verb that escalates to a human promptly dropped every guard protecting the work it
+  escalated: measured `gate waiting` empty (reap would take the worktree), `gate list`
+  empty (the human cannot even see it), and `cmd_reconcile` reading
+  "non-terminal + not parked + dead pane" as stranded and flipping it to **`failed`**.
+  That is the July-19 class reintroduced by this slice's own writer, which is the whole
+  argument for having a single classification site: the fix is one token there, and it
+  reaches reap, reconcile, `gate list` and the orphan escalation together. It is
+  **not terminal** — nothing concluded, the human can still decide it by hand, and
+  `suborch_ledger_active` (sharing only the TERMINAL set) must keep nudging.
+  Pinned by `gate-reject-routing-proof.sh` 6b/6d, with **6c** as the mandatory negative
+  control: widening this predicate must not make an *unknown* token parked, which is the
+  inverse failure — a genuinely stranded dispatch turning invisible. That is why this is
+  a closed `case` and never a "not terminal" test.
+- **`gate_post --park` is one transaction.** Two commands left a window in which the gate
+  message existed but the ledger did not say parked — and in that window reap could take
+  the worktree. The park is last: a park with no message is a wedge; a message with no
+  park is the bug.
+- **fleetd learns ONE fact and shells out.** `Fleet.courier` reads `decision` and
+  `delivered` from `meta.tsv` and `Popen`s `fleet gate deliver`. It must never learn the
+  sentinel grammar: that would be a second implementation, in a second language, in the
+  one process with no try/except around method dispatch, where a single exception exits
+  the daemon and `Restart=on-failure` crash-loops it to permanently `failed`.
+
+Locked in by `test/{gate-decision,gate-reject-routing,gate-courier,gate3-state}-proof.sh`.
+
+### The sub-orch window is self-sufficient (d34 S3)
+
+The window is harness pane + nvim viewer rooted at `.fleet/dispatch/<id>/`. It held the
+**evidence** and not the **question**, and the evidence only if a model remembered a chore:
+
+- `gate_post` now also writes `<dispatch-dir>/GATE-<N>.md` — the inbox's own bytes, so a
+  decision made from the file cannot differ from one made from the message. Last-wins,
+  never appended. No `-d` ⇒ nothing written, because a GATE file at an invented path is a
+  lie aimed at the reader least able to catch it.
+- **`dispatch_farm` populates the symlink farm in BASH**, from the ledger `reports` key
+  plus `workers.tsv`, run at `dispatch rename` and at every `gate post` — the two moments
+  the human is about to look. It was pure prose before (`FLEET_SUBORCH.md` §3.0.6), and
+  `test/dispatch-symlink-farm.sh` case 6 evals *the manual's* commands, which proves the
+  commands and never that a live sub-orch ran them. The prose stays as belt-and-braces.
+- **Viewer surface is Ex commands, not keymaps or RPC.** The viewer is plain `nvim .` with
+  the **human's own config** and **no `--listen`** (the `--listen` elsewhere is the *agent*
+  nvim), and `test/suborch-viewer-send.sh` asserts `@fleet_nvim_sock` stays unset — setting
+  it flips `cmd_send` to RPC-only, which then dies. `suborch_viewer_vimrc` writes
+  `.fleet-viewer.vim` and it is sourced via `-c`; it defines only `Fleet*` commands, maps
+  no keys, and **`echoerr`s on failure** — the one place the fail-silent rule is inverted,
+  because the whole attach path is fail-silent and a command that never installed is
+  otherwise indistinguishable from an approval that worked.
+- **The deck is a POPUP, never a third pane.** `suborch_attach_viewer`'s `npanes >= 2`
+  guard permanently disables viewer self-heal if a third pane exists, so the deck is
+  structurally excluded from being one. It is also one `fleet_actions()` row, not a prefix
+  chord — the only prefix binding is `menu`.
+
+### Human presence is a PANE OPTION (`@fleet_human`, d34 S6)
+
+"…or it can be done manually by a user within an agent" was added and never made safe.
+Every guard in fleet keys on `@agent_state`, i.e. on an **agent's** hook reports, so a
+human in a worktree with claude exited reports nothing and reads as abandoned.
+
+`fleet human on|off|status` stamps `@fleet_human` on the pane. **Not a 10th TSV column** —
+three readers parse that TSV positionally as exactly 9 fields and all three fail *silently
+wrong* on a 10th (every row renders the `done` pill and a human reaps live work; a blank
+dashboard; a mangled restore owner). Consumed by `cmd_reap` (refuses, **not even with
+`--force`** — `--force` has never meant "delete the tree a person is typing in", and the
+escape hatch is one word), `cmd_send` (refuses to type into the pane), and `cmd_reconcile`
+via `suborch_human_present` (never revive over them, never mark their work failed).
+
+Two more from the same slice: `cmd_send`'s never-clobber guarantee now extends to the
+**worker** path (`draft`/`modal` refuse, overridable with `--force`; `generating` is
+deliberately allowed, since an agent mid-turn is the ordinary case and the harness queues
+input), and `cmd_watch_run` gained both `fleet unwatch` and a **vanished-target-is-terminal**
+exit — streaked over three ticks, because `agents_tsv` falls back to tmux options and one
+empty read during a fleetd restart is a blip, not a death.
 
 ### Guard: executed command vs inert argument (`fleet-guard` block 1)
 
@@ -955,6 +1093,38 @@ this project with the `fleet` CLI.
   a hard block: it raises the severity to `blocked` so it fires a desktop notify
   (a routine summary stays `info` / silent). Don't sit silent — POST. (This is the
   canonical worker→human verb; `fleet inbox put` is the internal primitive.)
+- `fleet gate approve|reject|show|list [<id|slug>] [--gate N] [-m reason] [--yes]` — **decide a
+  gate.** This is the single authority; the viewer's `:FleetApprove`/`:FleetReject` Ex
+  commands and the leader deck (`prefix+F` → `g`) both funnel into it, and so does simply
+  talking to the sub-orch's harness pane when you want to approve *with amendments*.
+  Headless: no tmux, no dashboard, no nvim needed. With no target it resolves the dispatch
+  whose sub-orch window you are in. **`reject` ALWAYS requires a reason** (`-m`, `--file`,
+  or `$EDITOR`) — an empty one aborts and writes nothing — and routes the pipeline back
+  exactly one rung (gate 1 → the PLAN role, gate 3 → the IMPLEMENTATION role in the same
+  worktree), counting the lap and **escalating instead of routing at 3**. Deciding
+  **does not un-park**: the decision is written to the ledger and a courier delivers it,
+  un-parking only once the sub-orch has demonstrably received it — so an undelivered
+  decision leaves every reap guard and reconcile exemption in place. Unlike the rest of
+  fleet this verb **dies** on a target it cannot resolve rather than failing silently: a
+  silent no-op here is a human who believes they approved and walks away.
+  **Gate 2 asks you to type the slug back.** It is the approval that actually moves
+  code, so approving it shows the merge preview and requires the slug — and with **no
+  terminal and no `--yes` it REFUSES (rc 2, nothing written)** rather than silently
+  skipping the prompt, because a confirmation that quietly does not happen is the same
+  as not having one. `--yes` is the explicit, recorded escape hatch for scripts; the
+  absence of a tty is not consent. Gates 1 and 3 are unchanged. An explicit `--gate N`
+  that disagrees with the parked gate is refused for the same reason.
+- `fleet human on|off|status [<agent>]` — declare that **a human, not an agent, is working
+  in this pane.** Everything else in fleet keys on `@agent_state`, i.e. on an *agent's*
+  hook reports — so a person sitting in a worktree with claude exited is invisible, and
+  `fleet reap` would kill their window and delete the tree. With this set, reap refuses
+  that worktree (**not even with `--force`** — `fleet human off` is the escape hatch),
+  `fleet send` refuses to type into the pane, and `fleet reconcile` leaves the dispatch
+  alone. Stored as a pane option, never a TSV column.
+- `fleet unwatch [<pane>]` — disarm the watcher armed on a pane. Until now an armed
+  `fleet watch` could not be cancelled at all; its only exits were "all idle", "one
+  blocked", or the ~90-minute cap. A watch whose targets have **vanished** now also ends
+  on its own instead of running out that cap.
 - `fleet mode <agent>` — cycle that agent's permission mode one step. Only for
   harnesses that expose permission modes (e.g. claude); a no-op for harnesses
   like omp that have none.
@@ -1119,3 +1289,103 @@ commit yourself, then merge. Once merged, `fleet reap` clears out all the finish
 worktrees in one step (it refuses unmerged or dirty ones — an uncommitted worktree
 shows as `review`, not `done`).
 
+## Main pane only (FLEET_ROLE=main)
+
+> This section applies **only** in the command-center main pane (`FLEET_ROLE=main`).
+> Sub-orchestrators and workers: **ignore it** — the "Delegate first" / do-the-work
+> guidance above is yours. (This is advisory; the routing logic lives in a hook that
+> only ever runs in the main pane, so no other pane can act as a router regardless.)
+
+When the **dispatch layer** is enabled (`fleet dispatch enable`), a `UserPromptSubmit`
+hook runs in this pane and intercepts prompts with **zero model turn**: it allocates a
+ledger id, writes the instruction, and spawns an ephemeral sub-orchestrator (`so-<id>`)
+that decomposes and runs the work on its own panes. You never see those prompts — they
+are already handled.
+
+**Which prompts get dispatched is set by `fleet dispatch mode`:**
+
+- `sigil` (default) — **opt-in**: a prompt with a **leading `,`** dispatches; a bare
+  prompt falls through to you in-pane.
+- `all` — **the dispatch-everything front door (opt-out)**: **every** bare prompt is
+  dispatched (your pane returns to ready the instant you press Enter — never tied up
+  running a pipeline); a prompt with a **leading `\` (escape sigil)** is the exception,
+  answered **inline** in your pane for a quick question/status check.
+- `off` — the layer is dormant; everything falls through in-pane.
+
+Set/inspect it with `fleet dispatch mode [sigil|all|off]` (bare prints the current
+mode; `fleet dispatch status` also reports it). Or flip it from the **leader menu**:
+**+Session → `d`** opens a picker showing the current mode and whether the hook is
+wired, then off/sigil/all in one keystroke (sigil/all wire the hook first).
+
+What reaches you in-pane is only the fall-through (a bare prompt under `sigil`, or an
+escaped `\…` prompt under `all`):
+
+- A trivial question ("what's the build command?", "which branch is X on?") →
+  **answer it in-pane**.
+- A bare prompt that is actually a unit of work the user forgot to prefix (under
+  `sigil`) → treat it as a dispatch: delegate it yourself (`fleet new …`), or tell the
+  user to resend it with a leading `,` to fan it out through the layer.
+
+### Gated pipelines (the two human gates)
+
+A dispatched feature run through the `fleet-implementation-pipeline` skill **stops
+twice and waits for you**, surfacing each decision as a **✉ pill** in the dashboard
+inbox (posted at `sev warn`, so a desktop notify fires):
+
+- **🚧 GATE 1 — approve the plan.** The sub-orch posts a plain-English plan + proof
+  design, then **parks** (ends its turn). **Pop** the message (`e`→Enter on its row, or
+  the leader `p` FIFO drain) to approve → the approval routes **back to that sub-orch**
+  and auto-submits, and test-first implementation begins. Type a course-correction
+  instead → a fresh prompt; nothing is built.
+- **🚧 GATE 2 — approve the merge.** After the tests are green the sub-orch posts *how
+  the tests prove it* + manual-test steps, with the **merge target baked in**
+  (`fleet integration-branch`; absent ⇒ `main`), then parks. **Pop** = "merge + push to
+  that branch"; the sub-orch reviews the diff, merges, and `fleet ready`s. Type a defect
+  → it loops and builds further on what's there.
+
+A pipeline **never advances past a gate on its own** — only your pop moves it. A sub-orch
+parked at a gate carries a ledger `state=gate{1,2}-wait`, and **`fleet reap` skips it**
+(alongside the existing unread-needs-human guard) so a parked pipeline is never
+torn down before you pop. Gate mechanics for the sub-orch side live in
+`FLEET_SUBORCH.md §7`.
+
+Exceptional events (a dispatch hard-failed, a worker is BLOCKED on the human) arrive
+**out-of-band only** — a tmux toast, a terminal bell, and a row in the dashboard alerts
+strip — never injected into your input. When pinged, check the dashboard /
+`.fleet/dispatch/` ledger; recover stranded work with `fleet reconcile`.
+
+## Worktree secrets (per-repo auto-injection)
+
+Keep per-repo secret files in one place and have fleet drop them into **every** new
+worktree it creates — so a fresh debug worktree already has its `.env.local` / DSN at
+the right path, no pasting into a prompt.
+
+**Setup (default mechanism — a mirrored folder, no schema):**
+```sh
+mkdir -p ~/.config/fleet/secrets/<repo>
+$EDITOR ~/.config/fleet/secrets/<repo>/.env.local      # lay files out exactly as the worktree wants them
+```
+On `fleet new <repo> <branch>`, fleet mirror-copies that tree into the worktree (the
+file's path **relative to** `secrets/<repo>/` IS its destination), `chmod 600`s each
+file, and appends each dest to the worktree's `.git/info/exclude` so a secret can never
+be accidentally committed. Re-running is idempotent (overwrites, no duplicate ignore
+lines). `--scratch` agents and repos with no `secrets/<repo>/` dir are untouched.
+
+**Optional `pass` sugar (encryption-at-rest):** if a file's content is exactly
+`pass:<entry>` (e.g. `pass:fleet/myapp/db-url`), fleet resolves it with `pass show` at
+injection and writes the decrypted value instead (value streamed straight to the file —
+never on a command line, never logged). Store the secret encrypted with
+`pass insert fleet/myapp/db-url` once.
+
+**Fail-silent:** a missing source, locked gpg, or absent `pass` only warns — it never
+aborts `fleet new` and never hangs on a pinentry prompt. Every placement is recorded in
+an append-only audit log (`~/.config/fleet/secrets/audit.log`, timestamp/repo/dest/outcome,
+**never the value**). `fleet doctor` reports `pass` state and whether referenced entries
+resolve (no decrypt).
+
+**Honest threat model — read this.** On a single-user box the agent runs as the **same
+uid** as you, so it **CAN** `cat` an injected file or run `pass show` itself. This feature
+buys **auto-injection + accidental-commit protection + encryption-at-rest** — it does
+**NOT** make the secret unreadable by the agent, and is not documented as such. Genuine
+"the AI cannot read it" is impossible same-uid and would need a separate uid for both
+placement and the consuming process (a much larger, separate project).

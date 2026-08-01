@@ -73,6 +73,38 @@ this project with the `fleet` CLI.
   a hard block: it raises the severity to `blocked` so it fires a desktop notify
   (a routine summary stays `info` / silent). Don't sit silent — POST. (This is the
   canonical worker→human verb; `fleet inbox put` is the internal primitive.)
+- `fleet gate approve|reject|show|list [<id|slug>] [--gate N] [-m reason] [--yes]` — **decide a
+  gate.** This is the single authority; the viewer's `:FleetApprove`/`:FleetReject` Ex
+  commands and the leader deck (`prefix+F` → `g`) both funnel into it, and so does simply
+  talking to the sub-orch's harness pane when you want to approve *with amendments*.
+  Headless: no tmux, no dashboard, no nvim needed. With no target it resolves the dispatch
+  whose sub-orch window you are in. **`reject` ALWAYS requires a reason** (`-m`, `--file`,
+  or `$EDITOR`) — an empty one aborts and writes nothing — and routes the pipeline back
+  exactly one rung (gate 1 → the PLAN role, gate 3 → the IMPLEMENTATION role in the same
+  worktree), counting the lap and **escalating instead of routing at 3**. Deciding
+  **does not un-park**: the decision is written to the ledger and a courier delivers it,
+  un-parking only once the sub-orch has demonstrably received it — so an undelivered
+  decision leaves every reap guard and reconcile exemption in place. Unlike the rest of
+  fleet this verb **dies** on a target it cannot resolve rather than failing silently: a
+  silent no-op here is a human who believes they approved and walks away.
+  **Gate 2 asks you to type the slug back.** It is the approval that actually moves
+  code, so approving it shows the merge preview and requires the slug — and with **no
+  terminal and no `--yes` it REFUSES (rc 2, nothing written)** rather than silently
+  skipping the prompt, because a confirmation that quietly does not happen is the same
+  as not having one. `--yes` is the explicit, recorded escape hatch for scripts; the
+  absence of a tty is not consent. Gates 1 and 3 are unchanged. An explicit `--gate N`
+  that disagrees with the parked gate is refused for the same reason.
+- `fleet human on|off|status [<agent>]` — declare that **a human, not an agent, is working
+  in this pane.** Everything else in fleet keys on `@agent_state`, i.e. on an *agent's*
+  hook reports — so a person sitting in a worktree with claude exited is invisible, and
+  `fleet reap` would kill their window and delete the tree. With this set, reap refuses
+  that worktree (**not even with `--force`** — `fleet human off` is the escape hatch),
+  `fleet send` refuses to type into the pane, and `fleet reconcile` leaves the dispatch
+  alone. Stored as a pane option, never a TSV column.
+- `fleet unwatch [<pane>]` — disarm the watcher armed on a pane. Until now an armed
+  `fleet watch` could not be cancelled at all; its only exits were "all idle", "one
+  blocked", or the ~90-minute cap. A watch whose targets have **vanished** now also ends
+  on its own instead of running out that cap.
 - `fleet mode <agent>` — cycle that agent's permission mode one step. Only for
   harnesses that expose permission modes (e.g. claude); a no-op for harnesses
   like omp that have none.
