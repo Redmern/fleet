@@ -1443,9 +1443,30 @@ $(ready_instructions)"
   # while that pane is a live OCCUPANT of $dir. Occupancy, not mere liveness, is the
   # discriminator: the pair shares $dir exactly, while pane ids restart at %0 on a new
   # tmux server — the very event markers persist across — so a server-global liveness
-  # test keeps a stale marker on a recycled id. Same scan shape as cmd_reap's
-  # live-occupant check; realpath because the dispatch symlink farm makes $dir and
-  # pane_current_path differ in the real deployment. A miss CLEARS, deliberately: a
+  # test keeps a stale marker on a recycled id.
+  #
+  # NOT the same scan as cmd_reap's live-occupant check, and it cannot be: they answer
+  # different questions. Two deliberate differences.
+  #  - EXTRA here: `is_main_pane`. `cmd_ready` (4057) has no role check and its bleed
+  #    guard is exempted for linked worktrees (4075-4077), so the command centre —
+  #    cd'd into a worktree, running a bare `fleet ready` — writes a marker bearing
+  #    its OWN pane id. main is a live occupant of $dir that never dies, so without
+  #    this the marker is kept forever and the next worker on that branch inherits a
+  #    `done` flag it never set. main is never the agent the marker is about.
+  #    RESIDUAL, not free: `.fleet/roles/<pane_id>` accumulates dead entries (2031),
+  #    so a recycled pane id can be mis-read as main — and here a false positive
+  #    CLEARS A LIVE WORKER'S MARKER. Accepted because the window-name fast path (228)
+  #    makes the registry read a second-line fallback, and because the failure
+  #    direction matches this block's own bias (see the CLEARS note below).
+  #  - ABSENT here, on purpose: any `[ -n "$_gstate" ]` known-agent-state filter.
+  #    fleetd being down would then clear EVERY marker in the fleet — the opposite of
+  #    what this block is for.
+  # realpath because the dispatch symlink farm makes $dir and
+  # pane_current_path differ in the real deployment. Only the $dir side is testable:
+  # `#{pane_current_path}` is the kernel cwd and is therefore ALWAYS already physically
+  # resolved, so mutating that realpath cannot change any outcome (verified green under
+  # mutation). It is kept for symmetry and because the field's contract is tmux's, not
+  # ours; F11 pins the $dir side, which is the mutable one. A miss CLEARS, deliberately: a
   # cleared marker costs a pill and one `fleet ready`, a kept stale one costs a live
   # agent's worktree. RESIDUAL: a reliability check, not a control — cmd_ready writes
   # with `>`, so two live agents flagging one worktree still race, last writer wins.
@@ -1456,6 +1477,11 @@ $(ready_instructions)"
     while IFS=$'\t' read -r _gp _gpath; do
       [ "$_gp" = "$_rpane" ] || continue
       [ "$(realpath "$_gpath" 2>/dev/null || echo "$_gpath")" = "$_drp" ] || continue
+      # LAST, after the pane-id filter: `is_main_pane` costs 3 forks + 3 tmux RPCs,
+      # and at most one pane can match the recorded id, so placed here it runs ≤1×
+      # per `fleet new`. Placed before the filter it would run for every pane on the
+      # server, on every spawn.
+      is_main_pane "$_gp" && continue
       _live=1; break
     done < <(tmux list-panes -a -F '#{pane_id}'$'\t''#{pane_current_path}' 2>/dev/null)
   fi
@@ -2527,25 +2553,82 @@ cmd_gate() {
 # sentinel — while a genuine popped sentinel is on LINE 2 and never lower.
 #
 # The offset is therefore a CONSEQUENCE OF THE HEADER, not an allowance: line 2 is
-# honoured only when line 1 is an actual pop header. `fleet inbox put` has NO role
-# check, so any pane can enqueue an arbitrary body; a bare bound of N would hand an
-# attacker N-1 lines of camouflage lead-in to bury a forged sentinel behind.
+# honoured only when line 1 LOOKS LIKE a pop header.
+#
+# BE PRECISE ABOUT WHAT THAT BUYS, because the previous wording overclaimed it.
+# THIS BOUNDS CAMOUFLAGE; IT DOES NOT AUTHENTICATE. `fleet inbox put` has NO role
+# check (3226-3246: its only identity check drops `--from so-*`) and `inbox_pop_text`
+# inserts nothing between the header and the body — so a forger authors line 1 AND
+# line 2, and the pop path then hands this oracle a 100% genuine header. No glob can
+# test bytes its adversary writes, and at a single uid nothing here can. `A14` in
+# test/suborch-merge-gate-proof.sh PINS THAT FORGERY OPEN so this claim stays
+# falsifiable: if it ever goes red, the limit moved and this comment is stale.
+#
+# What the anchor does close is the ACCIDENT, which is the case actually observed:
+# `From ` as a bare prefix made any English sentence starting with that word a pop
+# header, so `From the plan we discussed: …` + a quoted sentinel crossed a gate at
+# rc 0. A genuine header is `From <from>: <title>` where <from> is exactly ONE token
+# (a window name — validated to [A-Za-z0-9._/-] — or `so-<id>`, or `-`), never a
+# phrase. That, not the line count, is what separates a header from prose.
+# RESIDUAL, stated rather than overclaimed: a ONE-WORD lead-in still crosses
+# (`From yesterday: note` parses). This narrows the accident, it does not remove
+# the class — consistent with "bounds camouflage, does not authenticate" above.
+# `%%` (longest suffix) is load-bearing: `%` would cut at the FIRST ": ", so a
+# genuine title containing ": " would yield a multi-word <from> and be REJECTED.
+#
+# THE COST THIS BUYS AT: genuine-header validity now depends on the sender's tmux
+# WINDOW NAME containing no whitespace. `inbox_put` (3319) derives `from` from
+# `#{window_name}`, and tmux window names are NOT held to fleet's `--name` charset
+# check — an auto-renamed or hand-renamed window ("git diff") yields
+# `From git diff: t`, which this refuses despite being a 100% genuine approval.
+# Fail-CLOSED, so it costs a refused gate and never a false approval, and it is the
+# right direction for this trade. Pinned as characterisation by A15 so the failure
+# mode is visible rather than discovered at a gate. If it ever bites in practice the
+# fix is to constrain the derived `from`, NOT to loosen this anchor back to prose.
+#
+# Rejected tightening (T2): also requiring the trailing `  (<disp>)` clause. That
+# clause is emitted only when the message carries a dispatch id (3550), so T2 rejects
+# a genuine `gate post` made without `-d` — while passing the rest of the suite
+# byte-identically, which is exactly how a wrong tightening ships. Pinned by A11.
 gate_parse() { # parse [file]
   # Reads line 1 and line 2 and nothing else — the bound is structural, not a knob.
-  local head l1 l2 first=""
+  local head l1 l2 first="" hfrom
   if [ -n "${1:-}" ] && [ -f "$1" ]; then head=$(sed -n '1,2p' "$1" 2>/dev/null)
   else head=$(sed -n '1,2p' 2>/dev/null); fi
   l1=$(printf '%s\n' "$head" | sed -n 1p)
   l2=$(printf '%s\n' "$head" | sed -n 2p)
   case "$l1" in
-    \[FLEET-GATE:*\]*) first="$l1" ;;                                  # a bare body
-    "From "*) case "$l2" in \[FLEET-GATE:*\]*) first="$l2" ;; esac ;;  # a popped message
+    \[FLEET-GATE:*\]*) first="$l1" ;;                     # a bare body
+    "From "*": "*)                                        # a popped message
+      # Single-token <from>, or it is prose, not a header.
+      hfrom="${l1#From }"; hfrom="${hfrom%%: *}"
+      case "$hfrom" in
+        ""|*[[:space:]]*) ;;
+        *) case "$l2" in \[FLEET-GATE:*\]*) first="$l2" ;; esac ;;
+      esac ;;
   esac
   [ -n "$first" ] || return 1
   local inner="${first#\[FLEET-GATE:}"; inner="${inner%%\]*}"   # "1 slug=x action=implement"
   local n="${inner%% *}" rest="${inner#* }" kv
+  # The enum is closed. Unvalidated, `[FLEET-GATE:99 …]` printed gate=99 at rc 0 and
+  # `[FLEET-GATE:2slug=x]` printed gate=2slug=x — malformed, yet reading as gate 2 to
+  # any consumer doing a prefix match.
+  case "$n" in 1|2) ;; *) return 1 ;; esac
   printf 'gate=%s' "$n"
-  for kv in $rest; do case "$kv" in *=*) printf ' %s' "$kv" ;; esac; done
+  # SPLIT WITHOUT GLOBBING. `for kv in $rest` was unquoted and the shell runs `set -u`
+  # but NOT `set -f`, so a sentinel containing `slug=*` was expanded against the CWD:
+  # measured `gate=2 slug=EVIL slug=EVIL2 action=merge target=main` from a directory
+  # holding files of those names — field values sourced from the filesystem, and with
+  # `target=*` a SECOND target=, the field the merge acts on. `read -r -a` word-splits
+  # on IFS and never globs; the `+` expansion keeps an empty array safe under `set -u`.
+  # Globbing is not the ONLY delta, so do not read it as a pure swap: IFS is narrowed
+  # from the default to a single space, so a TAB inside the sentinel no longer splits
+  # (it becomes part of one field). Unreachable from `gate_post`, which emits
+  # space-separated k=v only, and harmless if it ever is: a tab-bearing field prints
+  # verbatim instead of splitting into two. Named so the next reader does not assume
+  # the old separator set.
+  local -a kvs=(); IFS=' ' read -r -a kvs <<<"$rest"
+  for kv in ${kvs[@]+"${kvs[@]}"}; do case "$kv" in *=*) printf ' %s' "$kv" ;; esac; done
   printf '\n'
 }
 
