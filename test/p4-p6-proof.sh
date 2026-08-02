@@ -352,10 +352,19 @@ n_fleet_new() { grep -cE '^fleet new ' "$1/cmds.log" 2>/dev/null || echo 0; }
 # rank the rungs and compare. This is the honest test, and it is strictly HARDER
 # to satisfy than "did not crash": a restarting sub-orch rewinds, and rewinding
 # is precisely what this catches (P4b-MUT confirms it can).
-rung_index() { # <cursor value> -> 0..5, or -1 for unknown/empty
+rung_index() { # <cursor value> -> 0..7, or -1 for unknown/empty
+  # d34 S7: the 3->4 role split APPENDED `plan` and `gate3-wait`. `research` stays at
+  # index 0 — appending is what keeps every in-flight ledger monotonic, so a dispatch
+  # that was mid-flight across the change still resolves its phase at the same relative
+  # position and never silently restarts. Keep this list in sync with FLEET_SUBORCH.md
+  # §3.0.5 and test/plan-role-recon-proof.sh case 1; those three are the only copies.
+  # -1 for unknown is deliberately NOT an error: the vocabulary has drifted unchecked
+  # before (d32's `followups`), and a reader that fails on an unrecognised rung turns a
+  # cosmetic drift into a stalled pipeline. Unknown is treated as ABSENT.
   case "$1" in
-    research)   echo 0 ;; gate1-wait) echo 1 ;; impl) echo 2 ;;
-    test)       echo 3 ;; gate2-wait) echo 4 ;; done) echo 5 ;;
+    research)   echo 0 ;; plan)       echo 1 ;; gate1-wait) echo 2 ;;
+    impl)       echo 3 ;; gate3-wait) echo 4 ;; test)       echo 5 ;;
+    gate2-wait) echo 6 ;; done)       echo 7 ;;
     *)          echo -1 ;;
   esac
 }

@@ -993,6 +993,40 @@ render() {
     fi
   fi
 
+  # ALERTS STRIP. `append_dashboard_alert` (bin/fleet) has six writers — reconcile's
+  # stranded/failed paths, the gate-orphan escalation, the wake escalation — and
+  # until now ZERO readers: every one of those events went into a file nobody opened.
+  #
+  # It costs NOTHING when there is nothing to say. No alerts.log, or an empty one,
+  # emits not one row, so a fleet that never uses gates renders byte-identically to
+  # before this existed. Capped at ALERT_ROWS: an alert flood must never push the
+  # agent list off the screen, which would turn a visibility feature into a
+  # visibility bug. Newest first — the oldest alert is the least actionable one.
+  # Fail-silent on a garbage/unreadable file, like every other read here.
+  # >>> d34:alerts
+  if [ -r "$(dash_root)/.fleet/dispatch/alerts.log" ]; then
+    local _ats _amsg _arow _an=0
+    # `ins`/`drawn`/`slots` default so this fragment is eval-able standalone by
+    # test/gate-visibility-proof.sh — the extraction is the proof's only honest way
+    # to exercise the REAL renderer rather than a copy of it.
+    while IFS=$'\t' read -r _ats _amsg; do
+      [ -n "${_amsg:-}" ] || continue
+      (( _an >= ${ALERT_ROWS:-3} )) && break
+      (( ${drawn:-0} < ${slots:-99} )) || break
+      _an=$(( _an + 1 ))
+      _arow="⚠ ${_amsg}"
+      (( ${#_arow} > cw )) && _arow="${_arow:0:$(( cw > 1 ? cw - 1 : 0 ))}…"
+      printf '\033[2m│\033[0m%s\033[38;5;179m%-*s\033[0m%s\033[2m│\033[0m\033[K\n' \
+        "${ins:-}" "$cw" "$_arow" "${ins:-}"
+      drawn=$(( ${drawn:-0} + 1 ))
+    done < <(tac "$(dash_root)/.fleet/dispatch/alerts.log" 2>/dev/null | tr -d '\000')
+    # one blank spacer, only if we actually drew something and it fits
+    if (( _an > 0 )) && (( ${drawn:-0} < ${slots:-99} )); then
+      printf '\033[2m│%s│\033[0m\033[K\n' "${blank:-}"; drawn=$(( ${drawn:-0} + 1 ))
+    fi
+  fi
+  # <<< d34:alerts
+
   if (( N == 0 && ORPHAN_ROW == 0 && SYSTEM_ROW == 0 )); then
     (( drawn < slots )) && { printf '\033[2m│\033[0m%s%-*s%s\033[2m│\033[0m\033[K\n' \
       "$ins" "$cw" "no agents yet — press n to spawn one" "$ins"; (( drawn++ )); }
