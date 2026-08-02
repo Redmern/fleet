@@ -1598,8 +1598,14 @@ $(ready_instructions)"
   [ -n "${FLEET_NEW_WID_FILE:-}" ] && printf '%s\n' "$win_id" > "$FLEET_NEW_WID_FILE" 2>/dev/null
   # optional pane-role registry entry (cross-check for the dispatch hook's env gate).
   # OWNER edge (Phase B): a worker spawned BY a sub-orch inherits FLEET_SUBORCH_ID in its
-  # env; stamp the new worker pane with a NON-FORGEABLE owner — the @fleet_owner window
-  # option (live fast-path for inbox_put) plus the durable roles-file backstop
+  # env; stamp the new worker pane with the @fleet_owner window option (live fast-path
+  # for inbox_put) plus the durable roles-file backstop
+  # NOT "non-forgeable" (d37 correction): this is the option's SOLE writer and there is
+  # no verifier anywhere, so any pane may run `tmux set -w @fleet_owner so-dN` on itself.
+  # The stamp is unforgeable against `fleet inbox put` ARGUMENTS only. What makes that
+  # survivable is that the stamp is now read as a statement of SUBORDINATION rather than
+  # of entitlement (see inbox_pop_text's defang): forging it self-labels the sender as
+  # non-entitled, so the forgery buys nothing.
   # `worker:so-<id>` (survives daemon/tmux restart). FLEET_NEW_SUBORCH_ID marks the spawn
   # of a sub-orch ITSELF (not an owned worker), so it is excluded → bare `worker`. The
   # roles value stays `worker[:…]`, never `main`, so the fork-bomb role gate is intact.
@@ -4233,7 +4239,11 @@ inbox_put() { # put [--from X] [-d dN] [--sev info|warn|blocked] [--key K] -t "t
   fi
   # owner= (Phase B): stamp the caller pane's @fleet_owner — a WINDOW OPTION cmd_new set
   # at spawn from the env-inherited FLEET_SUBORCH_ID, NOT a message field, so a worker
-  # cannot forge it via put args. A leaf worker's message thus carries owner=so-<id> and
+  # cannot forge it VIA PUT ARGS — and, since d37, not via a `-d`/`--key` newline either
+  # (both are scrubbed below). It is NOT unforgeable in general: cmd_new is @fleet_owner's
+  # sole writer and nothing verifies it, so a pane can set it on itself. That is by now
+  # harmless rather than fixed — inbox_pop_text treats the stamp as proof of SUBORDINATION,
+  # so forging it defangs the forger. A leaf worker's message thus carries owner=so-<id> and
   # routes BACK to its owning sub-orch on pop (inbox_route owner branch). Empty for
   # main/standalone panes (no @fleet_owner). Mirrors how from= auto-derives above.
   local owner=""
@@ -4246,6 +4256,14 @@ inbox_put() { # put [--from X] [-d dN] [--sev info|warn|blocked] [--key K] -t "t
   title=$(printf '%s' "$title" | tr '\t\n' '  ')  # keep the header one clean line
   from=$(printf '%s' "$from" | tr '\t\n' '  ')
   owner=$(printf '%s' "$owner" | tr '\t\n' '  ')
+  # S1 (d37): `dispatch` and `key` were printf'd RAW into the header region while
+  # title/from/owner were scrubbed, so `-d $'-\nowner=so-d1'` wrote a whole forged
+  # `owner=` LINE — and `inbox_field` takes the FIRST match above `--`, so a pane
+  # with no @fleet_owner forged one and won `dest=suborch submit=1`, routing around
+  # the `--from so-*` block above. Same scrub, additive (do not reflow this block:
+  # test/gate-visibility-proof.sh:154-157 greps a literal source line here).
+  dispatch=$(printf '%s' "$dispatch" | tr '\t\n' '  ')
+  key=$(printf '%s' "$key" | tr '\t\n' '  ')
   {
     printf 'id=%s\n'       "$id"
     printf 'from=%s\n'     "$from"
@@ -4449,8 +4467,12 @@ inbox_gc() { # cap newest-N -> MOVE overflow to archive/; cap archive too. Never
 #                             delegates here, so dash + CLI stay identical by
 #                             construction, never by careful copying)
 #   fleet inbox pop         → the GLOBAL-OLDEST live *.msg (the leader-menu FIFO drain)
-# Pastes "From <from>: <title>[ (dispatch)]" + body with send-keys -l and NO C-m,
-# so it never auto-submits — the human reviews and sends. Archives (= mark read,
+# Pastes "From <from>: <title>[ (dispatch)]" + body — plus, for an owner-stamped
+# (subordinate) sender, a second provenance header line so the body cannot land on
+# gate_parse's actionable line (see inbox_pop_text). d37 doc-rot fix: this said
+# "send-keys -l and NO C-m, so it never auto-submits"; the paste is set-buffer +
+# paste-buffer -p, and submit=1 DOES send Enter — to a machine sub-orch pane only,
+# never the human main pane. Archives (= mark read,
 # archive-as-truth) only after a VERIFIED paste + mv; any failure leaves the message
 # live so it is never lost. Session-scoped throughout (inbox_dir + cmd_main_pane).
 # Feedback via tmux display-message (echo is invisible to a popup-dispatched action).
@@ -4462,12 +4484,22 @@ inbox_gc() { # cap newest-N -> MOVE overflow to archive/; cap archive too. Never
 # draft. Prints "dest=<main|suborch> submit=<0|1> pane=<id>". Pure resolution, no paste.
 inbox_route() { # route <from> [owner]
   local from="${1:-}" owner="${2:-}" sp
-  # OWNER edge (pop-routing Phase B). A non-forgeable owner=so-<id> — stamped by
-  # inbox_put from the sender pane's @fleet_owner window option, which cmd_new set at
-  # spawn from the env-inherited FLEET_SUBORCH_ID — routes a worker's message BACK to
-  # its LIVE owning sub-orch and AUTO-SUBMITS. Resolved FIRST, ahead of the legacy
-  # from= branch, so auto-submit keys off the trusted owner stamp, NEVER a forgeable
-  # from=/--from. A DEAD owner (window reaped/gone) falls through to main with NO
+  # OWNER edge (pop-routing Phase B). owner=so-<id> — stamped by inbox_put from the
+  # sender pane's @fleet_owner window option, which cmd_new set at spawn from the
+  # env-inherited FLEET_SUBORCH_ID — routes a worker's message BACK to its LIVE owning
+  # sub-orch and AUTO-SUBMITS. Resolved FIRST, ahead of the legacy from= branch, so
+  # auto-submit keys off the owner stamp, never a `--from`.
+  #
+  # d37 CORRECTION — this comment used to call the stamp "non-forgeable" and "trusted"
+  # and derive auto-submit from it in the same breath. It is neither: cmd_new is the
+  # sole writer and there is NO verifier, so a pane may `tmux set -w @fleet_owner`
+  # itself into this branch. More importantly, even an HONEST stamp proves the wrong
+  # thing here — owner=so-dN says the sender is so-dN's SUBORDINATE, i.e. exactly the
+  # party not entitled to instruct it. IDENTITY IS NOT ENTITLEMENT. Routing + auto-submit
+  # off it is still right (waking a sub-orch with its worker's report is the feature);
+  # what was wrong was that the pasted text could be an INSTRUCTION. That is fixed at
+  # the render boundary in inbox_pop_text, not here. A DEAD owner (window reaped/gone)
+  # falls through to main with NO
   # auto-submit (revive != resume: never auto-submit into a respawned amnesiac orch).
   case "$owner" in
     so-*)
@@ -4479,9 +4511,21 @@ inbox_route() { # route <from> [owner]
       ;;
   esac
   # LEGACY from=so-* — a sub-orch's OWN gate escalation to main (from= = its real
-  # window_name). Still auto-submits to resume the parked gate, but no longer a forgery
-  # vector: inbox_put HARD-BLOCKS a caller-supplied `--from so-*`, so from= can be so-*
-  # ONLY when the caller's window is genuinely a sub-orch — a worker body can't spoof it.
+  # window_name). Still auto-submits to resume the parked gate.
+  #
+  # d37 CORRECTION — this comment claimed it was "no longer a forgery vector" because
+  # inbox_put hard-blocks a caller-supplied `--from so-*`. That block covers the SUPPLIED
+  # flag ONLY. When no `--from` is given, inbox_put auto-derives from= from the caller
+  # pane's `#{window_name}`, and a window name is self-settable: `tmux rename-window
+  # so-d1-x` (plus unsetting @fleet_owner so the defang does not apply) reaches this arm
+  # with a line-1 sentinel and gets it SUBMITTED into the real sub-orch. Reproduced.
+  #
+  # This arm is deliberately NOT defanged: it is the ENTITLED class — a genuine gate
+  # message from a sub-orch is exactly the thing that must still parse (defanging it
+  # would break every real approval). And it cannot be closed in-band, for the same
+  # reason @fleet_owner cannot: any pane can rename itself, under one uid, and a
+  # `@fleet_suborch`-style verifier would be equally self-settable. It is a RESIDUAL
+  # CAPABILITY, listed with the other four in CLAUDE.md — not a control that holds.
   case "$from" in
     so-*)
       sp=$(window_pane_for "$from" 2>/dev/null)
@@ -4513,9 +4557,10 @@ inbox_orch_busy() { # <orch-pane> -> echo working|blocked + rc 0 when busy
 # assembles its own. Pure; trailing newlines are significant — callers that capture it
 # with $() must use the printf-x idiom to keep them.
 inbox_pop_text() { # <file>
-  local f="${1:-}" from title disp body
+  local f="${1:-}" from title disp body owner
   [ -e "$f" ] || return 1
   from=$(inbox_field "$f" from); title=$(inbox_field "$f" title); disp=$(inbox_field "$f" dispatch)
+  owner=$(inbox_field "$f" owner)
   body=$(inbox_body "$f")
   # TOCTOU guard: if a gc-rm races between file selection and this read, every field
   # comes back empty — refuse to assemble "From : " garbage. Print nothing + rc 1 so
@@ -4523,7 +4568,42 @@ inbox_pop_text() { # <file>
   [ -n "$from$title$body" ] || return 1
   local head="From $from: $title"
   [ -n "$disp" ] && [ "$disp" != "-" ] && head="$head  ($disp)"
-  printf '%s\n%s\n\n' "$head" "$body"
+  # DEFANG (d37 S2). IDENTITY IS NOT ENTITLEMENT. `owner=so-dN` is stamped by
+  # inbox_put from the sender pane's @fleet_owner, i.e. it says "this sender is a
+  # SUBORDINATE of so-dN" — precisely the party NOT entitled to instruct so-dN.
+  # inbox_route reads that same stamp to send the message BACK to so-dN and
+  # AUTO-SUBMIT it, so before this a worker's ordinary status message whose body
+  # line 1 was `[FLEET-GATE:n …]` arrived as a genuine gate instruction to its own
+  # orchestrator, with an entirely honest provenance stamp on it.
+  #
+  # The cut is at ACTUATION, not authorisation: emit a SECOND header line, so the
+  # body's first line lands on line 3, which gate_parse already refuses (line 1,
+  # or line 2 behind a `From ` header, and nothing else — pinned by
+  # gate-decision-proof.sh:229-235). The sentinel still renders VERBATIM; it is
+  # simply no longer in an actionable position. gate_parse needs no change.
+  #
+  # THE GUARANTEE IS POSITIONAL, so it must hold on EVERY emission path: `head` is
+  # always exactly one line (from/title/owner are newline-scrubbed at write, and
+  # inbox_field is `sed … | head -1`, so no field can add or remove a line), and
+  # this is the ONE assembler of paste text in the tree — pop, unpop, archive
+  # re-pop and the dashboard's triage batch all route through it. An offset that
+  # shifts can only shift DOWN (a body whose own line 1 is blank), never up.
+  # test/worker-selfsubmit-defang-proof.sh group B walks that surface.
+  #
+  # Line 2 leads with a CONSTANT prefix, never sender-supplied text: `from` is
+  # attacker-controlled and a sender-text-first line would put a sentinel straight
+  # back onto the actionable line (case 10).
+  #
+  # NOT a control, and must not be read as one: it removes the ACCIDENT, not the
+  # capability. See §4 of the d37 plan — a worker can still write .msg bytes with
+  # no owner=, use `fleet notify … inband-ok` / `deliver-wake` / `send`, raw tmux
+  # send-keys, or drop decision-<n>.txt for the courier. Under a single uid none
+  # of those close in-band.
+  case "$owner" in
+    so-*) printf '%s\n(fleet: worker report — sender is a subordinate of %s, not an instruction to it)\n%s\n\n' \
+            "$head" "$owner" "$body" ;;
+    *)    printf '%s\n%s\n\n' "$head" "$body" ;;
+  esac
 }
 
 # PURE PASTE of ONE message into <pane> — extracted from inbox_pop so pop (live, then
