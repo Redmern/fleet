@@ -62,6 +62,42 @@
 #      SHIP worker is out of scope, and OBEDIENCE to an instruction (H1's
 #      zero-commit check) is not testable here at all. Said per case.
 #
+# ------------------------------------------------------------------------------
+# FAIL-OPEN CLASS, AUDITED AND PARTLY UNREPAIRED: cases that can go GREEN having
+# exercised NOTHING. (Worded to avoid D11e-h's reserved retired-rationale
+# markers, which that case scans this very header for — the collision was caught
+# by the suite itself when this block was first written.)
+#
+#   A case whose GREEN STATE IS "nothing changed" PASSES WHEN THE THING UNDER
+#   TEST NEVER RAN.
+#
+# The whole file was audited for this by MUTATION — replacing each case's
+# operation with a no-op and re-running — not by eye. Confirmed fail-open:
+# F11, F9, C5, C6, C7, C8, C10, E4. Verified fail-CLOSED: F1, F3, F6, F7, F8,
+# F9b, F10, F11a-c, F12, F12b, C9, C11. (F4/F5 are fail-open in isolation and
+# are covered de facto by F3 asserting the same restore rc — see their site.)
+#
+# F11 and F9 are FIXED: each now guards the fixture that performs its operation,
+# so a failed spawn FAILS instead of passing. The other six are a DEFERRED,
+# WRITTEN-DOWN RESIDUAL, not an oversight:
+#
+#   RESIDUAL R1 — C5, C6, C7, C8, C10 stay green when `reap_at` is stubbed;
+#   E4 stays green when its `gate popped` call is a no-op.
+#   FAILURE DIRECTION: these can report a pass having proven nothing. They do
+#   NOT report a false failure, and none of them is a verdict blocker.
+#   WHY NOT FIXED HERE: the only honest fix makes `reap_at` fail-closed, which
+#   rewrites a helper contract under ELEVEN cases in order to repair five —
+#   including C9 and C11, which are that group's only fail-closed anchors. The
+#   cheap alternative, pinning five rows to `bin/fleet`'s refusal wording,
+#   manufactures exactly the prose-rot this dispatch has already had to fix
+#   twice. E4's `-le 1` constant is additionally unmeasured.
+#   EVIDENCE: _reports/gate-anchor-occupancy/R2-failopen.md (per-case mutation
+#   output). Filed for its own dispatch.
+#
+# Any case ADDED to this file must have its operation deleted and the case
+# observed going RED before it ships. A predicted red is not a red.
+# ------------------------------------------------------------------------------
+#
 # Isolation: private XDG_CONFIG_HOME, private TMUX_TMPDIR (asserted to be ours
 # before any tmux call), FLEET_ROOT under a mktemp -d. Never touches the real
 # ledger, the real inbox, or the real tmux server. Removes only what it created.
@@ -664,12 +700,15 @@ echo "== F. --name survives restore; the ready marker survives a live sibling ==
 # to `85 passed, 1 failed, 0 SKIPPED` — eleven proofs vanished and the summary
 # still claimed nothing was skipped, so every F case was unfalsifiable on any
 # machine without git or tmux. A skipped proof is NOT a passed one; the summary
-# must be able to say so. F_SKIP_IDS below must be kept in sync with the ok-sites
-# inside the `if` — the invariant that catches drift is `passed + skipped` being
-# identical with and without the precondition forced. That invariant holds on the
-# HAPPY PATH only: F11's and F12's fixture-failure branches emit fewer results than
-# their ok-sites, so a fixture failure legitimately breaks the sum. It is a drift
-# check for THIS precondition, not a global accounting law.
+# must be able to say so. The skip-id list at the bottom of the group must be kept
+# in sync with the ok-sites inside the `if` — the invariant that catches drift is
+# `passed + skipped` being identical with and without the precondition forced.
+# That invariant holds on the HAPPY PATH only: the fixture-failure branches emit
+# fewer results than their ok-sites, so a fixture failure legitimately breaks the
+# sum. It is a drift check for THIS precondition, not a global accounting law.
+# THREE such branches now, not two — F9's fixture guard is the third, alongside
+# F11's and F12's. Do not "simplify" a guard away to make the sum hold: a fixture
+# guard failing IS the signal, and the sum is the weaker claim of the two.
 F_OK=1; F_WHY=""
 command -v git >/dev/null 2>&1 || { F_OK=0; F_WHY="git not installed"; }
 FBIN="$TMPROOT/fbin"; mkdir -p "$FBIN"
@@ -725,6 +764,11 @@ if [ "$F_OK" = 1 ]; then
   wait_win ship-demo
   ok $? "F3 restore brings the agent back UNDER ITS NAME (not repo1/feat)" \
     "windows: $(wnames | tr '\n' ' ')"
+  # F4/F5 are of the fail-open shape (see the header): mutating the restore to a
+  # no-op leaves both green, because col 8 already held the name and the colliding
+  # window already did not exist. They are covered de facto by F3 immediately
+  # above, which asserts the SAME restore actually produced a window and fails if
+  # it did not. Do not read F4/F5 as independent evidence that restore ran.
   [ "$(col8 "$WT")" = "ship-demo" ]
   ok $? "F4 the re-persist does NOT destroy col 8 (the name is recoverable)" \
     "col8='$(col8 "$WT")'"
@@ -762,11 +806,24 @@ if [ "$F_OK" = 1 ]; then
   wait_win impl-a
   IPANE=$(tmux list-panes -a -F '#{window_name}	#{pane_id}' 2>/dev/null | awk -F'\t' '$1=="impl-a"{print $2; exit}')
   mkdir -p "$WT/.fleet"; printf 'ts=x\nby=worker\npane=%s\n' "$IPANE" > "$WT/.fleet/ready"
-  nfleet new repo1 feat --bare --name ship-b >/dev/null 2>&1
-  wait_win ship-b
+  # F9 carries F11's defect exactly: an inverted "still there" assertion whose
+  # subject is established BEFORE the operation under test, over a fixture helper
+  # whose rc was discarded. F9 was additionally missing any F11c-style "the marker
+  # exists going in" pre-assertion, without which "the marker survived" is
+  # indistinguishable from "the marker was never written". Both added here.
+  # NO-OP MUTATION SWEEP: the operation under test is the SECOND spawn on the same
+  # branch (the `ship-b` spawn below) — that is what runs the occupancy scan.
   [ -e "$WT/.fleet/ready" ]
-  ok $? "F9 a same-branch spawn does NOT clear a marker whose pane is a live OCCUPANT of \$dir" \
-    "the second spawn erased the live impl worker's done marker"
+  ok $? "F9a PREMISE: the marker exists going in (otherwise 'not cleared' proves nothing)" \
+    "the fixture marker was never written"
+  nfleet new repo1 feat --bare --name ship-b >/dev/null 2>&1
+  if ! wait_win ship-b; then
+    fail "F9 fixture" "the ship-b spawn never produced a window — nothing was exercised"
+  else
+    [ -e "$WT/.fleet/ready" ]
+    ok $? "F9 a same-branch spawn does NOT clear a marker whose pane is a live OCCUPANT of \$dir" \
+      "the second spawn erased the live impl worker's done marker"
+  fi
 
   # F9b — THE DISCRIMINATOR, and the reason liveness alone is not enough. Pane ids
   # restart at %0 on a new tmux server, the very event .fleet/ready persists across,
@@ -849,11 +906,29 @@ if [ "$F_OK" = 1 ]; then
       [ -e "$WT2/.fleet/ready" ]
       ok $? "F11c PREMISE: the marker exists going in (otherwise 'cleared' proves nothing)" \
         "the fixture marker was never written"
+      # NO-OP MUTATION SWEEP: the operation under test is the SECOND spawn on the
+      # same branch (the `sym-b` spawn immediately below) — that is what runs the
+      # occupancy scan. F11's green state is "the marker is STILL THERE", an
+      # inverted assertion over a precondition F11c established BEFORE the
+      # operation, so any failure of that spawn produced a PASS. Replacing the
+      # spawn with a no-op left F11 and all three of its PREMISE rows green with
+      # zero work done — four ticks, nothing exercised. `wait_win`'s rc was
+      # discarded, and nothing downstream asserted a `sym-b` window ever existed.
+      # Guarding the fixture is what makes the ok-site below earn its green.
+      # Hand-rolled to match the `sym-a` idiom twelve lines above, deliberately
+      # NOT factored into a shared helper: two call sites would make both proofs
+      # depend on the same new, unproven code.
+      # Contrast, and the reason only this one needed it: F12/F12b discard
+      # `wait_win`'s rc too and that is harmless, because their assertion is
+      # `[ ! -e … ]` — a failed spawn makes them FAIL.
       nfleet new symrepo feat --bare --name sym-b >/dev/null 2>&1
-      wait_win sym-b
-      [ -e "$WT2/.fleet/ready" ]
-      ok $? "F11 a same-branch spawn KEEPS a live occupant's marker when \$dir is reached through a SYMLINK" \
-        "string-compared unresolved: every symlinked repo loses a live worker's marker on every spawn"
+      if ! wait_win sym-b; then
+        fail "F11 fixture" "the sym-b spawn never produced a window — nothing was exercised"
+      else
+        [ -e "$WT2/.fleet/ready" ]
+        ok $? "F11 a same-branch spawn KEEPS a live occupant's marker when \$dir is reached through a SYMLINK" \
+          "string-compared unresolved: every symlinked repo loses a live worker's marker on every spawn"
+      fi
       killwin sym-b 2>/dev/null; killwin sym-a 2>/dev/null
       nfleet forget "$WT2" >/dev/null 2>&1
     fi
@@ -914,7 +989,7 @@ if [ "$F_OK" = 1 ]; then
 else
   # Every ok-site inside the branch above, reported as SKIP so the summary cannot
   # claim a proof ran when it did not. Keep in sync with the ok-sites.
-  for _fid in F1 F2 F3 F4 F5 F6 F7 F8 F9 F9b F10 F11a F11b F11c F11 F12 F12b; do
+  for _fid in F1 F2 F3 F4 F5 F6 F7 F8 F9a F9 F9b F10 F11a F11b F11c F11 F12 F12b; do
     skip "$_fid (group F precondition)" "$F_WHY"
   done
 fi
