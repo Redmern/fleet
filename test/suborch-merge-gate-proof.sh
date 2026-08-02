@@ -101,7 +101,13 @@ esac
 unset TMUX TMUX_PANE
 # Ambient fleet env from the pane running the harness would silently change the
 # verdicts in group B (FLEET_SELF_MERGE=1 makes every DENY case ALLOW).
-unset FLEET_ROLE FLEET_SELF_MERGE FLEET_SUBORCH_ID FLEET_SESSION 2>/dev/null || true
+# FLEET_AUTOCOMMIT is in that list for the same reason and was MISSING: two
+# independent measurements of one identical tree returned 113/0/0 and 112/1/0,
+# and the whole delta was this one variable leaking in from the fleet pane —
+# it turns the group-B `git commit (no-auto-commit backstop)` row from DENY to
+# ALLOW. Both numbers were honest; the suite was not quotable. Reproduced both
+# ways on this tree before the scrub was added.
+unset FLEET_ROLE FLEET_SELF_MERGE FLEET_SUBORCH_ID FLEET_SESSION FLEET_AUTOCOMMIT 2>/dev/null || true
 export GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null
 export FLEET_DEBUG_PORT=59223            # cmd_reap ends in `fuser -k <port>/tcp`
 export FLEET_SESSION="smg_t"
@@ -685,7 +691,23 @@ wnames() { tmux list-panes -a -F '#{window_name}' 2>/dev/null | sort -u; }
 have_win() { wnames | grep -qxF "$1"; }
 wait_win() { local i; for i in $(seq 40); do have_win "$1" && return 0; sleep 0.1; done; return 1; }
 col8() { awk -F'\t' -v d="$1" '$1==d{print $8}' "$AGENTS" 2>/dev/null; }
-killwin() { tmux kill-window -t "$(tmux list-panes -a -F '#{window_name}	#{window_id}' 2>/dev/null | awk -F'\t' -v n="$1" '$1==n{print $2; exit}')" 2>/dev/null; }
+# FAIL-CLOSED ON A MISS. The command substitution is empty when the window name
+# does not resolve, and `tmux kill-window -t ''` resolves to the CURRENT window —
+# so a miss blind-killed a live, unrelated window instead of doing nothing.
+# Measured on the unmutated tree at 113/0/0: exactly one miss per run (`ship-b`,
+# already killed by the F9b setup and re-killed by the reap-safety setup below),
+# i.e. every run silently destroyed one window. That is also the real root of the
+# adversary's V1 SECONDARY — F12/F12b failing with "could not cd the harness
+# 'main' window into $WT" whenever an F11 mutation shifted which window was
+# current. F12's fixture was never coupled to F11's second spawn; both were
+# standing behind this fail-open. Returning 1 on a miss keeps the collateral out
+# of every later mutation's signal.
+killwin() {
+  local _t
+  _t=$(tmux list-panes -a -F '#{window_name}	#{window_id}' 2>/dev/null | awk -F'\t' -v n="$1" '$1==n{print $2; exit}')
+  [ -n "$_t" ] || return 1
+  tmux kill-window -t "$_t" 2>/dev/null
+}
 
 if [ "$F_OK" = 1 ]; then
   WT="$N_ROOT/repo1"     # plain working repo: used in place, no worktree machinery
@@ -763,7 +785,9 @@ if [ "$F_OK" = 1 ]; then
   # …and the reap-safety case it was written for is preserved: an INHERITED marker
   # from a pane that is gone must still be cleared, or reap would tear down the
   # new agent's worktree mid-work.
-  killwin ship-b; killwin impl-a; sleep 0.3
+  # `ship-b` is already gone — the F9b setup above killed it. The duplicate kill
+  # here is what actually fired the fail-open in `killwin`, once per run. Dropped.
+  killwin impl-a; sleep 0.3
   printf 'ts=x\nby=worker\npane=%%99999\n' > "$WT/.fleet/ready"
   nfleet new repo1 feat --bare --name ship-c >/dev/null 2>&1
   wait_win ship-c
