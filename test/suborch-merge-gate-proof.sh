@@ -145,6 +145,20 @@ unset TMUX TMUX_PANE
 # ways on this tree before the scrub was added.
 unset FLEET_ROLE FLEET_SELF_MERGE FLEET_SUBORCH_ID FLEET_SESSION FLEET_AUTOCOMMIT 2>/dev/null || true
 export GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null
+# XDG_RUNTIME_DIR is the FIFTH isolation axis and was the one gap. `bin/fleet`
+# derives RUNTIME_DIR from it and that is where fleetd's socket lives, so an
+# un-isolated value lets anything that talks to the daemon reach the REAL one.
+# This group POSTS and PARKS gates, so the cost of a leak is not a wrong test
+# result — it is a fixture writing production state. That is not hypothetical:
+# a sibling dispatch's adversary delivered a /tmp fixture's gate message into the
+# human's real inbox and stamped gate_pending/parked_at/gate1_popped onto a REAL
+# ledger dispatch, which a human then had to re-terminalize by hand.
+# Note the ordering that makes isolation load-bearing: `fleet_root` prefers the
+# tmux `@fleet_root` option and only THEN falls back to $FLEET_ROOT — so
+# FLEET_ROOT alone does not confine anything. It is confined because TMUX_TMPDIR
+# points at a throwaway socket where $FLEET_SESSION does not exist, which is
+# asserted above before any tmux call.
+export XDG_RUNTIME_DIR="$TMPROOT/run"; mkdir -p "$XDG_RUNTIME_DIR"; chmod 700 "$XDG_RUNTIME_DIR"
 export FLEET_DEBUG_PORT=59223            # cmd_reap ends in `fuser -k <port>/tcp`
 export FLEET_SESSION="smg_t"
 export FLEET_ROOT="$TMPROOT/root"; mkdir -p "$FLEET_ROOT/.fleet"
@@ -212,6 +226,42 @@ out=$(printf '%s\n' "$P1" | "$FLEET" gate parse 2>/dev/null); rc=$?
 { [ "$rc" = 0 ] && has "$out" "gate=1" && has "$out" "action=implement"; }
 ok $? "A2 popped GATE 1 text parses" "rc=$rc out='$out'"
 
+# A2b/A2c — THE GATE-3 POSITIVE, and the STRUCTURAL GAP that let a dead gate ship.
+# Every suite that PARSES used gates 1-2; every suite that used gate 3 never parsed
+# (gate3-state-proof.sh exercises the ledger/park/reconcile half and greps the body
+# instead of asking the oracle). So a `gate_parse` enum of 1|2 made d34's headline
+# gate UNCROSSABLE and no test anywhere said a word. This closes the gap by routing
+# a gate-3 sentinel through the same real pop path A1/A2 use.
+#
+# NOT F11-SHAPED, by construction: the assertion is a CONJUNCTION OF POSITIVES over
+# the operation's OWN OUTPUT — rc is 0 AND the parsed gate is 3 AND the action is
+# commit AND the slug is the one posted. If the operation does not run there is no
+# output at all, so every conjunct fails. It cannot pass by omission. No `target=`
+# is asserted: the gate-3 sentinel carries none, and demanding one would be a wrong
+# tightening of exactly the kind A11 exists to block.
+#
+# NO-OP MUTATION SWEEP: the operation under test is the closed-enum membership of 3
+# in gate_parse's gate-number guard. Dropping 3 from that enum makes both rows RED.
+P3=$(popped_text 3 --slug demo --summary "does it" -d d99)
+out=$(printf '%s\n' "$P3" | "$FLEET" gate parse 2>/dev/null); rc=$?
+{ [ "$rc" = 0 ] && has "$out" "gate=3" && has "$out" "action=commit" && has "$out" "slug=demo"; }
+ok $? "A2b popped GATE 3 text parses (rc 0, gate=3, action=commit, slug=demo)" \
+  "rc=$rc out='$out' — gate 3 is UNCROSSABLE: FLEET_SUBORCH.md makes gate_parse the only sanctioned oracle and its fall-through is HALT-AND-ESCALATE"
+
+# A2c — the PARKED form, end to end, because that is how a gate 3 is actually raised.
+# `--park` needs a real ledger entry, so one is created HERE, under the suite's own
+# isolated FLEET_ROOT. Asserts the park landed (state=gate3-wait) AND that the parked
+# gate still parses — the two halves that must not disagree.
+mkdir -p "$LEDGER/d98"; printf 'state\tqueued\n' > "$LEDGER/d98/meta.tsv"
+rm -rf "$INBOX" 2>/dev/null
+"$FLEET" gate post 3 --slug demo --summary "does it" --park -d d98 >/dev/null 2>&1; prc=$?
+_f=$(ls "$INBOX"/*.msg 2>/dev/null | head -1)
+out=$("$FLEET" inbox pop-text "$_f" 2>/dev/null | "$FLEET" gate parse 2>/dev/null); rc=$?
+{ [ "$prc" = 0 ] && grep -q '^state	gate3-wait' "$LEDGER/d98/meta.tsv" \
+  && [ "$rc" = 0 ] && has "$out" "gate=3" && has "$out" "action=commit"; }
+ok $? "A2c a genuine 'gate post 3 --park' parks AND its popped text parses" \
+  "post rc=$prc parse rc=$rc out='$out' meta='$(cat "$LEDGER/d98/meta.tsv" 2>/dev/null | tr '\n' ' ')'"
+
 B2=$(body_of 2 --slug demo --target main -d d99)
 printf '%s\n' "$B2" | "$FLEET" gate parse >/dev/null 2>&1
 ok $? "A3 bare body still parses (backward compatible)" "rc=$?"
@@ -276,7 +326,8 @@ printf 'From the plan we discussed: here is the gate\n[FLEET-GATE:2 slug=s actio
 # out of the real pop path; none is hand-typed.
 a11=0
 for _args in "2 --slug demo --target main -d d99" "1 --slug demo -d d99" \
-             "2 --slug demo --target main" "1 --slug demo"; do
+             "2 --slug demo --target main" "1 --slug demo" \
+             "3 --slug demo -d d99" "3 --slug demo"; do
   # shellcheck disable=SC2086
   _t=$(popped_text $_args) || { a11=1; echo "    (post failed: $_args)"; continue; }
   printf '%s\n' "$_t" | "$FLEET" gate parse >/dev/null 2>&1 \
@@ -316,13 +367,20 @@ out=$(cd "$GDIR" && printf 'From x: t\n[FLEET-GATE:2 slug=s action=merge target=
 ok $? "A12b a glob cannot inject a SECOND target= (the field the merge acts on)" \
   "out='$out'"
 
-# A13 — REAL DEFECT: the gate number is echoed unvalidated (bin/fleet:2546). At HEAD
+# A13 — REAL DEFECT: the gate number is echoed unvalidated in `gate_parse`. At HEAD
 # `[FLEET-GATE:99 …]` yields gate=99 rc 0, and `[FLEET-GATE:2slug=x]` yields
 # `gate=2slug=x 2slug=x` rc 0 — a malformed sentinel that reads as gate 2 to any
-# consumer doing a prefix match. Only 1 and 2 exist.
+# consumer doing a prefix match.
+# The pinned defect is that the number was UNVALIDATED — NOT which numbers are
+# members. The enum is 1|2|3: d34 added gate 3, chronologically after this case was
+# written, and 99 is out of range under either membership, so A13 is unaffected by
+# that and stays a pure validation pin. The closed-enum boundary simply moved 3->4.
+# (No `bin/fleet:<line>` reference here on purpose: this comment used to carry one,
+# it rotted on the very next merge, and that rot is the D3 defect this dispatch was
+# commissioned to fix. Name the function, never the line.)
 printf 'From x: t\n[FLEET-GATE:99 slug=s action=merge]\n' | "$FLEET" gate parse >/dev/null 2>&1
 [ $? != 0 ]; ok $? "A13 an out-of-range gate number ([FLEET-GATE:99 …]) does NOT parse" \
-  "gate=99 rc 0 at HEAD — the enum is 1|2 and nothing checked it"
+  "gate=99 rc 0 at HEAD — the number was echoed with nothing checking it"
 printf 'From x: t\n[FLEET-GATE:2slug=x]\n' | "$FLEET" gate parse >/dev/null 2>&1
 [ $? != 0 ]; ok $? "A13b a malformed number ([FLEET-GATE:2slug=x]) does NOT parse" \
   "yields gate='2slug=x' rc 0 at HEAD"
