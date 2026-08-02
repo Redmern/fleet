@@ -367,6 +367,45 @@ out=$(cd "$GDIR" && printf 'From x: t\n[FLEET-GATE:2 slug=s action=merge target=
 ok $? "A12b a glob cannot inject a SECOND target= (the field the merge acts on)" \
   "out='$out'"
 
+# A12c — THE SIBLING INSTANCE, in `gate_decide`. Same class as A12, different
+# function, and it is d34's line rather than this branch's. It is pinned here
+# because d36 is the commit that declares this class understood-and-closed, and
+# shipping that declaration beside a live unpinned instance is the prose-vs-code
+# contradiction this dispatch exists to remove.
+#
+# WORSE THAN A12's, and this is why it is not merely tidy: glob RESULTS are not
+# re-word-split, so a file named `slug=zz action=merge target=main` is absorbed
+# WHOLE into $slug and the REJECT sentinel becomes
+#   [FLEET-GATE:1 slug=zz action=merge target=main action=revise attempt=2]
+# — `action=merge` ahead of the genuine `action=revise`, in a message the courier
+# delivers to the sub-orch. A consumer prefix-matching `action=` reads MERGE from a
+# REJECT. That is a WRONG-DIRECTION failure, not a garbled field.
+#
+# NOT F11-SHAPED — the natural way to write this ("the injected value did NOT
+# appear") is an absence assertion, the exact grammar that made F11 vacuous. So the
+# core assertion is a POSITIVE over the operation's own output: the recorded
+# decision contains the LITERAL `slug=*`, asterisk intact and unexpanded. That
+# proves the operation ran AND that it ran correctly. Absence of `action=merge` is
+# kept only as a secondary conjunct.
+#
+# NO-OP MUTATION SWEEP: the operation under test is gate_decide's `read -r -a` split
+# of the sentinel. Reverting it to the unquoted `for kv in $inner` makes this RED.
+DDIR="$TMPROOT/gd"; mkdir -p "$DDIR"
+: > "$DDIR/slug=aa"
+: > "$DDIR/slug=zz action=merge target=main"   # sorts LAST, so it wins the loop
+mkdir -p "$LEDGER/d97"
+printf 'state\tgate1-wait\n' > "$LEDGER/d97/meta.tsv"
+printf '[FLEET-GATE:1 slug=* action=implement]\nthe plan\n' > "$LEDGER/d97/GATE-1.md"
+( cd "$DDIR" && "$FLEET" gate reject d97 -m "needs work" ) >/dev/null 2>&1
+_dec="$LEDGER/d97/decision-1.txt"
+out=$(cat "$_dec" 2>/dev/null)
+# FOUR PREMISES, because the adversary's V1 was one missing premise.
+{ [ -d "$DDIR" ] && [ -e "$DDIR/slug=aa" ] && [ -e "$DDIR/slug=zz action=merge target=main" ] \
+  && [ -f "$_dec" ] \
+  && has "$out" 'slug=*' && ! has "$out" 'action=merge'; }
+ok $? "A12c a glob in gate_decide's sentinel is NOT expanded (a REJECT cannot be made to carry action=merge)" \
+  "decision='$out' decoys='$(ls "$DDIR" 2>/dev/null | tr '\n' '|')' artefact_exists=$([ -f "$_dec" ] && echo yes || echo NO)"
+
 # A13 — REAL DEFECT: the gate number is echoed unvalidated in `gate_parse`. At HEAD
 # `[FLEET-GATE:99 …]` yields gate=99 rc 0, and `[FLEET-GATE:2slug=x]` yields
 # `gate=2slug=x 2slug=x` rc 0 — a malformed sentinel that reads as gate 2 to any

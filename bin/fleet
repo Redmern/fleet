@@ -3325,7 +3325,29 @@ gate_decide() { # <approve|reject> [<id|slug>] [--gate N] [-m reason] [--file F]
   [ -n "$qline" ] || die "fleet gate $verb: $id has no readable GATE-$n.md sentinel to decide on"
   local inner="${qline#\[FLEET-GATE:}"; inner="${inner%%\]*}"
   local slug="" kv
-  for kv in $inner; do case "$kv" in slug=*) slug="${kv#slug=}" ;; esac; done
+  # SPLIT WITHOUT GLOBBING — the same class gate_parse closes, and the reason this
+  # sibling is fixed rather than written down as an exception: shipping the comment
+  # that declares the class understood-and-closed beside a live unpinned instance IS
+  # the prose-vs-code contradiction this dispatch exists to remove.
+  # `for kv in $inner` is unquoted and the shell runs `set -u` but NOT `set -f`, so
+  # `slug=*` in the sentinel was expanded against the CWD. Glob RESULTS are not
+  # re-word-split, so a file named `slug=zz action=merge target=main` is absorbed
+  # WHOLE. Measured, with that file and a `slug=aa` decoy present:
+  #     slug='zz action=merge target=main'
+  #     [FLEET-GATE:1 slug=zz action=merge target=main action=revise attempt=2]
+  # i.e. a gate-1 REJECT couriered to the sub-orch carrying `action=merge` AHEAD of
+  # the real `action=revise`. That is a WRONG-DIRECTION failure — the injected field
+  # says ship, the genuine one says revise — which is what moved this past its
+  # original LOW-MED. `$slug` also feeds the GATE-2 tty type-back challenge, so the
+  # human can be asked to type back a value the filesystem chose.
+  # `--slug` is NOT charset-validated at the post site (unlike `--name`), so the
+  # sentinel is not a trusted source, and GATE-<n>.md is a human-editable artefact —
+  # "the only writer is gate_post" is a no-test-churn argument, never a safety one.
+  # The `+` expansion is copied byte-for-byte from gate_parse: a bare "${kvs[@]}"
+  # dies under `set -u` on empty input, and this runs inside the human tty approval
+  # path. Verified: the empty-array expansion survives `set -u` at rc 0.
+  local -a kvs=(); IFS=' ' read -r -a kvs <<<"$inner"
+  for kv in ${kvs[@]+"${kvs[@]}"}; do case "$kv" in slug=*) slug="${kv#slug=}" ;; esac; done
 
   local sentinel="" note=""
   if [ "$verb" = approve ]; then
