@@ -784,12 +784,64 @@ ok $? "C3 --force does NOT override the integration-branch guard (pinned)" "$(_w
 # quoted, so a reword cannot redden this.
 read -r K_ROOT K_SESS <<<"$(mkcase k)"
 KWT=$(add_integration_wt "$K_ROOT" "$K_SESS" main)
-_norm() { printf '%s' "$1" | sed "s#$K_ROOT#<root>#g"; }
-_reap_exec "$K_ROOT" "$K_SESS";         c3_plain=$(_norm "$REAP_OUT")
-_reap_exec "$K_ROOT" "$K_SESS" --force; c3_force=$(_norm "$REAP_OUT")
-{ [ -d "$KWT" ] && [ -n "$c3_plain" ] && [ "$c3_plain" = "$c3_force" ]; }
+KBY=$(add_bystander "$K_ROOT" "$K_SESS" feat/x)
+read -r K2_ROOT K2_SESS <<<"$(mkcase k2)"
+K2WT=$(add_integration_wt "$K2_ROOT" "$K2_SESS" main)
+K2BY=$(add_bystander "$K2_ROOT" "$K2_SESS" feat/x)
+_norm() { printf '%s' "$1" | sed "s#$K_ROOT#<root>#g; s#$K2_ROOT#<root>#g"; }
+#
+# C3b READS THE WITNESS (d39 round 2). Without the two `SMG_DELTA` conjuncts this
+# was the ONLY group-C row that bypassed `reap_expect_*`, i.e. it carried all
+# three of d36's fail-open ingredients in material added by the rung that exists
+# to retire them: `[ -d "$KWT" ]` was true BEFORE the command ran, `[ -n
+# "$c3_plain" ]` is satisfied by any output at all, and the equality is trivially
+# satisfied when both invocations do nothing. Measured, not inferred: a `cmd_reap`
+# that merely `echo`s a plausible refusal line and returns kept this row GREEN,
+# and a lossy `_norm(){ printf 'x'; }` kept it green while the real M5 output
+# divergence was live. `SMG_DELTA` is overwritten by each `_reap_exec`, so BOTH
+# calls must be captured — a single post-hoc read would only ever witness the
+# second.
+#
+# `SMG_DELTA` alone is NOT enough and the measurement says so: it is an
+# INVOCATION witness (the shim counts `fleet` calls and `exec`s the real binary),
+# so a `cmd_reap` whose body is deleted still scores delta=1. Measured: with both
+# delta conjuncts in place and nothing else, the printing no-op left C3b GREEN.
+# The two invocations therefore each get their OWN merged bystander, in their own
+# root, which that very invocation must destroy — the same effect contract
+# `reap_expect_*` carries, expressed for a row that compares two runs rather than
+# one. The comparison stays wording-free: both roots are normalised to `<root>`
+# and the bystander branch name is the same on each side, so the two outputs are
+# byte-equal iff `--force` never reached the integration guard.
+_reap_exec "$K_ROOT" "$K_SESS";           c3_plain=$(_norm "$REAP_OUT"); c3_d1=$SMG_DELTA
+_reap_exec "$K2_ROOT" "$K2_SESS" --force; c3_force=$(_norm "$REAP_OUT"); c3_d2=$SMG_DELTA
+# …and the normaliser itself is pinned. It is the one unguarded transform in this
+# row: `_norm(){ printf 'x'; }` maps every output to a constant, which greens the
+# equality while the real `--force` output divergence is live (measured). A canary
+# through the same function catches any normaliser that is not "substitute the
+# root, change nothing else".
+c3_canary=$(_norm "$K_ROOT/zz reaped repo/feat_x")
+{ [ "$c3_d1" = 1 ] && [ "$c3_d2" = 1 ] \
+  && [ "$c3_canary" = "<root>/zz reaped repo/feat_x" ] \
+  && [ -d "$KWT" ] && [ -d "$K2WT" ] \
+  && [ ! -d "$KBY" ] && [ ! -d "$K2BY" ] \
+  && [ -n "$c3_plain" ] && [ "$c3_plain" = "$c3_force" ]; }
 ok $? "C3b reap and reap --force are byte-equivalent on the integration branch" \
-  "plain='$c3_plain' force='$c3_force'"
+  "delta=$c3_d1/$c3_d2 canary='$c3_canary' plain='$c3_plain' force='$c3_force'"
+
+# C3c — the FIXTURE PREMISE of `add_bystander_force`, asserted rather than
+# assumed. Everything the `--force` pin buys at C3/C6/C7/C8 rests on one line in
+# that helper: the `commit -q --allow-empty -m ahead` that leaves the bystander
+# UNMERGED, hence removable only on the `--force` path. Delete that one line and
+# all four rows go green again under a killed `--force` parse — the d36 defect
+# restored by a plausible test-side "simplification", with nothing complaining.
+# So: a PLAIN reap (no `--force`) must leave that bystander standing. The merged
+# bystander in the same root must die in the same run, so this row cannot be
+# satisfied by a reap that did no work.
+read -r L_ROOT L_SESS <<<"$(mkcase l)"
+LFBY=$(add_bystander_force "$L_ROOT" "$L_SESS" force/only)
+LMBY=$(add_bystander       "$L_ROOT" "$L_SESS" feat/x)
+reap_expect_refuse "$L_ROOT" "$L_SESS" "$LFBY" "$LMBY"
+ok $? "C3c add_bystander_force is genuinely UNMERGED: a plain reap leaves it standing" "$(_why)"
 
 # C4 — narrowness of the POSITIONAL <target>, on its OWN root. It used to run on
 # C_ROOT against `$FWT`, which C1 had already consumed — so its `[ ! -d "$FWT" ]`
