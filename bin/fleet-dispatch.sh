@@ -81,9 +81,44 @@ BODY="${BODY# }"           # strip one optional following space
 # 4. DISPATCH (zero model turn).
 #    (a) Allocate an id + ledger dir. The body NEVER crosses a command line — fleet
 #        echoes the dir path and we write instruction.txt ourselves with printf.
-DIR="$("$FLEET_BIN" dispatch-alloc 2>/dev/null)"
-[ -n "$DIR" ] && [ -d "$DIR" ] || exit 0
-printf '%s' "$BODY" > "$DIR/instruction.txt" 2>/dev/null || exit 0
+#        FRESHNESS, NOT EXISTENCE. This guard used to read
+#            DIR="$(... dispatch-alloc 2>/dev/null)"
+#            [ -n "$DIR" ] && [ -d "$DIR" ] || exit 0
+#            printf '%s' "$BODY" > "$DIR/instruction.txt"
+#        and every clause of it was backwards for an ALLOCATOR: `2>/dev/null`
+#        destroyed the rc and every `die` message, and "the directory exists" — the
+#        one condition that should force a refusal — was the success oracle. On
+#        2026-08-02 that combination was one keystroke away from writing a new
+#        instruction over a LIVE dispatch's brief while its sub-orch kept working
+#        from text it had already read.
+#
+#        Three changes, and they are one change: branch on the allocator's real rc;
+#        never re-test `-d "$DIR"` (that follows symlinks where mkdir(2) does not,
+#        so re-testing hands the hole straight back); and write the brief NO-CLOBBER
+#        under `set -C`, so a collision degrades to a loud refusal instead of a
+#        silent truncation. Loud = `fleet dispatch-alert`, because an `exit 0` here
+#        is indistinguishable from the user having typed nothing.
+_alert() { "$FLEET_BIN" dispatch-alert "$@" >/dev/null 2>&1 || true; }
+
+_errf="$(mktemp 2>/dev/null)" || _errf=""
+DIR="$("$FLEET_BIN" dispatch-alloc 2>${_errf:-/dev/null})"; _arc=$?
+_amsg=""; [ -n "$_errf" ] && _amsg="$(head -c 400 "$_errf" 2>/dev/null | tr '\n' ' ')"
+[ -n "$_errf" ] && rm -f "$_errf"
+if [ "$_arc" -ne 0 ] || [ -z "$DIR" ]; then
+  _alert "dispatch hook: allocation FAILED (rc=$_arc) — prompt NOT dispatched: ${_amsg:-no detail}"
+  printf '{"systemMessage":"fleet: dispatch-alloc failed — prompt not dispatched (see dashboard alerts)"}\n'
+  exit 0
+fi
+if [ -e "$DIR/instruction.txt" ]; then
+  _alert "dispatch hook: REFUSED to dispatch into $DIR — instruction.txt already exists (allocator returned a dir that is already in use)"
+  printf '{"systemMessage":"fleet: dispatch REFUSED — %s already holds a brief; prompt not dispatched"}\n' "$DIR"
+  exit 0
+fi
+( set -C; printf '%s' "$BODY" > "$DIR/instruction.txt" ) 2>/dev/null || {
+  _alert "dispatch hook: REFUSED to clobber $DIR/instruction.txt — prompt NOT dispatched"
+  printf '{"systemMessage":"fleet: dispatch REFUSED — could not write the brief without clobbering; prompt not dispatched"}\n'
+  exit 0
+}
 ID="$(basename "$DIR")"
 
 #    (b) Spawn the sub-orchestrator (only the id is passed).

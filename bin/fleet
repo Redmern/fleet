@@ -153,10 +153,46 @@ project_session() {
   echo "$s"                                              # base is gone: no invention
 }
 
+# DETECTION, NOT PREVENTION, AND DELIBERATELY FAIL-SOFT (d38 P5).
+#
+# On 2026-08-02 a test fixture exported FLEET_ROOT into a sandbox but did not
+# isolate TMUX_TMPDIR. tmux therefore answered for the REAL project while the env
+# named the sandbox, and the fixture parked a gate on the human's live d1, put a
+# message in their real inbox, and had the pop stamped onto it. Nothing anywhere
+# compared the two signals, so the escape was silent for ~10 minutes.
+#
+# This does NOT change what fleet_root RETURNS, and that is the whole design.
+# Flipping the precedence was examined and killed: worker panes carry no FLEET_ROOT
+# and would fall through to `pwd`, and fleetd discovers projects BY the tmux value.
+# Making a disagreement FATAL is worse still — it fails OPEN at is_main_pane, whose
+# `fleet_root … || return 1` reads as "not main" and switches off the never-clobber
+# brake in safe_kill_window. A guard whose failure mode disables an older guard is
+# worse than no guard.
+#
+# What it buys: the alert is written into the log of the root that WON — so a
+# fixture escaping its sandbox writes the evidence into the REAL project's log and
+# cannot suppress it. Once per process (the flag is also what stops the recursion
+# through append_dashboard_alert -> fleet_root).
+#
+# UNCONDITIONAL ASSIGNMENT, never `${_ROOT_DISAGREE_ALERTED:-0}` (V2). The `:-`
+# form reads the ENVIRONMENT, so one exported `_ROOT_DISAGREE_ALERTED=1` silences
+# the alert in this process and in every child of it — process-wide suppression of
+# the audit trail with no file write and no trace, a strictly easier vector than
+# the disclosed same-uid one. The flag is per-process state, not a knob.
+_ROOT_DISAGREE_ALERTED=0
+root_disagreement_alert() { # <tmux-root>
+  [ "$_ROOT_DISAGREE_ALERTED" = 1 ] && return 0
+  [ -n "${FLEET_ROOT:-}" ] || return 0
+  [ -n "${1:-}" ] || return 0
+  [ "$FLEET_ROOT" = "$1" ] && return 0
+  _ROOT_DISAGREE_ALERTED=1            # set BEFORE the call: append_dashboard_alert re-enters fleet_root
+  append_dashboard_alert "root DISAGREEMENT: env FLEET_ROOT=$FLEET_ROOT but tmux @fleet_root=$1 — this write went to $1 (audit, not authorisation)"
+}
+
 fleet_root() { # project root for the current session
   local s; s=$(session_name) || return 1
   local r; r=$(tmux show -t "$s" -v @fleet_root 2>/dev/null)
-  [ -n "$r" ] && { echo "$r"; return 0; }
+  [ -n "$r" ] && { root_disagreement_alert "$r"; echo "$r"; return 0; }
   [ -n "${FLEET_ROOT:-}" ] && { echo "$FLEET_ROOT"; return 0; }
   pwd
 }
@@ -2118,13 +2154,140 @@ release_lock() { # <lockdir>
   rmdir "$lk" 2>/dev/null
 }
 
-alloc_id() { # <led> -> echoes d<N> (atomic, under a reaped lock)
-  local led="$1" n
+# A dispatch id is interpolated straight into `$root/.fleet/dispatch/$id`, and the
+# resolver's `d[0-9]*` glob matched `d1/../../evil` — which resolves clean OUTSIDE
+# the ledger whenever that path exists. So: `d` + a digit, and a SINGLE PATH SEGMENT
+# with no `..`, expressed as a closed `case` so it is usable on every path here.
+#
+# DELIBERATELY NOT a strict `^d[0-9]+$`, and the reason is measured, not stylistic:
+# the live corpus already allocates ids with a letter suffix out-of-band — `d1c`
+# (test/gate3-state-proof.sh), `d2c`/`d2e`/`d2f` (test/gate-courier-proof.sh) — so
+# the strict form silently unresolves real, existing dispatches at every gate verb.
+# It would buy nothing: a name with no separator and no `..` cannot leave the ledger
+# directory BY NAME — see ledger_entry_dir for the other half, which is what makes
+# that sentence true of the resulting PATH as well. The strict `^d[0-9]+$`
+# filter DOES apply where it is load-bearing for a different reason — ledger_disk_max,
+# where a filename reaches an arithmetic (i.e. eval) context.
+valid_dispatch_id() { # <id>
+  case "${1:-}" in
+    ""|.*|-*) return 1 ;;      # empty, dotfile, or option-looking
+    */*|*..*) return 1 ;;      # not a single path segment
+    d[0-9]*)  return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+# THE SECOND HALF OF THE SHAPE CHECK, and the one round 2 found missing (S1).
+# valid_dispatch_id bounds the NAME; every site then asked `[ -d "$d" ]` — and
+# `[ -d ]` FOLLOWS SYMLINKS. So `ln -sfn /elsewhere/victim $LED/d99` is shape-valid
+# AND `-d`-true, and `gate park d99` / `dispatch done d99` / `dispatch rename d99 s`
+# each wrote a 0600 meta.tsv and planted a farm symlink in the victim — outside every
+# ledger, hence outside every alerts.log: the round-1 V1 outcome by a second route.
+# Strict `^d[0-9]+$` would NOT have closed it (`d99` is strict-valid), so this is not
+# an argument about that choice. It is the same lesson the ALLOCATOR half already
+# wrote down (`mkdir(2)` does not follow a trailing symlink where `[ -d ]` does), now
+# applied to the gate/dispatch half.
+#
+# `-L` before `-d` and no trailing slash on the argument: `[ -L "$d/" ]` resolves the
+# link and is FALSE. Blast-radius/audit, not security — same uid, and planting the
+# link is already a write into the ledger dir.
+ledger_entry_dir() { # <path> -> 0 iff a REAL directory (not a symlink to one)
+  local d="${1:-}"; d=${d%/}
+  [ -n "$d" ] || return 1
+  [ ! -L "$d" ] || return 1
+  [ -d "$d" ]
+}
+
+ALLOC_MAX_TRIES=${ALLOC_MAX_TRIES:-64}   # bounded retry: a stray dir must not wedge the prompt hook
+
+# Highest `d<N>` DIRECTORY actually on disk (0 if none). The `^d[0-9]+$` filter is
+# mandatory, not cosmetic: `$(( ))` on a filename is an eval context, `d1c` already
+# exists in the corpus (test/gate3-state-proof.sh), `alerts.log`/`seq`/`.seqlock`
+# live in the same dir, and dispatch_farm plants symlinks there. `-type d` is false
+# for a symlink-to-dir (find does not follow by default), so a planted symlink is
+# never counted — and if one nonetheless occupies a candidate name, `mkdir(2)` still
+# refuses it, because mkdir does not follow a trailing symlink where `[ -d ]` does.
+ledger_disk_max() { # <led> -> highest N, or 0
+  local led="${1:-}" b m=0 e
+  [ -d "$led" ] || { echo 0; return 0; }
+  for e in $(find "$led" -maxdepth 1 -mindepth 1 -type d -printf '%f\n' 2>/dev/null); do
+    case "$e" in d) continue ;; d*[!0-9]*) continue ;; d*) ;; *) continue ;; esac
+    b=${e#d}
+    # NOT `2>/dev/null`. With the filter above in place `$b` is always numeric, so
+    # the suppression would be dead code — and dead suppression is what makes the
+    # filter's absence unobservable. Left loud, a stray name reaching this
+    # comparison announces itself instead of being silently skipped.
+    [ "$b" -gt "$m" ] && m=$b
+  done
+  echo "$m"
+}
+
+# ALLOCATE BY CREATE. The honest guarantee, and it is deliberately narrow:
+#
+#     the allocator never returns a directory it did not create.
+#
+# It is NOT "ids are never reused" — `_reports/<slug>` and archived `dispatch=dN`
+# inbox messages outlive a deleted dispatch, and empty/partial dirs are never
+# reclaimed (explicit non-goal).
+#
+# WHY THE CREATE, NOT THE COUNTER, IS THE EXCLUSION. `seq` is a counter this
+# function does not own: anything can `mkdir` a ledger dir out-of-band, and on
+# 2026-08-02 something did — seq read 35 while d36 was a LIVE dispatch, so the old
+# `seq+1` handed out a running dispatch's directory and the caller stamped over its
+# meta.tsv. Seeding from max(seq, disk) closes the observed gap; the bare `mkdir`
+# closes the general one, because the kernel arbitrates and two racers cannot both
+# win. `mkdir -p` is exactly the thing that converts "already exists" into success
+# and must never come back here. In-repo precedent: the notes-archive create and
+# acquire_lock both use bare `mkdir` as the arbiter.
+#
+# On EEXIST: ADVANCE AND RETRY, bounded — never `die`. A single stray directory
+# must not wedge the prompt hook (whose stderr is swallowed, so a die there turns
+# into silently vanished prompts). Exhausting the cap is the one refusal.
+#
+# The `seq` write is checked and FAIL-SOFT: max(seq,disk) self-heals the next
+# allocation, so a lost write costs an alert, not an allocation.
+# CONTRACT NOTE. On success this sets the GLOBALS `ALLOC_ID` and `ALLOC_CREATED_DIR`
+# as well as echoing d<N>. The globals are the load-bearing half and the echo is the
+# convenience one: a command substitution runs the function in a SUBSHELL, so
+# provenance recorded in a variable would be discarded exactly at the caller that
+# needs it. cmd_dispatch_alloc therefore calls this WITHOUT `$( )`.
+alloc_id() { # <led> -> echoes d<N> for a directory it CREATED; rc != 0 otherwise
+  local led="$1" n seq disk tries=0
   acquire_lock "$led/.seqlock" || return 1
-  n=$(( $(cat "$led/seq" 2>/dev/null || echo 0) + 1 ))
-  echo "$n" > "$led/seq"
+  seq=$(cat "$led/seq" 2>/dev/null)
+  case "$seq" in ''|*[!0-9]*) seq=0 ;; esac
+  disk=$(ledger_disk_max "$led")
+  if [ "$disk" -gt "$seq" ]; then
+    append_dashboard_alert "dispatch alloc: seq ($seq) is BEHIND the highest ledger dir on disk (d$disk) — seeding from disk"
+  fi
+  n=$(( (seq > disk ? seq : disk) + 1 ))
+  while [ "$tries" -lt "$ALLOC_MAX_TRIES" ]; do
+    if mkdir "$led/d$n" 2>/dev/null; then
+      # Provenance, for cmd_dispatch_alloc: the ONE dir this call created. Consumed
+      # via rc + this variable, never by re-testing `[ -d ]` at the caller — `[ -d ]`
+      # follows symlinks where mkdir(2) does not, so re-testing would hand the hole
+      # straight back.
+      ALLOC_CREATED_DIR="$led/d$n"; ALLOC_ID="d$n"
+      echo "$n" > "$led/seq" 2>/dev/null \
+        || append_dashboard_alert "dispatch alloc: seq write FAILED at $led/seq (allocated d$n) — next allocation will self-heal from the disk max"
+      release_lock "$led/.seqlock"
+      echo "d$n"
+      return 0
+    fi
+    # Discriminate EEXIST from a real failure. `-e` is false for a DANGLING symlink,
+    # which mkdir still refuses, so test `-L` too.
+    if [ -e "$led/d$n" ] || [ -L "$led/d$n" ]; then
+      append_dashboard_alert "dispatch alloc: id collision — $led/d$n already exists, advancing"
+      n=$((n+1)); tries=$((tries+1))
+      continue
+    fi
+    release_lock "$led/.seqlock"
+    append_dashboard_alert "dispatch alloc: cannot create $led/d$n (not a collision) — allocation ABORTED"
+    return 1
+  done
   release_lock "$led/.seqlock"
-  echo "d$n"
+  append_dashboard_alert "dispatch alloc: no free dispatch id after $ALLOC_MAX_TRIES tries from d$n — allocation REFUSED"
+  return 1
 }
 
 meta_get() { # <dispatch-dir> <key> -> value (tab-separated meta.tsv)
@@ -2672,11 +2835,12 @@ cmd_dispatch() { # dispatch <id> | enable | disable | status | rename <id> <slug
   esac
   local id="${1:-}"
   [ -n "$id" ] || die "usage: fleet dispatch <id> | enable | disable | status | rename <id> <slug> | done|fail|cancel <id>"
+  valid_dispatch_id "$id" || die "fleet dispatch: invalid dispatch id '$id' (expected d<N>)"
   local sess root led wname
   sess=$(session_name) || die "not inside tmux"
   root=$(fleet_root)   || die "not inside tmux"
   led="$root/.fleet/dispatch/$id"
-  [ -f "$led/instruction.txt" ] || die "no such dispatch $id (no instruction.txt)"
+  ledger_entry_dir "$led" && [ -f "$led/instruction.txt" ] || die "no such dispatch $id (no instruction.txt)"
   wname="so-$id"                                    # one sub-orch per instruction
   resolve_or_spawn_suborch "$sess" "$wname" "$id" "$root"
   meta_set "$led" window "$wname"
@@ -2701,9 +2865,10 @@ cmd_dispatch_finish() { # done|fail|cancel <id>
     *) die "usage: fleet dispatch done|fail|cancel <id>" ;;
   esac
   [ -n "$id" ] || die "usage: fleet dispatch $verb <id>"
+  valid_dispatch_id "$id" || die "fleet dispatch $verb: invalid dispatch id '$id' (expected d<N>)"
   local r; r=$(fleet_root 2>/dev/null) || die "no project root"
   local d="$r/.fleet/dispatch/$id"
-  [ -d "$d" ] || die "no such dispatch $id"
+  ledger_entry_dir "$d" || die "no such dispatch $id"
   meta_set "$d" state "$st"
   echo "dispatch $id → $st"
 }
@@ -2718,9 +2883,13 @@ cmd_dispatch_finish() { # done|fail|cancel <id>
 cmd_dispatch_rename() {
   local id="${1:-}"; [ -n "$id" ] && [ $# -gt 0 ] && shift || die "usage: fleet dispatch rename <id> <slug text...>"
   local text="$*"
+  # Same shape as gate_park (V1): `$id` is interpolated into the ledger path below,
+  # and rename additionally writes the ABSOLUTE reports key — a traversal here aims
+  # every later consumer of that key off-ledger.
+  valid_dispatch_id "$id" || die "fleet dispatch rename: invalid dispatch id '$id'"
   local root led d; root=$(fleet_root) || die "not inside tmux"
   led="$root/.fleet/dispatch"; d="$led/$id"
-  [ -d "$d" ] || die "no such dispatch $id"
+  ledger_entry_dir "$d" || die "no such dispatch $id"
   local slug; slug=$(suborch_slug "$text")
   [ -n "$slug" ] || { echo "rename $id: empty slug — keeping so-$id"; return 0; }
   acquire_lock "$led/.spawnlock-$id" || return 1
@@ -2760,8 +2929,13 @@ cmd_dispatch_rename() {
 # dangling link is an intended tombstone, not an error.
 dispatch_farm() { # <dispatch-id>
   local id="${1:-}"; [ -n "$id" ] || return 0
+  # SHAPE-CHECK BEFORE INTERPOLATION (V1). Reachable from the CLI as `fleet dispatch
+  # farm <id>`, and it MKDIRS and plants symlinks under `$d` — a traversal id would
+  # do that outside every ledger, where no alerts.log exists to record it. Fail-silent
+  # (return 0), matching this function's stated rc-0-throughout contract.
+  valid_dispatch_id "$id" || return 0
   local root; root=$(fleet_root 2>/dev/null) || return 0
-  local d="$root/.fleet/dispatch/$id"; [ -d "$d" ] || return 0
+  local d="$root/.fleet/dispatch/$id"; ledger_entry_dir "$d" || return 0
   local rep; rep=$(meta_get "$d" reports 2>/dev/null)
   case "$rep" in
     /*) mkdir -p "$rep" 2>/dev/null || true
@@ -2793,12 +2967,31 @@ cmd_dispatch_alloc() {
   root=$(fleet_root) || die "not inside tmux"
   led="$root/.fleet/dispatch"
   mkdir -p "$led" 2>/dev/null || die "cannot create ledger $led"
-  id=$(alloc_id "$led") || die "id allocation failed (lock contention?)"
-  d="$led/$id"
-  mkdir -p "$d" 2>/dev/null
+  # PROVENANCE, NOT EXISTENCE. alloc_id creates the directory itself and records it
+  # in ALLOC_CREATED_DIR; this function stamps meta ONLY into that exact path. The
+  # old code did `mkdir -p "$d"` (rc discarded) and then two unconditional meta_set
+  # calls, so an id that was already a LIVE dispatch got `state queued` + a fresh
+  # `created` written straight over its ledger — the 2026-08-02 damage.
+  #
+  # Deliberately NOT `[ -d "$d" ]`: that is the test that made the incident possible,
+  # and it follows symlinks where mkdir(2) does not.
+  ALLOC_CREATED_DIR=""; ALLOC_ID=""
+  alloc_id "$led" >/dev/null || die "id allocation failed (no free id, or lock contention) — nothing was stamped"
+  id="$ALLOC_ID"; d="$led/$id"
+  [ -n "$ALLOC_CREATED_DIR" ] && [ -n "$id" ] && [ "$ALLOC_CREATED_DIR" = "$d" ] \
+    || die "dispatch-alloc: refusing to stamp ${d:-<unknown>} — this process did not create it"
   meta_set "$d" state queued
   meta_set "$d" created "$(date -Is 2>/dev/null || date)"
   printf '%s\n' "$d"
+}
+
+# `fleet dispatch-alert <text…>` (internal, called by the hook): the hook is POSIX
+# sh and has no access to append_dashboard_alert, yet it is the one place where a
+# refused allocation must become visible — its stderr is swallowed by the harness
+# and an `exit 0` there is indistinguishable from "the user typed nothing".
+cmd_dispatch_alert() {
+  [ $# -gt 0 ] || return 0
+  append_dashboard_alert "$*"
 }
 
 # ---- gated pipeline: integration branch + gate messages ------------------------
@@ -2980,7 +3173,41 @@ gate_post() { # post <1|2|3> [--park] --slug S [--target T] [--summary "…"] [-
   # omitted, and `.fleet/dispatch/-/meta.tsv` is a lie aimed at exactly the reader
   # least able to catch it. With no id, drop the ledger clause and keep the
   # artifacts cross-check — degrading is strictly better than misdirecting.
-  local reorient="⟳ RE-ORIENT FIRST (your context may have been compacted): re-read your manual $FLEET_DIR/FLEET_SUBORCH.md"
+  # ...and NEVER print an absolute path into a tree that is not the project's. This
+  # is the same rule as the `disp="-"` clause below, applied to the other half of the
+  # pointer: $FLEET_DIR comes from the BINARY's own location (bin/fleet:10) and the
+  # root comes from tmux, and nothing had ever compared them. That split is exactly
+  # how `/tmp/adv3/tree/FLEET_SUBORCH.md` — a manual outside the project, under a
+  # path the project does not control — was written into a real dispatch's gate
+  # artifact on 2026-08-02, aimed at a sub-orch whose stated job is to re-read it.
+  # Degrade to a BARE FILENAME: the sub-orch resolves it against its own tree, which
+  # is where the manual it should trust actually is. Blast-radius / mis-addressing
+  # guard, NOT security — same uid throughout.
+  # THE TRIGGER IS NARROWER THAN "outside the root", and that is not a softening —
+  # the blanket form is a regression. In every real install the binary is outside the
+  # project by construction ($FLEET_DIR is the release tree ~/.local/lib/fleet/current,
+  # or a checkout under ~/proj), so "outside the root ⇒ bare filename" fires on EVERY
+  # gate message ever posted and replaces a pointer that resolves with one that does
+  # not — breaking this function's own rule two paragraphs down. What distinguished
+  # the incident was not that the binary was outside the project; it was that the
+  # binary was outside anything this user's install owns: /tmp/adv3/tree, a path any
+  # process on the box can plant.
+  #
+  # So: keep the absolute path when $FLEET_DIR is under the resolved root OR under
+  # $HOME; degrade to a bare filename otherwise. Heuristic, and stated as one — it is
+  # a blast-radius / mis-addressing guard, NOT security. Same uid throughout: an agent
+  # that can run a binary from a tree it wrote can also `inbox_put` any body it likes,
+  # because that verb has no role check by design. What this stops is the ACCIDENT —
+  # a fixture running a copy of fleet out of a temp dir against the real ledger, which
+  # is exactly what happened on 2026-08-02.
+  local _gp_root _manual="$FLEET_DIR/FLEET_SUBORCH.md"
+  _gp_root=$(fleet_root 2>/dev/null) || _gp_root=""
+  case "$FLEET_DIR/" in
+    "${_gp_root:-/nonexistent}"/*) ;;
+    "${HOME:-/nonexistent}"/*)     ;;
+    *) _manual="FLEET_SUBORCH.md" ;;
+  esac
+  local reorient="⟳ RE-ORIENT FIRST (your context may have been compacted): re-read your manual $_manual"
   case "$disp" in
     ""|-) reorient="$reorient
 ⟳ then cross-check the _reports/$slug/ artifacts on disk against your ledger role-phase BEFORE acting." ;;
@@ -3120,8 +3347,14 @@ gate_write_artifact() { # <dispatch-id|-> <gate-n> <body>
   local disp="${1:-}" n="${2:-}" body="${3:-}"
   case "$disp" in ""|-) return 0 ;; esac
   case "$n" in 1|2|3) ;; *) return 0 ;; esac
+  # SHAPE-CHECK BEFORE INTERPOLATION (V1). `$disp` is attacker-writable text and is
+  # pasted straight into a path below; `../../../victim` resolves clean OUTSIDE the
+  # ledger whenever that path exists, so the artifact — and with it every trace of
+  # the write — lands where no alerts.log will ever see it. Fail-silent (return 0)
+  # to match this function's contract: every other refusal here is a silent no-op.
+  valid_dispatch_id "$disp" || return 0
   local root; root=$(fleet_root 2>/dev/null) || return 0
-  local d="$root/.fleet/dispatch/$disp"; [ -d "$d" ] || return 0
+  local d="$root/.fleet/dispatch/$disp"; ledger_entry_dir "$d" || return 0
   printf '%s\n' "$body" > "$d/GATE-$n.md" 2>/dev/null || true
   # A RE-POSTED GATE IS A NEW QUESTION, so it re-opens the decision. Without this the
   # idempotency guard in gate_decide — which exists so a double-approve can never
@@ -3154,9 +3387,16 @@ gate_park() { # park <dispatch-id> <1|2|3>
   local id="${1:-}" gate="${2:-}"
   case "$gate" in 1|2|3) ;; *) die "usage: fleet gate park <dispatch-id> <1|2|3>" ;; esac
   [ -n "$id" ] || die "usage: fleet gate park <dispatch-id> <1|2|3>"
+  # SHAPE-CHECK BEFORE INTERPOLATION (V1). Without this, `fleet gate park
+  # '../../../victim' 1` reported "parked" and wrote `state gate1-wait` + `parked_at`
+  # into a directory outside every ledger — hence outside every alerts.log, so the
+  # audit trail that IS this half's deliverable recorded nothing. `die`, not a silent
+  # return: gate verbs are the one place fleet's fail-silent rule is already inverted,
+  # because a park that quietly did not happen is the invisible July-19 half.
+  valid_dispatch_id "$id" || die "fleet gate park: invalid dispatch id '$id'"
   local r; r=$(fleet_root 2>/dev/null) || die "no project root"
   local d="$r/.fleet/dispatch/$id"
-  [ -d "$d" ] || die "no such dispatch $id"
+  ledger_entry_dir "$d" || die "no such dispatch $id"
   # CHECKED, and this is the other half of B5's de-swallow: `gate_post` now stops
   # swallowing a park failure, but that buys nothing if the park itself reports
   # success after losing the one write that IS the park. A lost `state` write here
@@ -3186,6 +3426,15 @@ gate_record_pop() { # popped <msgfile>
   [ -e "$f" ] || return 0
   disp=$(inbox_field "$f" dispatch 2>/dev/null)
   case "$disp" in ""|-) return 0 ;; esac
+  # The `dispatch=` header is attacker-writable text (inbox_put has no role check by
+  # design), and it is interpolated into a path below. Shape-check it: an id that does
+  # not pass `valid_dispatch_id` (`d`+digit, one path segment, no `..` — deliberately
+  # NOT strict `^d[0-9]+$`; see that function) is not a dispatch, and a pop must never
+  # stamp somewhere else. The `[ -d ]` below is `ledger_entry_dir`, which additionally
+  # refuses a symlinked entry — `[ -d ]` alone follows the link straight out.
+  # Blast-radius guard, not authorisation — same uid; a well-formed id belonging to
+  # someone else is still accepted, exactly as the comment above says.
+  valid_dispatch_id "$disp" || return 0
   # Parse the BODY through the same oracle the sub-orch uses — never a private regex.
   parsed=$(inbox_body "$f" 2>/dev/null | gate_parse 2>/dev/null) || return 0
   n="${parsed#gate=}"; n="${n%% *}"
@@ -3194,7 +3443,7 @@ gate_record_pop() { # popped <msgfile>
   case "$n" in 1|2|3) ;; *) return 0 ;; esac
   local r; r=$(fleet_root 2>/dev/null) || return 0
   local d="$r/.fleet/dispatch/$disp"
-  [ -d "$d" ] || return 0
+  ledger_entry_dir "$d" || return 0
   meta_set "$d" "gate${n}_popped" "$(date -Is 2>/dev/null || date)" 2>/dev/null || true
   return 0
 }
@@ -3236,12 +3485,19 @@ gate_resolve_dir() { # [<id|slug>] -> prints dir, or dies
   led="$root/.fleet/dispatch"
   [ -d "$led" ] || die "fleet gate: no dispatch ledger at $led"
   if [ -n "$want" ]; then
+    # A separator or a `..` is never part of a dispatch id OR of a slug, and the old
+    # `d[0-9]*` glob accepted both: `d1/../../evil` matched it and was stopped only
+    # by `[ -d ]` on a path that happened not to exist — which, when it does exist,
+    # resolves clean outside the ledger. Refused here, before either branch.
     case "$want" in
-      d[0-9]*) [ -d "$led/$want" ] || die "fleet gate: no such dispatch $want"
-               printf '%s\n' "$led/$want"; return 0 ;;
+      */*|*..*) die "fleet gate: invalid dispatch target '$want'" ;;
     esac
+    if valid_dispatch_id "$want"; then
+      ledger_entry_dir "$led/$want" || die "fleet gate: no such dispatch $want"
+      printf '%s\n' "$led/$want"; return 0
+    fi
     for d in "$led"/d*/; do
-      [ -d "$d" ] || continue
+      ledger_entry_dir "$d" || continue
       wn=$(meta_get "$d" window)
       case "$wn" in *"-$want") printf '%s\n' "${d%/}"; return 0 ;; esac
     done
@@ -3253,13 +3509,13 @@ gate_resolve_dir() { # [<id|slug>] -> prints dir, or dies
   wn=$(tmux display -p '#{window_name}' 2>/dev/null)
   case "$wn" in
     so-d[0-9]*) id=${wn#so-}; id=${id%%-*}
-                [ -d "$led/$id" ] && { printf '%s\n' "$led/$id"; return 0 ; } ;;
+                ledger_entry_dir "$led/$id" && { printf '%s\n' "$led/$id"; return 0 ; } ;;
   esac
   # Last resort: exactly ONE dispatch is parked at a gate. More than one is genuinely
   # ambiguous and must be named — guessing would approve the wrong pipeline.
   local hits="" n=0
   for d in "$led"/d*/; do
-    [ -d "$d" ] || continue
+    ledger_entry_dir "$d" || continue
     ledger_parked "$(meta_get "$d" state)" || continue
     hits="${d%/}"; n=$((n+1))
   done
@@ -3540,8 +3796,14 @@ gate_show() {
 # Every failure mode here fails towards "still parked", which is the safe direction.
 gate_deliver() { # deliver <id>
   local id="${1:-}"; [ -n "$id" ] || die "usage: fleet gate deliver <dispatch-id>"
+  # SHAPE-CHECK BEFORE INTERPOLATION (V1). `fleet gate deliver` is a CLI verb and the
+  # courier WRITES: `.deliver.lock`, `delivered`, `deliver_attempts`, `deliver_after`.
+  # A traversal id lands all of that outside every ledger. `return 1` rather than `die`
+  # — every other refusal in the courier is a deferral, and fleetd Popens this on a 2s
+  # tick where a die is just a nonzero rc anyway.
+  valid_dispatch_id "$id" || return 1
   local root; root=$(fleet_root 2>/dev/null) || return 1
-  local d="$root/.fleet/dispatch/$id"; [ -d "$d" ] || return 1
+  local d="$root/.fleet/dispatch/$id"; ledger_entry_dir "$d" || return 1
   # ONE COURIER PER DISPATCH. fleetd `Popen`s a fresh `fleet gate deliver` every 2s
   # with NO in-flight dedup, while this function blocks >=6s inside `gate_landed` —
   # so couriers overlap on EVERY delivery whose confirm window exceeds the tick, i.e.
@@ -3746,7 +4008,7 @@ gate_list() {
   led="$root/.fleet/dispatch"; [ -d "$led" ] || return 0
   now=$(date +%s 2>/dev/null)
   for d in "$led"/d*/; do
-    [ -d "$d" ] || continue
+    ledger_entry_dir "$d" || continue
     st=$(meta_get "$d" state); ledger_parked "$st" || continue
     id=$(basename "$d"); pa=$(meta_get "$d" parked_at); dec=$(meta_get "$d" decision)
     age="-"
@@ -3789,7 +4051,7 @@ gate_waiting() {
   local r led d id st; r=$(fleet_root 2>/dev/null) || return 0
   led="$r/.fleet/dispatch"; [ -d "$led" ] || return 0
   for d in "$led"/d*/; do
-    [ -d "$d" ] || continue
+    ledger_entry_dir "$d" || continue
     id=$(basename "$d"); st=$(meta_get "$d" state)
     # Emit the LIVE window name (meta window, slugged by `dispatch rename`), fallback
     # bare so-$id — so the reap-skip match (cmd_reap, by live window name) hits a renamed
@@ -3866,7 +4128,7 @@ cmd_reconcile() {
   case "$respawn_max"  in ''|*[!0-9]*) respawn_max=5 ;; esac
   case "$grace"        in ''|*[!0-9]*) grace=30 ;; esac
   for d in "$led"/d*/; do
-    [ -d "$d" ] || continue
+    ledger_entry_dir "$d" || continue
     id=$(basename "$d")
     meta_compact "$d"   # collapse legacy stacked meta.tsv before reading state
     state=$(meta_get "$d" state)
@@ -4126,7 +4388,7 @@ suborch_ledger_active() { # <soid>
   did="${soid#so-}"; did="${did%%-*}"          # so-d11[-slug] -> d11
   root=$(fleet_root 2>/dev/null) || return 1
   d="$root/.fleet/dispatch/$did"
-  [ -d "$d" ] || return 1                        # no ledger -> not an active dispatch
+  ledger_entry_dir "$d" || return 1                        # no ledger -> not an active dispatch
   st=$(meta_get "$d" state 2>/dev/null)
   ledger_terminal "$st" && return 1
   return 0
@@ -5038,7 +5300,7 @@ dispatch_status() { # report whether the hook is wired + the ledger rollup
   [ -d "$led" ] || { echo "no dispatches yet"; return 0; }
   printf 'ID\tSTATE\tWINDOW\n'
   for d in "$led"/d*/; do
-    [ -d "$d" ] || continue
+    ledger_entry_dir "$d" || continue
     id=$(basename "$d"); st=$(meta_get "$d" state)
     printf '%s\t%s\t%s\n' "$id" "${st:-?}" "$(meta_get "$d" window)"
   done
@@ -8043,6 +8305,7 @@ case "${1:-}" in
   unhide)  shift; cmd_unhide "$@" ;;        # surface a parked agent back onto the bar
   dispatch)      shift; cmd_dispatch "$@" ;;        # <id> spawn, or enable|disable|status|mode
   dispatch-alloc) shift; cmd_dispatch_alloc "$@" ;; # internal: alloc id + ledger dir (hook)
+  dispatch-alert) shift; cmd_dispatch_alert "$@" ;; # internal: hook -> alerts.log (hook is POSIX sh)
   dispatch-classify) shift; cmd_dispatch_classify "$@" ;; # internal: front-door classifier (hook)
   gate)          shift; cmd_gate "$@" ;;            # gated pipeline: parse|post|park|waiting
   integration-branch) shift; cmd_integration_branch "$@" ;; # per-project GATE 2 merge target

@@ -352,9 +352,27 @@ spawn each role:
 
 ```
 research → plan → gate1-wait → impl → gate3-wait → test → gate2-wait → done
+```
+
+```
 # upsert the cursor by appending a tab-separated line (last-wins, like §6's state write):
 printf 'role-phase\t%s\n' impl >> .fleet/dispatch/<id>/meta.tsv
 ```
+
+**READ THE FENCE AROUND THAT APPEND.** It is the *one* hand-write this design still
+asks for, and it is tolerable for one narrow reason: `role-phase` has exactly one
+writer — you, about your own dispatch — so there is no interleave to lose. It takes
+neither `.meta.lock` nor the tmp-file+`mv` that `meta_set` uses, so it is **not** a
+general licence to edit the ledger by hand. Everything else has a verb: state →
+`fleet dispatch done|fail|cancel` (§6), gates → `fleet gate post|park` (§7), and a new
+dispatch → **`fleet dispatch-alloc`, never `mkdir`** (§8 below).
+
+Hand-creating ledger directories is not a hypothetical: three of them (d36, d37, d38)
+were made that way without bumping `seq`, and on 2026-08-02 the allocator — which
+trusted the counter and used `mkdir -p` — handed a **live, running** dispatch's
+directory to a new prompt and stamped its `meta.tsv`. The allocator no longer can
+(it creates the directory itself, and a create that fails is a collision, not a
+success), but the motive is the thing worth removing: §8 documents the supported path.
 
 **The rungs were APPENDED, never renamed — and that is the whole of the safety argument.**
 The pipeline is now four roles (RESEARCH · PLAN · IMPLEMENTATION · TESTING, §3.0.2), so
@@ -766,3 +784,59 @@ discriminator.
 > approval back to YOUR pane and auto-submits** (you are a machine pane, no draft to
 > clobber) — resolved from the `from=so-<id>` the post stamps. You never touch the main
 > input line, and the main pane is never the parked party.
+
+---
+
+## 8. Filing a FOLLOW-UP dispatch — the supported path
+
+**There was no documented way to do this, and that omission has a body count.** Three
+dispatch directories (`d36`, `d37`, `d38`) were created by hand — `mkdir` plus a
+hand-written `instruction.txt`, then `fleet dispatch <id>` — because that was the only
+route anyone could see. None of them bumped `.fleet/dispatch/seq`, so the counter fell
+three behind reality, and on 2026-08-02 `fleet dispatch-alloc` returned the ledger
+directory of a **live, running** dispatch (`d36`, `state=planning`, sub-orch working in
+`@53`) and stamped `state queued` + a fresh `created` over its `meta.tsv`. The next line
+of the prompt hook would have written a new brief over that dispatch's own, silently,
+while its sub-orch kept working from text it had already read.
+
+The allocator has been fixed so that outcome is unreachable (it creates the directory
+itself; an id that already exists is a collision to skip, never a success to return).
+**That does not make the hand path safe — it makes it unnecessary.** Use one of these:
+
+**(a) Ask the human.** The ordinary route, and the right one whenever the follow-up is a
+new unit of work rather than a mechanical continuation. Post to the inbox and say what
+you would file:
+
+```sh
+fleet inbox put -d "$id" --sev warn -t 'follow-up needed: <one line>' -m '<why, and the instruction you propose>'
+```
+
+The human types it as a `,`-prefixed prompt (or bare, under `dispatch mode all`) and the
+prompt hook allocates, writes the brief and spawns the sub-orch — one path, correctly
+counted, with the ledger consistent at every step.
+
+**(b) Allocate through the allocator, never around it.** If you genuinely must file one
+yourself, the two steps are:
+
+```sh
+dir=$(fleet dispatch-alloc)     || exit 1   # BRANCH ON THE rc — it is not decorative
+[ -e "$dir/instruction.txt" ]   && exit 1   # freshness: a dir that already holds a brief is not yours
+printf '%s' "$INSTRUCTION" > "$dir/instruction.txt"
+fleet dispatch "$(basename "$dir")"
+```
+
+Three rules, each of which was violated by the code path that caused the incident:
+
+1. **Branch on the allocator's exit code.** Not on `[ -d "$dir" ]`. For an allocator an
+   existing directory is the one condition that must force a refusal — and `[ -d ]`
+   follows symlinks where `mkdir(2)` does not, so testing it hands back the hole the
+   allocator's bare `mkdir` closes.
+2. **Never `mkdir` a ledger directory.** Not with `-p`, not at all. `mkdir -p` reports
+   success on a directory that was already there, which is precisely how "collision"
+   became "allocated".
+3. **Never write `instruction.txt` over one that exists.** A collision must degrade to a
+   loud refusal, never to a truncation.
+
+**Not offered: a `fleet dispatch-file` verb.** A second front door onto the allocator is
+a bigger change than the one that closed the hole, and (a) already covers the case the
+hand path was invented for.
