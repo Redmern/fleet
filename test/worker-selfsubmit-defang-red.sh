@@ -15,8 +15,19 @@
 # nothing about which case covers what.
 #
 # It also names, honestly, the cases that are green PRE-FIX by construction. Those
-# are premise-pins (14, 15) and negative controls (3, 3b, 8b), not coverage of the
-# change; each is reddened by a mutation of the thing it actually pins.
+# are premise-pins (8c, 14, 15) and negative controls (3, 3b, 8b), not coverage of
+# the change; each is reddened by a mutation of the thing it actually pins.
+#
+# CASE 8, AND WHY THIS DRIVER EARNED ITS KEEP. After the d37 merge this driver went
+# 6/8: case 8 stopped reddening under `remove-defang`. The defence was fine (20/20);
+# what had gone false was case 8's COVERAGE CLAIM. 3839f03 (d36, merged in 184b844)
+# tightened gate_parse's anchor to require a single-token <from>, and case 8's
+# fixture had NO from= at all — so its degenerate "From : " header was refused by
+# the anchor whether or not the defang ran. Case 8 was reshaped to a truncation
+# that keeps from= (so the anchor accepts and only the defang defends), and the
+# now-double-protected empty-<from> path was pinned separately as 8c with its own
+# mutation (M9) below. The expected red sets for M1/M7 were NOT edited — 8 is still
+# in both. See _reports/f1b-worker-selfsubmit/CASE8-DIAGNOSIS.md.
 set -u
 
 HERE=$(cd "$(dirname "$0")/.." && pwd)
@@ -136,6 +147,14 @@ mutate widen-bound-real "s/sed -n '1,2p'/sed -n '1,3p'/g; s/| sed -n 2p)/| sed -
 # and it re-reddens 16, proving 16 depends on the real route and not on a pane the
 # fixture hard-coded.
 mutate no-owner-route 's/^    so-\*)$/    so-NEVER-MATCH)/' 15 16
+
+# M9 — DELETE THE ANCHOR'S EMPTY-<from> REJECTION (bin/fleet:2904). This is what
+# makes 8c coverage rather than decoration: 8c is green pre-fix by construction,
+# so only a mutation of the thing it actually pins can red it. Expected red is 8c
+# ALONE — the space-rejection arm survives (case 10's `from` is a whole sentinel,
+# i.e. multi-token), and no defang case depends on this clause. A wider red set
+# here would mean the two guards are entangled, which is a finding, not a pass.
+mutate no-empty-from-reject 's/^        ""|\*\[\[:space:\]\]\*) ;;/        *[[:space:]]*) ;;/' 8c
 
 printf '\n---- %s: %d passed, %d failed\n' "$(basename "$0")" "$PASS_N" "$FAIL_N"
 [ "$FAIL_N" -eq 0 ] || exit 1
