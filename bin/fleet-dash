@@ -178,10 +178,14 @@ harness_has_modes() { # harness -> 0 if it supports a permission-mode cycle
 }
 
 # --- orchestrator cards: ownership + classification --------------------------
-# Workers spawned by a sub-orchestrator carry a non-forgeable @fleet_owner window
-# option (=so-<id>), stamped at spawn by cmd_new. The dashboard groups each card's
-# rows under their sub-orch header. owner_of is cached PROCESS-LIFETIME (owner is
-# immutable per window) — NOT cleared per load_rows.
+# Workers spawned by a sub-orchestrator carry an @fleet_owner window option
+# (=so-<id>), stamped at spawn by cmd_new. cmd_new is its SOLE writer but there is
+# NO verifier: any pane can self-set it (`tmux set -w @fleet_owner …`). It is read
+# as SUBORDINATION ("this window's work belongs to so-<id>"), never as entitlement —
+# see the d37 correction in bin/fleet (cmd_new / inbox_put / inbox_route). The
+# dashboard groups each card's rows under their sub-orch header. owner_of is cached
+# PROCESS-LIFETIME (owner is not expected to change; a stale group is cosmetic) —
+# NOT cleared per load_rows.
 ROWS=()                                     # live agent rows (8-field, see load_rows)
 declare -a ROW_GID ROW_ROLE ROW_ANNOT       # per-row card group / role(0 hdr,1 wkr) / annotation, display order
 declare -A OWN_RAW                          # window_id -> @fleet_owner (lifetime cache)

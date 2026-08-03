@@ -879,10 +879,28 @@ Four things that are load-bearing:
 5. Writing `decision-<n>.txt` for `gate_deliver` to un-park with no message at all.
 
 Under a single uid none of these close in-band — the same wall d23 hit. Also corrected: the
-"non-forgeable owner" comments at `cmd_new`, `inbox_put` and `inbox_route`. `@fleet_owner`
-has one writer and **no verifier**; the stamp is unforgeable against `fleet` CLI
-*arguments* only. That is now survivable rather than fixed — forging the stamp is what
-routes you to the sub-orch, and forging it is what defangs you.
+overclaiming owner comments — at `cmd_new`, `inbox_put`, `inbox_route`, **and the ownership
+section header of `bin/fleet-dash`**, which was missed by the first sweep and is the first
+place a reader of the ownership model lands. Treat that as a list of the sites found, not a
+closed set: re-run the grep rather than trusting the enumeration. `@fleet_owner` has one
+writer and **no verifier**; the stamp resists forgery through `fleet` CLI *arguments* only,
+and any pane can set it on itself with `tmux set -w`. That is survivable rather than fixed —
+forging the stamp is what routes you to the sub-orch, and forging it is what defangs you.
+
+**Known residual risk (non-blocking, from the d37 adversary):**
+
+- **NB1** — the two `so-*` globs at `bin/fleet:4505` (`inbox_route`) and `:4603`
+  (`inbox_pop_text`) are coupled by *convention only*. Route ⊆ defang holds today as an
+  identity of patterns, but nothing pins them together; a one-sided edit silently
+  reintroduces the whole class.
+- **NB2** — proof case 14 pins the `sed -n '1,2p'` **source literal**, not the `l1`/`l2`
+  `case` structure that is the real bound. A structural widening of `gate_parse` makes this
+  defence stop defending with the suite still green.
+- **NB3** — `bin/fleet:4417` (bare `fleet inbox`) and `:4798` (`inbox archive list`) print
+  the body raw; they are positionally safe only because `inbox_show` happens to emit two
+  header lines first, and nothing pins that. Slim either renderer to a bare body and a
+  subordinate's sentinel becomes parseable on line 1 via `gate_parse`'s bare-body arm —
+  bypassing the defang with no forgery at all.
 
 Locked in by `test/worker-selfsubmit-defang-proof.sh` (20 cases) **plus
 `test/worker-selfsubmit-defang-red.sh`**, a mutation driver that neuters one operation at
