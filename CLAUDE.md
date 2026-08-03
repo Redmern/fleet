@@ -113,6 +113,118 @@ whose sub-orch pane is **dead** is never revived *and* never silently dropped �
 `ledger_parked`: a gate-parked sub-orch losing its pane is exactly when the human
 most needs the nudge. Locked in by `test/reconcile-gate-park-proof.sh` (9 cases).
 
+### The allocator creates instead of counts (`alloc_id`, `cmd_dispatch_alloc`, d38)
+
+`fleet dispatch-alloc` read `.fleet/dispatch/seq`, added one, and `mkdir -p`'d the result.
+Every clause of that is wrong for an allocator. `seq` is a counter the function does not
+own — anything can create a ledger dir out-of-band, and three things did (`d36`/`d37`/`d38`
+were filed by hand) — and **`mkdir -p` is precisely what converts "already exists" into
+success**. On 2026-08-02, with `seq`=35 and `d36` a **live** dispatch (`state=planning`,
+sub-orch working in `@53`), alloc returned `d36` and stamped `state queued` + a fresh
+`created` over its `meta.tsv`. The next line of `bin/fleet-dispatch.sh` would have written
+a new brief over that dispatch's own — silently, while its sub-orch kept working from text
+it had already read. A human caught it, not the system.
+
+The honest guarantee is narrow and is written at the function: **"the allocator never
+returns a directory it did not create."** It is **not** "ids are never reused" —
+`_reports/<slug>` and archived `dispatch=dN` messages outlive a deleted dispatch, and
+empty/partial dirs are never reclaimed (explicit non-goal).
+
+- **The create IS the exclusion.** Bare `mkdir`, never `-p`: the kernel arbitrates and two
+  racers cannot both win. Same primitive as `acquire_lock` and the notes-archive create.
+- **Seed from `max(seq, disk-max)`,** where the scan is `find -maxdepth 1 -type d` filtered
+  `^d[0-9]+$`. The filter is mandatory — a filename reaches `[ "$b" -gt "$m" ]`, an
+  arithmetic (eval) context — and `d1c`/`alerts.log`/`seq` all live in that dir while
+  `dispatch_farm` plants symlinks there. The comparison is deliberately **not**
+  `2>/dev/null`: with the filter in place the suppression is dead code, and dead
+  suppression is what makes the filter's absence unobservable (proof case A4).
+- **EEXIST ⇒ advance and retry, bounded (`ALLOC_MAX_TRIES`, 64) — never `die`.** One stray
+  directory must not wedge the prompt hook, whose stderr is swallowed: a `die` there
+  becomes silently vanished prompts. Exhausting the cap is the one refusal.
+- **`seq` is written only after a successful create, and its rc is CHECKED** — fail-soft,
+  because `max(seq,disk)` self-heals the next allocation. A lost write costs an alert.
+- **Provenance is passed in GLOBALS (`ALLOC_ID`, `ALLOC_CREATED_DIR`), so
+  `cmd_dispatch_alloc` calls `alloc_id` WITHOUT `$( )`.** A command substitution runs the
+  function in a subshell and would discard provenance at exactly the caller that needs it.
+  `cmd_dispatch_alloc` stamps meta only into the path alloc recorded — and deliberately
+  **never re-tests `[ -d "$d" ]`**: that was the incident's own oracle, and `[ -d ]`
+  follows symlinks where `mkdir(2)` does not. (Measured: with `mkdir -p` restored and a
+  symlink planted at the next candidate id, `meta.tsv` is written straight through it —
+  proof case A4 under mutation `M_A4`.)
+
+`bin/fleet-dispatch.sh:84-86` was the other half and shipped as one change with it: it
+branched on `[ -d "$DIR" ]` (existence — the one condition that must force refusal),
+discarded alloc's rc and every `die` message via `2>/dev/null`, and truncated
+`instruction.txt`. It now branches on the **rc**, refuses when `instruction.txt` already
+exists, writes the brief **no-clobber under `set -C`**, and routes every refusal to
+`fleet dispatch-alert` (a new internal verb — the hook is POSIX sh and cannot reach
+`append_dashboard_alert`) plus a `systemMessage`, because an `exit 0` there is
+indistinguishable from the user having typed nothing.
+
+Locked in by `test/dispatch-alloc-proof.sh` (A1–A7b; A6 is the repo's **first** test that
+drives `bin/fleet-dispatch.sh` at all) and `test/cross-root-guard-proof.sh` (B1–B4), with
+`test/d38-sabotage.sh` as the RED harness: 13 delete-the-operation mutations, each with a
+vacuity guard that aborts if its target text is absent. Two results worth keeping: **A2's
+headline is double-covered** (deleting the disk seed leaves the id correct because the
+retry reaches `d39` anyway — only the alert goes red), and **A3 needs both the bare `mkdir`
+and the seqlock gone** before duplicates appear. Neither is a weak case; both are two
+mechanisms covering each other, and the sabotage script says which is which.
+
+### Cross-root ledger writes: detection, never refusal (d38)
+
+`fleet_root()` resolves tmux `@fleet_root` **first**, `FLEET_ROOT` second, `pwd` third, and
+**nothing anywhere compares the environment that produced the root with the argument that
+produced the target.** A test fixture that exported `FLEET_ROOT` into a sandbox but did not
+isolate `TMUX_TMPDIR` therefore wrote the **real** ledger on 2026-08-02: it parked a gate on
+the human's live `d1`, dropped a message in their real inbox, and their own pop stamped
+`gate1_popped` on it.
+
+**Refusal was examined and killed, and the reason must not be re-litigated.** Flipping the
+precedence breaks worker panes (they carry no `FLEET_ROOT` and fall through to `pwd`) and
+`fleetd`, which discovers projects *by* `@fleet_root`. Making a mismatch fatal fails
+**OPEN** at `is_main_pane:230` — `fleet_root … || return 1` reads as "not main", which
+switches off the never-clobber brake in `safe_kill_window`, the brake installed after a
+prior dispatch tore down a whole session. *A guard whose failure mode disables an older
+guard is worse than no guard.* A **containment** assertion is worse still and was killed as
+a **tautology**: the target path is *built* from the root, so a proof of it is green by
+construction — exactly the false green this dispatch exists to eliminate.
+
+What ships instead is four narrow things, all of them audit or blast-radius, **none of them
+security** (same uid throughout; `inbox_put` has no role check by design):
+
+- **`root_disagreement_alert`**, called from `fleet_root` and changing nothing it returns.
+  Fires once per process when `FLEET_ROOT` is set and differs from tmux, writing into the
+  log of the root that **won** — so an escaping fixture writes the evidence into the *real*
+  project's `alerts.log` and cannot suppress it. The once-per-process flag is set **before**
+  the call, which is also what stops the recursion through `append_dashboard_alert`.
+- **`valid_dispatch_id`** at `gate_resolve_dir`, `gate_record_pop`, `cmd_dispatch` and
+  `cmd_dispatch_finish`. The old `d[0-9]*` glob matched `d1/../../evil`, which resolves
+  clean **outside** the ledger whenever that path exists. Deliberately **not** the strict
+  `^d[0-9]+$`: the live corpus allocates `d1c`, `d2c`, `d2e`, `d2f` out-of-band, and the
+  strict form silently unresolves them at every gate verb while buying nothing — a name
+  with no separator and no `..` cannot leave the ledger dir. Strict `^d[0-9]+$` *is* used at
+  `ledger_disk_max`, for the different reason above.
+- **The `gate_post` reorient cut.** `$FLEET_DIR` comes from the binary's own location and
+  was never compared to the root; that split is how `/tmp/adv3/tree/FLEET_SUBORCH.md` — a
+  manual under a path anything on the box can plant — was written into a real dispatch's
+  gate artifact, aimed at the reader whose job is to re-read it. **The trigger is
+  "under the root OR under `$HOME`", not the plainer "inside the root"**, and that is
+  load-bearing: in every real install the binary is outside the project by construction
+  (release tree / a checkout), so the plainer rule fires on *every* gate message and
+  replaces a pointer that resolves with one that does not. `gate-unpark-pointer-proof.sh`
+  measures that (4 assertions go red under the blanket form).
+- **The harness refuses to run half-isolated** (`proof_root_tripwire`, plus a `TMUX_TMPDIR`
+  check beside the existing socket ones). The escaping fixture simply did not source
+  `hidden-proof-common.sh` — which is the argument for making the harness impossible to
+  half-use rather than for adding one more thing a fixture author must remember. Fail-CLOSED,
+  the deliberate inversion of fleet's usual rule.
+
+`gate_write_artifact`, `gate_park` and `inbox_put` are **unchanged and still reachable from
+any root** — that residue is stated, not hidden, in
+`_reports/alloc-collision/CROSSROOT-RESIDUE.md`, which is the deliverable this half is
+judged on. FLEET_SUBORCH.md §8 documents the supported way to file a follow-up dispatch,
+removing the motive for the hand-`mkdir` that started all of it.
+
 ### Reap is atomic (`cmd_reap`)
 
 `cmd_reap` is split into **DECIDE** (pure reads: the ready marker, target match,

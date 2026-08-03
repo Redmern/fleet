@@ -78,6 +78,17 @@ proof_isolate() {
        rm -rf "$TMPROOT"; exit 1 ;;
   esac
 
+  # d38: TMUX_TMPDIR itself, not only the derived SOCK. FLEET_TEST_SOCK can move
+  # SOCK back inside TMPROOT while TMUX_TMPDIR still points at the real server —
+  # and `bin/fleet` (the code under test) resolves its OWN server from TMUX_TMPDIR,
+  # not from our wrapper. Half-isolation is what let the 2026-08-02 fixture write
+  # the live ledger; a harness that can be half-used is the thing being fixed.
+  case "$TMUX_TMPDIR" in
+    "$TMPROOT"/*) ;;
+    *) echo "REFUSE: TMUX_TMPDIR '$TMUX_TMPDIR' is outside the proof TMPROOT ($TMPROOT)" >&2
+       rm -rf "$TMPROOT"; exit 1 ;;
+  esac
+
   export XDG_CONFIG_HOME="$TMPROOT/config"; mkdir -p "$XDG_CONFIG_HOME/fleet/sessions"
   export XDG_RUNTIME_DIR="$TMPROOT/run";    mkdir -p "$XDG_RUNTIME_DIR"  # no real fleetd
   unset TMUX TMUX_PANE                                   # never inherit the live server
@@ -126,7 +137,36 @@ proof_session() { # proof_session <name> — visible fleet session with @fleet_r
   local s="$1"
   export FLEET_SESSION="$s"
   tmux new-session -d -s "$s" -n main sh 2>/dev/null
-  tmux set -t "$s" @fleet_root "$FLEET_ROOT" 2>/dev/null
+  # FLEET_PROOF_ROOT_OVERRIDE exists ONLY so a safety proof can inject a deliberate
+  # disagreement, exactly like FLEET_TEST_SOCK above: it can fail the tripwire below,
+  # never bypass it.
+  tmux set -t "$s" @fleet_root "${FLEET_PROOF_ROOT_OVERRIDE:-$FLEET_ROOT}" 2>/dev/null
+  proof_root_tripwire
+}
+
+# d38 P6 — REFUSE TO RUN HALF-ISOLATED. `fleet_root()` reads tmux @fleet_root FIRST
+# and FLEET_ROOT second, so a fixture that isolates only the env variable runs
+# against whatever project tmux names. On 2026-08-02 that was the live one: a gate
+# parked on the human's real d1, a message in their real inbox, and their own pop
+# stamped onto it. The escaping fixture simply did not source this file — which is
+# the argument for making the harness impossible to half-use, rather than for adding
+# one more thing a fixture author must remember.
+#
+# Fail-CLOSED, unlike the rest of fleet: a proof that silently runs against the
+# wrong root is worse than a proof that does not run.
+proof_root_tripwire() {
+  local t; t=$(tmux show -v @fleet_root 2>/dev/null)
+  if [ "$t" != "${FLEET_ROOT:-}" ]; then
+    echo "REFUSE: FLEET_ROOT ('${FLEET_ROOT:-}') and tmux @fleet_root ('$t') disagree — half-isolated fixture" >&2
+    tmux kill-server 2>/dev/null || true
+    rm -rf "$TMPROOT"; exit 1
+  fi
+  case "${FLEET_ROOT:-}" in
+    "$TMPROOT"/*) ;;
+    *) echo "REFUSE: FLEET_ROOT ('${FLEET_ROOT:-}') is outside the proof TMPROOT ($TMPROOT)" >&2
+       tmux kill-server 2>/dev/null || true
+       rm -rf "$TMPROOT"; exit 1 ;;
+  esac
 }
 
 pane_of() { # pane_of <window-name> -> pane id (first match, any session)
