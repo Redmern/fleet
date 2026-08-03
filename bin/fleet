@@ -2011,7 +2011,10 @@ cmd_watch() {
     [ -n "$st" ] || die "no agent matching '$t' (try: fleet ls)"
   done
   [ -n "$msg" ] || msg="fleet: agents now idle — ${targets[*]}"
-  local self="$FLEET_DIR/bin/fleet"
+  # STABLE dir, never $FLEET_DIR: the detached watcher outlives this process by up to
+  # ~90 minutes, well past release_prune's 10-minute floor, so a `rel-<stamp>` path can
+  # be deleted out from under a watcher that is still armed.
+  local self="$(release_stable_dir)/bin/fleet"
   # Pass this pane's FLEET_SUBORCH_ID (so-d<N>, empty for main/workers) as the soid
   # positional: a sub-orch's detached watcher then NAMES its escalation and gates the
   # pane-death path on the dispatch ledger. (The setsid child also inherits the env, so
@@ -6725,7 +6728,11 @@ keybind_for() { # keybind_for <action> → key (config override or default)
 }
 
 action_tmux_command() { # tmux command string run when an action's key is pressed
-  local action="$1" self="$FLEET_DIR/bin/fleet"
+  # STABLE dir, never $FLEET_DIR: this string is BAKED INTO A TMUX KEY BINDING, which
+  # lives in the server and outlives the release that wrote it. A `rel-<stamp>` path is
+  # immutable and eventually PRUNED, so the next promote left prefix+F/prefix+Space
+  # pointing at a deleted file — `... menu-popup' returned 127`, measured 2026-08-03.
+  local action="$1" self="$(release_stable_dir)/bin/fleet"
   case "$action" in
     menu) echo "run-shell -b '$self menu-popup'" ;;   # measures then opens a fit-to-content popup
     pick) echo "display-popup -E -b rounded -w 80% -h 60% '$self pick'" ;;
@@ -6881,7 +6888,9 @@ cmd_popup_fit() { # cmd_popup_fit <menu|keys|ls|sessions> — thin map of kind �
   # menu/keys/ls/sessions on a single sizing path so they can never drift apart.
   # 'sessions' and 'ls' are INTERACTIVE fzf, so their measure cmd is a fzf-free
   # `--measure` dump (rows + fzf-chrome placeholder lines) — never the run.
-  local self="$FLEET_DIR/bin/fleet"
+  # STABLE dir, never $FLEET_DIR — same reason as action_tmux_command: these strings
+  # are handed to tmux, which may run them after this release has been pruned.
+  local self="$(release_stable_dir)/bin/fleet"
   case "${1:-menu}" in
     menu)     popup_fit_content 'leader_grid'         "$self menu"        64% 80% ;;
     keys)     popup_fit_content "$self keys"          "$self keys --hold" 72% 70% ;;
