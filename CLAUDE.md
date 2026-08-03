@@ -193,17 +193,49 @@ What ships instead is four narrow things, all of them audit or blast-radius, **n
 security** (same uid throughout; `inbox_put` has no role check by design):
 
 - **`root_disagreement_alert`**, called from `fleet_root` and changing nothing it returns.
-  Fires once per process when `FLEET_ROOT` is set and differs from tmux, writing into the
+  Fires when `FLEET_ROOT` is set and differs from tmux, writing into the
   log of the root that **won** — so an escaping fixture writes the evidence into the *real*
-  project's `alerts.log` and cannot suppress it. The once-per-process flag is set **before**
-  the call, which is also what stops the recursion through `append_dashboard_alert`.
-- **`valid_dispatch_id`** at `gate_resolve_dir`, `gate_record_pop`, `cmd_dispatch` and
-  `cmd_dispatch_finish`. The old `d[0-9]*` glob matched `d1/../../evil`, which resolves
+  project's `alerts.log` and cannot suppress it. The flag is set **before**
+  the call, which is what stops the recursion through `append_dashboard_alert`.
+  **It de-duplicates per SHELL CONTEXT, not per process** — the earlier "once per process"
+  wording was wrong and is corrected here rather than quietly dropped. `fleet_root` is
+  almost always called as `$(fleet_root)`, and a subshell's assignment to
+  `_ROOT_DISAGREE_ALERTED` cannot propagate back to its parent, so a verb that resolves the
+  root twice alerts twice (**measured: 2 for `dispatch rename`**, 1 each for
+  `dispatch done` / `gate park` / `dispatch farm`). The **claim** was fixed, not the
+  behaviour: the alert is audit and fail-soft, a duplicate line costs nothing, and the
+  alternatives (a marker file, or exporting into the environment) add a durable side effect
+  to a function every code path calls.
+- **`valid_dispatch_id`** at **nine** sites — `cmd_dispatch`, `cmd_dispatch_finish`,
+  `cmd_dispatch_rename`, `dispatch_farm`, `gate_write_artifact`, `gate_park`,
+  `gate_record_pop`, `gate_resolve_dir` and `gate_deliver` (`bin/fleet` 2784, 2814, 2835,
+  2882, 3237, 3278, 3316, 3374, 3661 at `05a323d`). Round 1 shipped **four** — the read/
+  resolve sites only — and that four-site list survived in this file for a round after the
+  code had nine; `CROSSROOT-RESIDUE.md` and the `05a323d` commit message say "seven" while
+  enumerating nine. The commit message cannot be amended; **nine is the number**.
+  The old `d[0-9]*` glob matched `d1/../../evil`, which resolves
   clean **outside** the ledger whenever that path exists. Deliberately **not** the strict
   `^d[0-9]+$`: the live corpus allocates `d1c`, `d2c`, `d2e`, `d2f` out-of-band, and the
   strict form silently unresolves them at every gate verb while buying nothing — a name
   with no separator and no `..` cannot leave the ledger dir. Strict `^d[0-9]+$` *is* used at
   `ledger_disk_max`, for the different reason above.
+- **`ledger_entry_dir`, the second half of that check — and the half round 2 found
+  missing.** `valid_dispatch_id` bounds the NAME; every site then asked `[ -d "$d" ]`, and
+  **`[ -d ]` follows symlinks**. Measured against `05a323d`: with `ln -sfn <victim>
+  $LED/d99`, `gate park d99 1`, `dispatch done d99` and `dispatch rename d99 slugx` each
+  wrote a 0600 `meta.tsv` and planted a farm symlink in the victim — outside every ledger,
+  hence outside every `alerts.log`. That is round 1's V1 outcome by a second route, and
+  strict `^d[0-9]+$` would **not** have closed it (`d99` is strict-valid), so it is not an
+  argument about the non-strict choice. It is the lesson the *allocator* half already wrote
+  down (`mkdir(2)` does not follow a trailing symlink where `[ -d ]` does) reaching the gate
+  half a round late. `ledger_entry_dir` is `[ ! -L ]` before `[ -d ]`, with the trailing
+  slash stripped (`[ -L "$d/" ]` resolves the link and is false), and it replaced the
+  `[ -d ]` at every ledger-entry site including the read/enumerate ones. **Residual, stated:
+  it bounds the final path component only** — a symlinked `.fleet/dispatch` *itself*, or a
+  symlinked `.fleet`, still redirects everything, and no realpath containment is asserted
+  anywhere (a containment proof built from the root is the tautology killed above).
+  Pinned by `cross-root-guard-proof.sh` **B5** (a–h; 11 assertions go red when the `[ ! -L ]`
+  line is deleted, with a narrowness case proving a REAL `d99` directory still parks).
 - **The `gate_post` reorient cut.** `$FLEET_DIR` comes from the binary's own location and
   was never compared to the root; that split is how `/tmp/adv3/tree/FLEET_SUBORCH.md` — a
   manual under a path anything on the box can plant — was written into a real dispatch's

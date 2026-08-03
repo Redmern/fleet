@@ -2132,7 +2132,8 @@ release_lock() { # <lockdir>
 # (test/gate3-state-proof.sh), `d2c`/`d2e`/`d2f` (test/gate-courier-proof.sh) — so
 # the strict form silently unresolves real, existing dispatches at every gate verb.
 # It would buy nothing: a name with no separator and no `..` cannot leave the ledger
-# directory, which is the whole of the hole being closed. The strict `^d[0-9]+$`
+# directory BY NAME — see ledger_entry_dir for the other half, which is what makes
+# that sentence true of the resulting PATH as well. The strict `^d[0-9]+$`
 # filter DOES apply where it is load-bearing for a different reason — ledger_disk_max,
 # where a filename reaches an arithmetic (i.e. eval) context.
 valid_dispatch_id() { # <id>
@@ -2142,6 +2143,27 @@ valid_dispatch_id() { # <id>
     d[0-9]*)  return 0 ;;
     *) return 1 ;;
   esac
+}
+
+# THE SECOND HALF OF THE SHAPE CHECK, and the one round 2 found missing (S1).
+# valid_dispatch_id bounds the NAME; every site then asked `[ -d "$d" ]` — and
+# `[ -d ]` FOLLOWS SYMLINKS. So `ln -sfn /elsewhere/victim $LED/d99` is shape-valid
+# AND `-d`-true, and `gate park d99` / `dispatch done d99` / `dispatch rename d99 s`
+# each wrote a 0600 meta.tsv and planted a farm symlink in the victim — outside every
+# ledger, hence outside every alerts.log: the round-1 V1 outcome by a second route.
+# Strict `^d[0-9]+$` would NOT have closed it (`d99` is strict-valid), so this is not
+# an argument about that choice. It is the same lesson the ALLOCATOR half already
+# wrote down (`mkdir(2)` does not follow a trailing symlink where `[ -d ]` does), now
+# applied to the gate/dispatch half.
+#
+# `-L` before `-d` and no trailing slash on the argument: `[ -L "$d/" ]` resolves the
+# link and is FALSE. Blast-radius/audit, not security — same uid, and planting the
+# link is already a write into the ledger dir.
+ledger_entry_dir() { # <path> -> 0 iff a REAL directory (not a symlink to one)
+  local d="${1:-}"; d=${d%/}
+  [ -n "$d" ] || return 1
+  [ ! -L "$d" ] || return 1
+  [ -d "$d" ]
 }
 
 ALLOC_MAX_TRIES=${ALLOC_MAX_TRIES:-64}   # bounded retry: a stray dir must not wedge the prompt hook
@@ -2786,7 +2808,7 @@ cmd_dispatch() { # dispatch <id> | enable | disable | status | rename <id> <slug
   sess=$(session_name) || die "not inside tmux"
   root=$(fleet_root)   || die "not inside tmux"
   led="$root/.fleet/dispatch/$id"
-  [ -f "$led/instruction.txt" ] || die "no such dispatch $id (no instruction.txt)"
+  ledger_entry_dir "$led" && [ -f "$led/instruction.txt" ] || die "no such dispatch $id (no instruction.txt)"
   wname="so-$id"                                    # one sub-orch per instruction
   resolve_or_spawn_suborch "$sess" "$wname" "$id" "$root"
   meta_set "$led" window "$wname"
@@ -2814,7 +2836,7 @@ cmd_dispatch_finish() { # done|fail|cancel <id>
   valid_dispatch_id "$id" || die "fleet dispatch $verb: invalid dispatch id '$id' (expected d<N>)"
   local r; r=$(fleet_root 2>/dev/null) || die "no project root"
   local d="$r/.fleet/dispatch/$id"
-  [ -d "$d" ] || die "no such dispatch $id"
+  ledger_entry_dir "$d" || die "no such dispatch $id"
   meta_set "$d" state "$st"
   echo "dispatch $id → $st"
 }
@@ -2835,7 +2857,7 @@ cmd_dispatch_rename() {
   valid_dispatch_id "$id" || die "fleet dispatch rename: invalid dispatch id '$id'"
   local root led d; root=$(fleet_root) || die "not inside tmux"
   led="$root/.fleet/dispatch"; d="$led/$id"
-  [ -d "$d" ] || die "no such dispatch $id"
+  ledger_entry_dir "$d" || die "no such dispatch $id"
   local slug; slug=$(suborch_slug "$text")
   [ -n "$slug" ] || { echo "rename $id: empty slug — keeping so-$id"; return 0; }
   acquire_lock "$led/.spawnlock-$id" || return 1
@@ -2881,7 +2903,7 @@ dispatch_farm() { # <dispatch-id>
   # (return 0), matching this function's stated rc-0-throughout contract.
   valid_dispatch_id "$id" || return 0
   local root; root=$(fleet_root 2>/dev/null) || return 0
-  local d="$root/.fleet/dispatch/$id"; [ -d "$d" ] || return 0
+  local d="$root/.fleet/dispatch/$id"; ledger_entry_dir "$d" || return 0
   local rep; rep=$(meta_get "$d" reports 2>/dev/null)
   case "$rep" in
     /*) mkdir -p "$rep" 2>/dev/null || true
@@ -3236,7 +3258,7 @@ gate_write_artifact() { # <dispatch-id|-> <gate-n> <body>
   # to match this function's contract: every other refusal here is a silent no-op.
   valid_dispatch_id "$disp" || return 0
   local root; root=$(fleet_root 2>/dev/null) || return 0
-  local d="$root/.fleet/dispatch/$disp"; [ -d "$d" ] || return 0
+  local d="$root/.fleet/dispatch/$disp"; ledger_entry_dir "$d" || return 0
   printf '%s\n' "$body" > "$d/GATE-$n.md" 2>/dev/null || true
   # A RE-POSTED GATE IS A NEW QUESTION, so it re-opens the decision. Without this the
   # idempotency guard in gate_decide — which exists so a double-approve can never
@@ -3278,7 +3300,7 @@ gate_park() { # park <dispatch-id> <1|2|3>
   valid_dispatch_id "$id" || die "fleet gate park: invalid dispatch id '$id'"
   local r; r=$(fleet_root 2>/dev/null) || die "no project root"
   local d="$r/.fleet/dispatch/$id"
-  [ -d "$d" ] || die "no such dispatch $id"
+  ledger_entry_dir "$d" || die "no such dispatch $id"
   # CHECKED, and this is the other half of B5's de-swallow: `gate_post` now stops
   # swallowing a park failure, but that buys nothing if the park itself reports
   # success after losing the one write that IS the park. A lost `state` write here
@@ -3309,8 +3331,11 @@ gate_record_pop() { # popped <msgfile>
   disp=$(inbox_field "$f" dispatch 2>/dev/null)
   case "$disp" in ""|-) return 0 ;; esac
   # The `dispatch=` header is attacker-writable text (inbox_put has no role check by
-  # design), and it is interpolated into a path below. Shape-check it: an id that is
-  # not `^d[0-9]+$` is not a dispatch, and a pop must never stamp somewhere else.
+  # design), and it is interpolated into a path below. Shape-check it: an id that does
+  # not pass `valid_dispatch_id` (`d`+digit, one path segment, no `..` — deliberately
+  # NOT strict `^d[0-9]+$`; see that function) is not a dispatch, and a pop must never
+  # stamp somewhere else. The `[ -d ]` below is `ledger_entry_dir`, which additionally
+  # refuses a symlinked entry — `[ -d ]` alone follows the link straight out.
   # Blast-radius guard, not authorisation — same uid; a well-formed id belonging to
   # someone else is still accepted, exactly as the comment above says.
   valid_dispatch_id "$disp" || return 0
@@ -3322,7 +3347,7 @@ gate_record_pop() { # popped <msgfile>
   case "$n" in 1|2|3) ;; *) return 0 ;; esac
   local r; r=$(fleet_root 2>/dev/null) || return 0
   local d="$r/.fleet/dispatch/$disp"
-  [ -d "$d" ] || return 0
+  ledger_entry_dir "$d" || return 0
   meta_set "$d" "gate${n}_popped" "$(date -Is 2>/dev/null || date)" 2>/dev/null || true
   return 0
 }
@@ -3372,11 +3397,11 @@ gate_resolve_dir() { # [<id|slug>] -> prints dir, or dies
       */*|*..*) die "fleet gate: invalid dispatch target '$want'" ;;
     esac
     if valid_dispatch_id "$want"; then
-      [ -d "$led/$want" ] || die "fleet gate: no such dispatch $want"
+      ledger_entry_dir "$led/$want" || die "fleet gate: no such dispatch $want"
       printf '%s\n' "$led/$want"; return 0
     fi
     for d in "$led"/d*/; do
-      [ -d "$d" ] || continue
+      ledger_entry_dir "$d" || continue
       wn=$(meta_get "$d" window)
       case "$wn" in *"-$want") printf '%s\n' "${d%/}"; return 0 ;; esac
     done
@@ -3388,13 +3413,13 @@ gate_resolve_dir() { # [<id|slug>] -> prints dir, or dies
   wn=$(tmux display -p '#{window_name}' 2>/dev/null)
   case "$wn" in
     so-d[0-9]*) id=${wn#so-}; id=${id%%-*}
-                [ -d "$led/$id" ] && { printf '%s\n' "$led/$id"; return 0 ; } ;;
+                ledger_entry_dir "$led/$id" && { printf '%s\n' "$led/$id"; return 0 ; } ;;
   esac
   # Last resort: exactly ONE dispatch is parked at a gate. More than one is genuinely
   # ambiguous and must be named — guessing would approve the wrong pipeline.
   local hits="" n=0
   for d in "$led"/d*/; do
-    [ -d "$d" ] || continue
+    ledger_entry_dir "$d" || continue
     ledger_parked "$(meta_get "$d" state)" || continue
     hits="${d%/}"; n=$((n+1))
   done
@@ -3660,7 +3685,7 @@ gate_deliver() { # deliver <id>
   # tick where a die is just a nonzero rc anyway.
   valid_dispatch_id "$id" || return 1
   local root; root=$(fleet_root 2>/dev/null) || return 1
-  local d="$root/.fleet/dispatch/$id"; [ -d "$d" ] || return 1
+  local d="$root/.fleet/dispatch/$id"; ledger_entry_dir "$d" || return 1
   # ONE COURIER PER DISPATCH. fleetd `Popen`s a fresh `fleet gate deliver` every 2s
   # with NO in-flight dedup, while this function blocks >=6s inside `gate_landed` —
   # so couriers overlap on EVERY delivery whose confirm window exceeds the tick, i.e.
@@ -3865,7 +3890,7 @@ gate_list() {
   led="$root/.fleet/dispatch"; [ -d "$led" ] || return 0
   now=$(date +%s 2>/dev/null)
   for d in "$led"/d*/; do
-    [ -d "$d" ] || continue
+    ledger_entry_dir "$d" || continue
     st=$(meta_get "$d" state); ledger_parked "$st" || continue
     id=$(basename "$d"); pa=$(meta_get "$d" parked_at); dec=$(meta_get "$d" decision)
     age="-"
@@ -3908,7 +3933,7 @@ gate_waiting() {
   local r led d id st; r=$(fleet_root 2>/dev/null) || return 0
   led="$r/.fleet/dispatch"; [ -d "$led" ] || return 0
   for d in "$led"/d*/; do
-    [ -d "$d" ] || continue
+    ledger_entry_dir "$d" || continue
     id=$(basename "$d"); st=$(meta_get "$d" state)
     # Emit the LIVE window name (meta window, slugged by `dispatch rename`), fallback
     # bare so-$id — so the reap-skip match (cmd_reap, by live window name) hits a renamed
@@ -3985,7 +4010,7 @@ cmd_reconcile() {
   case "$respawn_max"  in ''|*[!0-9]*) respawn_max=5 ;; esac
   case "$grace"        in ''|*[!0-9]*) grace=30 ;; esac
   for d in "$led"/d*/; do
-    [ -d "$d" ] || continue
+    ledger_entry_dir "$d" || continue
     id=$(basename "$d")
     meta_compact "$d"   # collapse legacy stacked meta.tsv before reading state
     state=$(meta_get "$d" state)
@@ -4245,7 +4270,7 @@ suborch_ledger_active() { # <soid>
   did="${soid#so-}"; did="${did%%-*}"          # so-d11[-slug] -> d11
   root=$(fleet_root 2>/dev/null) || return 1
   d="$root/.fleet/dispatch/$did"
-  [ -d "$d" ] || return 1                        # no ledger -> not an active dispatch
+  ledger_entry_dir "$d" || return 1                        # no ledger -> not an active dispatch
   st=$(meta_get "$d" state 2>/dev/null)
   ledger_terminal "$st" && return 1
   return 0
@@ -5083,7 +5108,7 @@ dispatch_status() { # report whether the hook is wired + the ledger rollup
   [ -d "$led" ] || { echo "no dispatches yet"; return 0; }
   printf 'ID\tSTATE\tWINDOW\n'
   for d in "$led"/d*/; do
-    [ -d "$d" ] || continue
+    ledger_entry_dir "$d" || continue
     id=$(basename "$d"); st=$(meta_get "$d" state)
     printf '%s\t%s\t%s\n' "$id" "${st:-?}" "$(meta_get "$d" window)"
   done

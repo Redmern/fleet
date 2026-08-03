@@ -308,4 +308,80 @@ else no "B4j pos-control: the courier wrote nothing at all — B4j would prove n
 if [ -e "$VICT/.deliver.lock" ]; then no "B4j: the courier opened a lock OUTSIDE every ledger ($VICT/.deliver.lock)"
 else ok "B4j: the courier wrote nothing outside the ledger"; fi
 
+
+
+# ---------------------------------------------------------------------------
+section "B5 — a SHAPE-VALID id that is a SYMLINK must not escape the ledger (round 2, S1)"
+# THE HOLE THIS PINS, measured by the round-2 adversary against 05a323d: `d99` passes
+# valid_dispatch_id (it is even STRICT-valid, so this is not an argument about the
+# non-strict choice), and every site then asked `[ -d "$d" ]` — which FOLLOWS SYMLINKS.
+# With `ln -sfn <victim> $LED/d99`, `gate park d99 1`, `dispatch done d99` and
+# `dispatch rename d99 slugx` each wrote a 0600 meta.tsv and planted a farm symlink in
+# the victim, OUTSIDE every ledger and hence outside every alerts.log: round 1's V1
+# outcome by a second route. Closed by `ledger_entry_dir` (`[ -L ]` before `[ -d ]`).
+#
+# RED PROOF: delete the `[ ! -L "$d" ] || return 1` line in ledger_entry_dir and the
+# five escape assertions below go red (the pos-controls stay green).
+VS="$FLEET_ROOT/.fleet/vsym"
+rm -rf "$VS"; mkdir -p "$VS"; printf 'state\tplanning\n' > "$VS/meta.tsv"
+rm -rf "$LED/d99"; ln -sfn "$VS" "$LED/d99"
+# Vacuity guards: the link must exist, be shape-valid, and `-d`-true through the link —
+# otherwise every assertion below is satisfied by the link simply not resolving.
+if [ -L "$LED/d99" ] && [ -d "$LED/d99" ]; then ok "B5 pos-control: \$LED/d99 is a symlink that -d resolves through"
+else no "B5 pos-control: the symlink does not resolve — the case would assert nothing"; fi
+VS_BEFORE=$(cksum < "$VS/meta.tsv")
+
+B5A_OUT=$("$FLEET" gate park d99 1 2>&1); B5A_RC=$?
+chk_ne "B5a: 'gate park d99' (symlinked entry) is refused (nonzero rc)" "0" "$B5A_RC"
+chk "B5a: the victim's meta.tsv is byte-identical after the park" "$VS_BEFORE" "$(cksum < "$VS/meta.tsv")"
+
+B5B_OUT=$("$FLEET" dispatch done d99 2>&1); B5B_RC=$?
+chk_ne "B5b: 'dispatch done d99' is refused (nonzero rc)" "0" "$B5B_RC"
+chk "B5b: no terminal state written outside the ledger" "$VS_BEFORE" "$(cksum < "$VS/meta.tsv")"
+
+B5C_OUT=$("$FLEET" dispatch rename d99 slugx 2>&1); B5C_RC=$?
+chk_ne "B5c: 'dispatch rename d99 slugx' is refused (nonzero rc)" "0" "$B5C_RC"
+chk "B5c: no window/reports key written outside the ledger" "$VS_BEFORE" "$(cksum < "$VS/meta.tsv")"
+
+# The farm is the one that plants a SYMLINK in the victim, so its observable is a path,
+# not a checksum. `reports` is pre-seeded so an unguarded farm would definitely plant.
+printf 'state\tplanning\nreports\t%s\n' "$FLEET_ROOT/_reports/x" > "$VS/meta.tsv"
+VS_BEFORE=$(cksum < "$VS/meta.tsv")
+rm -f "$VS/reports"
+"$FLEET" dispatch farm d99 >/dev/null 2>&1
+if [ -e "$VS/reports" ]; then no "B5d: 'dispatch farm d99' planted the farm OUTSIDE every ledger ($VS/reports)"
+else ok "B5d: no farm planted through the symlinked entry"; fi
+
+# The courier: `.deliver.lock` is written before any decision is read (see B4j).
+rm -f "$VS/.deliver.lock"
+"$FLEET" gate deliver d99 >/dev/null 2>&1
+if [ -e "$VS/.deliver.lock" ]; then no "B5e: the courier opened a lock OUTSIDE every ledger ($VS/.deliver.lock)"
+else ok "B5e: the courier wrote nothing through the symlinked entry"; fi
+
+# The READ verb too — a symlinked entry must not be resolvable at all, or the human is
+# shown an off-ledger dispatch as if it were one of theirs. The victim is staged with a
+# PENDING GATE first: with a bare `state=planning` this case passes against the
+# unguarded source too (gate_show dies on "has no gate"), i.e. it would be vacuous.
+printf 'state\tgate1-wait\n' > "$VS/meta.tsv"; printf 'off-ledger question\n' > "$VS/GATE-1.md"
+VS_BEFORE=$(cksum < "$VS/meta.tsv")
+B5F_OUT=$("$FLEET" gate show d99 2>&1); B5F_RC=$?
+chk_ne "B5f: 'gate show d99' does not resolve a symlinked ledger entry" "0" "$B5F_RC"
+
+# S3 EXTENSION (cheap, same fixture): `fleet dispatch <id>` is the spawn verb and was
+# never driven hostilely by the shipped suite. It gates on instruction.txt, so the
+# victim carries one — without it the refusal is for the wrong reason.
+printf 'brief\n' > "$VS/instruction.txt"
+B5G_OUT=$("$FLEET" dispatch d99 2>&1); B5G_RC=$?
+chk_ne "B5g: 'fleet dispatch d99' does not spawn against a symlinked entry" "0" "$B5G_RC"
+chk "B5g: no state/window key written outside the ledger" "$VS_BEFORE" "$(cksum < "$VS/meta.tsv")"
+
+# NARROWNESS CONTROL — the whole point of ledger_entry_dir is that it refuses ONLY the
+# symlink. A REAL d99 directory must still work at the same verb, or B5 is satisfied by
+# a gate/dispatch layer that refuses everything.
+rm -f "$LED/d99"; mkdir -p "$LED/d99"; printf 'state\tplanning\n' > "$LED/d99/meta.tsv"
+B5H_OUT=$("$FLEET" gate park d99 1 2>&1); B5H_RC=$?
+chk "B5 narrowness: a REAL d99 directory still parks (rc 0)" "0" "$B5H_RC"
+case "$(cat "$LED/d99/meta.tsv")" in *gate1-wait*) ok "B5 narrowness: the real d99 was genuinely parked" ;;
+  *) no "B5 narrowness: park reported success but wrote no state — B5 proves nothing" ;; esac
+
 proof_summary
