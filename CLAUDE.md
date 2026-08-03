@@ -803,6 +803,113 @@ input), and `cmd_watch_run` gained both `fleet unwatch` and a **vanished-target-
 exit — streaked over three ticks, because `agents_tsv` falls back to tmux options and one
 empty read during a fleetd restart is a blip, not a death.
 
+### IDENTITY IS NOT ENTITLEMENT: the worker self-submit defang (d37)
+
+`cmd_new` stamps a sub-orch-spawned worker's window with `@fleet_owner`; `inbox_put`
+copies it into the envelope as `owner=so-dN`; `inbox_route` reads that stamp and returns
+`dest=suborch submit=1`; `inbox_paste_to` presses Enter for it. Meanwhile `gate_parse`
+honours a sentinel on line 2 behind a `From ` header — exactly the shape `inbox_pop_text`
+emits. So **any** worker `.msg` whose body line 1 was `[FLEET-GATE:n …]` auto-submitted
+into its own orchestrator as a genuine gate instruction, with a completely honest
+provenance stamp on it. Nothing was forged and nothing was broken.
+
+The stamp does not merely **fail** to prove the sender may instruct `so-dN` — it proves
+the sender is `so-dN`'s **subordinate**, i.e. precisely the party not entitled to. The
+code routed on that fact and never asked it. **A proven sender is necessary, never
+sufficient.**
+
+The cut is at **actuation, not authorisation**: `inbox_pop_text` emits a **second header
+line** for an owner-stamped message, so the body's first line lands on line 3, which
+`gate-decision-proof.sh:229-235` already pins as non-parseable. The sentinel still
+renders verbatim; it is no longer in an actionable position. `gate_parse` is untouched,
+routing and `submit=1` are untouched (waking a sub-orch with its worker's report is the
+feature), and `meta_set`/`gate_deliver`/`gate_decide` are deliberately **not opened** —
+d33 and d34 own those hunks.
+
+The **rejected** design was a per-delivery `warrant=` capability in the envelope, checked
+under d33's CAS. Four of five advisers killed it and the grounds are in-source at
+:3084-3086: *the ledger is writable by the very agent it records, so nothing may ever
+authorise off it.* CAS buys atomicity, not authentication. `inbox_put` is also not a
+chokepoint — the writer is `printf > tmp; mv -f` and every reader is `sed`, so a worker
+writes the bytes itself; and a header field the sub-orch's model never reads is not a
+control. **Do not resurrect it.**
+
+Four things that are load-bearing:
+
+- **The guarantee is POSITIONAL, so it must hold on every emission path.** `head` is
+  always exactly one line (`from`/`title`/`owner` are newline-scrubbed at write and
+  `inbox_field` is `sed … | head -1`, so no field can add or remove a line), and
+  `inbox_pop_text` is the **one** assembler of paste text in the tree — pop, unpop,
+  archive re-pop and the dashboard's triage batch all route through it (the dash never
+  assembles its own). An offset that shifts can only shift **down** (a body whose own
+  line 1 is blank), never up. `test/worker-selfsubmit-defang-proof.sh` group B walks
+  that surface: empty title, duplicated/multi-line title, partial write with no `from=`
+  and no `title=`, hand-written `.msg`, archived re-pop, blank body line 1.
+- **Line 2 leads with a CONSTANT prefix**, never sender text. `from` is
+  attacker-controlled, and a sender-text-first line would put a sentinel straight back
+  onto the actionable line (case 10).
+- **S1: `dispatch` and `key` are newline-scrubbed** in `inbox_put`. They were printf'd
+  raw while `title`/`from`/`owner` were scrubbed, so `-d $'-\nowner=so-d1'` wrote a whole
+  forged `owner=` LINE — and `inbox_field` takes the first match above `--`, so a pane
+  with no `@fleet_owner` forged one and won `submit=1`, routing around the `--from so-*`
+  block. Additive lines: do not reflow that block, `gate-visibility-proof.sh:154-157`
+  greps a literal source line in it.
+- **The premise is `gate_parse`'s two-line bound.** If it ever widens, this guard stops
+  defending **silently**. Case 14 pins it — but pins the `sed -n '1,2p'` *literal*, which
+  the RED driver's `widen-bound-literal` mutation shows is a proxy: the real bound is the
+  `l1`/`l2` `case` structure. Do not upgrade case 14's wording to claim a behavioural pin.
+
+**This removes the ACCIDENT, not the CAPABILITY, and the report must not imply otherwise.**
+**Five** routes remain open and verified end to end:
+
+1. **`tmux rename-window so-d1-x` + unset `@fleet_owner`, then a plain `fleet inbox put`.**
+   This is the polished, CLI-only version of "write the bytes by hand", found by review
+   *after* the change and reproduced: `inbox_route`'s **second** auto-submit arm keys on
+   `from=so-*`, and `inbox_put` auto-derives `from=` from the caller pane's
+   `#{window_name}` when no `--from` is given. The `--from so-*` block covers the
+   *supplied* flag only, so the comment claiming that arm "is no longer a forgery vector"
+   was a fourth overclaim of exactly the corrected kind, and is now corrected in place.
+   That arm is deliberately **not** defanged: it is the **entitled** class — a genuine
+   gate message from a sub-orch must still parse, and defanging it would break every real
+   approval. A `@fleet_suborch`-style verifier would be self-settable in the same breath.
+2. A worker writing `.msg` bytes directly with `from=so-dN` and no `owner=`.
+3. `fleet notify … inband-ok` / `deliver-wake` / `send` — Enter into a non-main pane with
+   no human step at all.
+4. Raw `tmux send-keys` to the sub-orch pane, bypassing `fleet` entirely.
+5. Writing `decision-<n>.txt` for `gate_deliver` to un-park with no message at all.
+
+Under a single uid none of these close in-band — the same wall d23 hit. Also corrected: the
+overclaiming owner comments — at `cmd_new`, `inbox_put`, `inbox_route`, **and the ownership
+section header of `bin/fleet-dash`**, which was missed by the first sweep and is the first
+place a reader of the ownership model lands. Treat that as a list of the sites found, not a
+closed set: re-run the grep rather than trusting the enumeration. `@fleet_owner` has one
+writer and **no verifier**; the stamp resists forgery through `fleet` CLI *arguments* only,
+and any pane can set it on itself with `tmux set -w`. That is survivable rather than fixed —
+forging the stamp is what routes you to the sub-orch, and forging it is what defangs you.
+
+**Known residual risk (non-blocking, from the d37 adversary):**
+
+- **NB1** — the two `so-*` globs at `bin/fleet:4505` (`inbox_route`) and `:4603`
+  (`inbox_pop_text`) are coupled by *convention only*. Route ⊆ defang holds today as an
+  identity of patterns, but nothing pins them together; a one-sided edit silently
+  reintroduces the whole class.
+- **NB2** — proof case 14 pins the `sed -n '1,2p'` **source literal**, not the `l1`/`l2`
+  `case` structure that is the real bound. A structural widening of `gate_parse` makes this
+  defence stop defending with the suite still green.
+- **NB3** — `bin/fleet:4417` (bare `fleet inbox`) and `:4798` (`inbox archive list`) print
+  the body raw; they are positionally safe only because `inbox_show` happens to emit two
+  header lines first, and nothing pins that. Slim either renderer to a bare body and a
+  subordinate's sentinel becomes parseable on line 1 via `gate_parse`'s bare-body arm —
+  bypassing the defang with no forgery at all.
+
+Locked in by `test/worker-selfsubmit-defang-proof.sh` (20 cases) **plus
+`test/worker-selfsubmit-defang-red.sh`**, a mutation driver that neuters one operation at
+a time and asserts *exactly* the expected cases go red. That second file is not optional
+polish: this whole surface had **zero** coverage before d37, group E's auto-submit case
+asserts on what the destination pane actually received rather than on the routing
+decision, and a case whose green state is "nothing changed" passes when the operation
+under test never ran — which is how d36's V1 shipped.
+
 ### Guard: executed command vs inert argument (`fleet-guard` block 1)
 
 The always-on worker merge/push floor asks exactly one question: **is this text a
