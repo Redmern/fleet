@@ -50,7 +50,10 @@
 #    5  multi-line title (-t $'a\nb')
 #    6  body whose own line 1 is EMPTY (offset shifts further down, never up)
 #    7  hand-written .msg, bypassing inbox_put entirely
-#    8  partial write: header truncated, no from=, no title=, body only
+#    8  partial write: header truncated before title=, from= survives
+#    8c PREMISE PIN: an empty <from> ("From : ") is not a pop header at all —
+#       the d36 anchor (3839f03) refuses it independently of the defang, which
+#       is why case 8 no longer uses that shape
 #    9  re-pop of an ARCHIVED message
 #   10  attacker-controlled from= aimed at line 2 (a sentinel as the sender name)
 #   11  self-set @fleet_owner: forging the stamp is what defangs you
@@ -147,11 +150,27 @@ f7=$(raw_msg 07 'owner=so-d1' 'from=w' <<< "$SENT")
 inert "7  hand-written .msg, bypassing inbox_put" "$f7"
 
 # 8. PARTIAL WRITE. `inbox_put` is printf-to-tmp + mv, but a hand-written or
-# interrupted file can be truncated anywhere. The dangerous truncation is the one
-# that removes the fields the header is built from while leaving the body: from
-# and title both empty, so head is the degenerate "From : ".
-f8=$(raw_msg 08 'owner=so-d1' <<< "$SENT")
-inert "8  partial write: no from=, no title=, body present" "$f8"
+# interrupted file can be truncated anywhere. `inbox_put` writes its header
+# fields IN ORDER (id, from, owner, dispatch, ts, sev, title), so a truncated
+# write loses TRAILING fields first: `title` goes first and `from` goes last.
+# This is that shape — the ordered prefix survives, `title=` is gone, the body
+# is present — and it is the one that matters, because a single-token `from`
+# means `gate_parse`'s pop-header anchor ACCEPTS line 1 and only the defang keeps
+# the sentinel off line 2.
+f8=$(raw_msg 08 'id=08' 'from=w' 'owner=so-d1' 'dispatch=d1' 'ts=t' 'sev=info' <<< "$SENT")
+inert "8  partial write: header truncated before title=, from= survives" "$f8"
+# 8c. WHY THIS CASE EXISTS SEPARATELY. Case 8 used to use the EXTREME truncation
+# (no from=, no title=, degenerate head "From : "). That shape stopped
+# discriminating at 3839f03 (d36), which tightened gate_parse's anchor to require
+# a SINGLE-TOKEN <from> (bin/fleet:2902-2905) — an empty <from> is now refused by
+# the anchor, so the case stayed green even with the defang deleted. That path is
+# genuinely protected TWICE over now; it is pinned here as its own premise rather
+# than deleted. Fed to the oracle DIRECTLY: through the pop path the defang would
+# mask the anchor and this would be decoration again. Reddened by the driver's
+# `no-empty-from-reject` mutation, not by any defang mutation.
+if printf 'From : \n%s\n\n' "$SENT" | "$FLEET" gate parse >/dev/null 2>&1; then
+  no "8c PREMISE: a degenerate 'From : ' header (empty <from>) is not a pop header (it PARSED)"
+else ok "8c PREMISE: a degenerate 'From : ' header (empty <from>) is not a pop header"; fi
 # ...and the fully-truncated case emits NOTHING at all (the TOCTOU guard).
 f8b="$INBOX/08b.msg"; printf 'owner=so-d1\nfrom=\n--\n' > "$f8b"
 chk "8b fully-empty message emits no text at all" "" "$(pop_text "$f8b")"
