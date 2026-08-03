@@ -71,6 +71,28 @@ if grep -qi 'root.*disagree\|disagree.*root' "$FLEET_ROOT/.fleet/dispatch/alerts
 then no "B1 neg-control: an AGREEING root still alerted (the alert would be pure noise)"
 else ok "B1 neg-control: an agreeing root does not alert"; fi
 
+# B1b — THE FLAG IS PER-PROCESS STATE, NOT A KNOB (V2). It was seeded
+# `${_ROOT_DISAGREE_ALERTED:-0}`, i.e. read from the ENVIRONMENT — so one exported
+# `_ROOT_DISAGREE_ALERTED=1` suppressed the alert in this process and in every child
+# of it, with no file write and no trace. That is a strictly easier suppression
+# vector than the disclosed same-uid one, and an audit trail that can be switched
+# off from the environment reads as innocence. Re-run B1's own disagreement with the
+# flag pre-exported: the alert must still be written.
+tmux set -t t1 @fleet_root "$RB" 2>/dev/null
+rm -f "$RB/.fleet/dispatch/alerts.log" "$RA/.fleet/dispatch/alerts.log"
+# B1 already drove d1 to `done`, and `dispatch done` is idempotent — so the mutation
+# pos-control below would fail for the wrong reason. Reset the fixture so the verb has
+# something to change.
+printf 'state\tplanning\n' > "$RB/.fleet/dispatch/d1/meta.tsv"
+B1B_RB_BEFORE=$(sha "$RB/.fleet/dispatch/d1/meta.tsv")
+B1B_RC=0
+_ROOT_DISAGREE_ALERTED=1 FLEET_ROOT="$RA" "$FLEET" dispatch done d1 >/dev/null 2>&1 || B1B_RC=$?
+chk "B1b pos-control: the verb exited 0 with the flag exported" 0 "$B1B_RC"
+chk_ne "B1b pos-control: the write LANDED (RB's ledger changed)" "$B1B_RB_BEFORE" "$(sha "$RB/.fleet/dispatch/d1/meta.tsv")"
+if grep -qi 'root' "$RB/.fleet/dispatch/alerts.log" 2>/dev/null
+then ok "B1b: an exported _ROOT_DISAGREE_ALERTED=1 does NOT suppress the alert"
+else no "B1b: the audit trail was silenced by one exported env var — process-wide suppression, no file write"; fi
+
 # ---------------------------------------------------------------------------
 section "B2 — the reorient cut: no absolute path into a foreign tree"
 # gate_post emits \$FLEET_DIR/FLEET_SUBORCH.md into the gate artifact. FLEET_DIR
@@ -182,5 +204,108 @@ chk "B4 pos-control: a well-formed id d1 still resolves" "0" "$B4B_RC"
 rm -rf "$LED/d1c"; cp -a "$LED/d1" "$LED/d1c"   # byte-identical to the d1 fixture: only the NAME differs
 B4C_OUT=$("$FLEET" gate show d1c 2>&1); B4C_RC=$?
 chk "B4 pos-control: a suffixed out-of-band id (d1c) still resolves" "0" "$B4C_RC"
+
+# ---------------------------------------------------------------------------
+# B4d — the WRITE verbs, not only the read verb (V1).
+#
+# `gate show` was shape-checked and `gate park` was not, so the traversal stayed open
+# at the verb that MUTATES: `fleet gate park '../../../victim' 1` printed "parked" and
+# wrote `state gate1-wait` + `parked_at` into a directory outside every ledger — hence
+# outside every alerts.log, so the audit trail that IS this half's deliverable recorded
+# nothing at all. Refusing the read while allowing the write is the worst of both.
+#
+# The green state of "the victim was not written" is "nothing changed", so this case
+# ASSERTS THE OPERATION EXECUTED FIRST: the victim dir exists, the path resolves, and
+# the byte-identical control park on `d1` demonstrably DOES mutate meta.tsv.
+VICT="$FLEET_ROOT/.fleet/victim"
+rm -rf "$VICT"; mkdir -p "$VICT"; printf 'state\tplanning\n' > "$VICT/meta.tsv"
+if [ -d "$LED/d1/../../victim" ]; then ok "B4d pos-control: the park traversal target genuinely resolves on disk"
+else no "B4d pos-control: the park target does not resolve — the case would assert nothing"; fi
+V_BEFORE=$(cksum < "$VICT/meta.tsv")
+
+B4D_OUT=$("$FLEET" gate park 'd1/../../victim' 1 2>&1); B4D_RC=$?
+chk_ne "B4d: 'gate park d1/../../victim' is refused (nonzero rc)" "0" "$B4D_RC"
+case "$B4D_OUT" in *parked*) no "B4d: park reported success on a traversal id" ;; *) ok "B4d: park did not report success" ;; esac
+chk "B4d: the out-of-ledger victim meta.tsv is unwritten" "$V_BEFORE" "$(cksum < "$VICT/meta.tsv")"
+case "$(cat "$VICT/meta.tsv")" in *gate1-wait*|*parked_at*) no "B4d: park state/stamp landed outside the ledger" ;; *) ok "B4d: no park state or stamp outside the ledger" ;; esac
+
+# POSITIVE CONTROL for B4d — the SAME verb on a well-formed id must still park, and
+# must be seen to MUTATE. Without this, B4d passes just as happily against a `gate
+# park` that is broken, missing, or refuses everything.
+D1_BEFORE=$(cksum < "$LED/d1/meta.tsv" 2>/dev/null || echo none)
+B4E_OUT=$("$FLEET" gate park d1 1 2>&1); B4E_RC=$?
+chk "B4d pos-control: a well-formed id d1 still parks" "0" "$B4E_RC"
+chk_ne "B4d pos-control: parking d1 actually MUTATED its meta.tsv" "$D1_BEFORE" "$(cksum < "$LED/d1/meta.tsv" 2>/dev/null || echo none)"
+case "$(cat "$LED/d1/meta.tsv")" in *gate1-wait*) ok "B4d pos-control: d1 carries state gate1-wait" ;; *) no "B4d pos-control: d1 did not get state gate1-wait — park is inert, B4d proves nothing" ;; esac
+
+# B4h — the THIRD unvalidated id site: `gate_write_artifact`, reached by `gate post -d`.
+# Its refusal is fail-SILENT by contract (every other refusal in it is `return 0`), so
+# rc says nothing here and the case must be measured on the FILE. Positive control
+# first — the same command with a well-formed id must demonstrably write GATE-1.md, or
+# "no artifact outside the ledger" is satisfied by a gate_post that writes nothing.
+rm -f "$LED/d1/GATE-1.md" "$VICT/GATE-1.md"
+"$FLEET" gate post 1 --slug someslug -d d1 --summary 'control' >/dev/null 2>&1
+if [ -s "$LED/d1/GATE-1.md" ]; then ok "B4h pos-control: gate post -d d1 writes GATE-1.md inside the ledger"
+else no "B4h pos-control: gate post wrote no artifact at all — B4h would prove nothing"; fi
+
+"$FLEET" gate post 1 --slug someslug -d 'd1/../../victim' --summary 'traversal' >/dev/null 2>&1
+if [ -e "$VICT/GATE-1.md" ]; then no "B4h: a gate artifact was written OUTSIDE every ledger ($VICT/GATE-1.md)"
+else ok "B4h: no gate artifact outside the ledger"; fi
+
+# B4f — `dispatch rename` has the identical shape and additionally writes the ABSOLUTE
+# `reports` key, so a traversal there aims every later consumer of that key off-ledger.
+#
+# THIS CASE MAY NOT ASSERT ONLY "nonzero rc" OR "the victim is unwritten" — MEASURED:
+# with the shape check deleted, rename still exits 1 and still writes nothing, because
+# `acquire_lock "$led/.spawnlock-$id"` mkdirs through a path whose parent does not
+# exist and returns 1. That is the "inert only by accident" the round-1 report named,
+# and both of those assertions stay GREEN against the unguarded source — i.e. vacuous.
+# So the case pins the REFUSAL MECHANISM: the shape check must be what refused, named
+# in the message, before any of the interpolation happens.
+B4F_OUT=$("$FLEET" dispatch rename 'd1/../../victim' some slug 2>&1); B4F_RC=$?
+chk_ne "B4f: 'dispatch rename d1/../../victim' is refused (nonzero rc)" "0" "$B4F_RC"
+case "$B4F_OUT" in
+  *"invalid dispatch id"*) ok "B4f: refused BY THE SHAPE CHECK, not by an incidental lock failure" ;;
+  *) no "B4f: refused for some other reason ('$B4F_OUT') — the traversal is unguarded and only accidentally inert" ;;
+esac
+case "$(cat "$VICT/meta.tsv")" in *reports*|*window*) no "B4f: rename wrote keys outside the ledger" ;; *) ok "B4f: no rename keys outside the ledger" ;; esac
+
+# POSITIVE CONTROL for B4f — the same verb on a well-formed id must still rename and
+# must be seen to WRITE the ledger, or B4f is satisfied by a rename that refuses all
+# input (including the `acquire_lock` corpse above).
+B4G_BEFORE=$(sha "$LED/d1/meta.tsv")
+B4G_OUT=$("$FLEET" dispatch rename d1 some slug 2>&1); B4G_RC=$?
+chk "B4f pos-control: a well-formed id d1 still renames" "0" "$B4G_RC"
+chk_ne "B4f pos-control: renaming d1 actually MUTATED its meta.tsv" "$B4G_BEFORE" "$(sha "$LED/d1/meta.tsv")"
+case "$(cat "$LED/d1/meta.tsv")" in *reports*) ok "B4f pos-control: d1 carries the reports key" ;; *) no "B4f pos-control: rename wrote no reports key — rename is inert, B4f proves nothing" ;; esac
+
+# B4i / B4j — the two REMAINING CLI-reachable write verbs that interpolate an id.
+# Round 1 closed the four read/resolve sites and left every MUTATING one open, which is
+# what made V1 a blocker; enumerating the write verbs exhaustively is the fix for the
+# class, not just for the two the report happened to name.
+#
+# B4i — `fleet dispatch farm <id>` mkdirs and plants symlinks under the ledger dir.
+# Observable: with a `reports` key present it plants `reports ->`. Positive control on
+# a well-formed id first, or "no link in the victim" is satisfied by an inert farm.
+printf 'state\tplanning\nreports\t%s\n' "$FLEET_ROOT/_reports/x" > "$LED/d1/meta.tsv"
+printf 'state\tplanning\nreports\t%s\n' "$FLEET_ROOT/_reports/x" > "$VICT/meta.tsv"
+rm -f "$LED/d1/reports" "$VICT/reports"
+"$FLEET" dispatch farm d1 >/dev/null 2>&1
+if [ -L "$LED/d1/reports" ]; then ok "B4i pos-control: 'dispatch farm d1' plants the reports link inside the ledger"
+else no "B4i pos-control: farm planted nothing — B4i would prove nothing"; fi
+"$FLEET" dispatch farm 'd1/../../victim' >/dev/null 2>&1
+if [ -e "$VICT/reports" ]; then no "B4i: 'dispatch farm' planted the farm OUTSIDE every ledger ($VICT/reports)"
+else ok "B4i: no farm planted outside the ledger"; fi
+
+# B4j — `fleet gate deliver <id>` is the courier and WRITES: `.deliver.lock` first of
+# all, before any decision is even read. That file is the observable, and it appears
+# whether or not a decision exists — so this case does not depend on staging one.
+rm -f "$LED/d1/.deliver.lock" "$VICT/.deliver.lock"
+"$FLEET" gate deliver d1 >/dev/null 2>&1
+if [ -e "$LED/d1/.deliver.lock" ]; then ok "B4j pos-control: 'gate deliver d1' opens its lock inside the ledger"
+else no "B4j pos-control: the courier wrote nothing at all — B4j would prove nothing"; fi
+"$FLEET" gate deliver 'd1/../../victim' >/dev/null 2>&1
+if [ -e "$VICT/.deliver.lock" ]; then no "B4j: the courier opened a lock OUTSIDE every ledger ($VICT/.deliver.lock)"
+else ok "B4j: the courier wrote nothing outside the ledger"; fi
 
 proof_summary

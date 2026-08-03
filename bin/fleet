@@ -173,7 +173,13 @@ project_session() {
 # fixture escaping its sandbox writes the evidence into the REAL project's log and
 # cannot suppress it. Once per process (the flag is also what stops the recursion
 # through append_dashboard_alert -> fleet_root).
-_ROOT_DISAGREE_ALERTED=${_ROOT_DISAGREE_ALERTED:-0}
+#
+# UNCONDITIONAL ASSIGNMENT, never `${_ROOT_DISAGREE_ALERTED:-0}` (V2). The `:-`
+# form reads the ENVIRONMENT, so one exported `_ROOT_DISAGREE_ALERTED=1` silences
+# the alert in this process and in every child of it — process-wide suppression of
+# the audit trail with no file write and no trace, a strictly easier vector than
+# the disclosed same-uid one. The flag is per-process state, not a knob.
+_ROOT_DISAGREE_ALERTED=0
 root_disagreement_alert() { # <tmux-root>
   [ "$_ROOT_DISAGREE_ALERTED" = 1 ] && return 0
   [ -n "${FLEET_ROOT:-}" ] || return 0
@@ -2823,6 +2829,10 @@ cmd_dispatch_finish() { # done|fail|cancel <id>
 cmd_dispatch_rename() {
   local id="${1:-}"; [ -n "$id" ] && [ $# -gt 0 ] && shift || die "usage: fleet dispatch rename <id> <slug text...>"
   local text="$*"
+  # Same shape as gate_park (V1): `$id` is interpolated into the ledger path below,
+  # and rename additionally writes the ABSOLUTE reports key — a traversal here aims
+  # every later consumer of that key off-ledger.
+  valid_dispatch_id "$id" || die "fleet dispatch rename: invalid dispatch id '$id'"
   local root led d; root=$(fleet_root) || die "not inside tmux"
   led="$root/.fleet/dispatch"; d="$led/$id"
   [ -d "$d" ] || die "no such dispatch $id"
@@ -2865,6 +2875,11 @@ cmd_dispatch_rename() {
 # dangling link is an intended tombstone, not an error.
 dispatch_farm() { # <dispatch-id>
   local id="${1:-}"; [ -n "$id" ] || return 0
+  # SHAPE-CHECK BEFORE INTERPOLATION (V1). Reachable from the CLI as `fleet dispatch
+  # farm <id>`, and it MKDIRS and plants symlinks under `$d` — a traversal id would
+  # do that outside every ledger, where no alerts.log exists to record it. Fail-silent
+  # (return 0), matching this function's stated rc-0-throughout contract.
+  valid_dispatch_id "$id" || return 0
   local root; root=$(fleet_root 2>/dev/null) || return 0
   local d="$root/.fleet/dispatch/$id"; [ -d "$d" ] || return 0
   local rep; rep=$(meta_get "$d" reports 2>/dev/null)
@@ -3214,6 +3229,12 @@ gate_write_artifact() { # <dispatch-id|-> <gate-n> <body>
   local disp="${1:-}" n="${2:-}" body="${3:-}"
   case "$disp" in ""|-) return 0 ;; esac
   case "$n" in 1|2|3) ;; *) return 0 ;; esac
+  # SHAPE-CHECK BEFORE INTERPOLATION (V1). `$disp` is attacker-writable text and is
+  # pasted straight into a path below; `../../../victim` resolves clean OUTSIDE the
+  # ledger whenever that path exists, so the artifact — and with it every trace of
+  # the write — lands where no alerts.log will ever see it. Fail-silent (return 0)
+  # to match this function's contract: every other refusal here is a silent no-op.
+  valid_dispatch_id "$disp" || return 0
   local root; root=$(fleet_root 2>/dev/null) || return 0
   local d="$root/.fleet/dispatch/$disp"; [ -d "$d" ] || return 0
   printf '%s\n' "$body" > "$d/GATE-$n.md" 2>/dev/null || true
@@ -3248,6 +3269,13 @@ gate_park() { # park <dispatch-id> <1|2|3>
   local id="${1:-}" gate="${2:-}"
   case "$gate" in 1|2|3) ;; *) die "usage: fleet gate park <dispatch-id> <1|2|3>" ;; esac
   [ -n "$id" ] || die "usage: fleet gate park <dispatch-id> <1|2|3>"
+  # SHAPE-CHECK BEFORE INTERPOLATION (V1). Without this, `fleet gate park
+  # '../../../victim' 1` reported "parked" and wrote `state gate1-wait` + `parked_at`
+  # into a directory outside every ledger — hence outside every alerts.log, so the
+  # audit trail that IS this half's deliverable recorded nothing. `die`, not a silent
+  # return: gate verbs are the one place fleet's fail-silent rule is already inverted,
+  # because a park that quietly did not happen is the invisible July-19 half.
+  valid_dispatch_id "$id" || die "fleet gate park: invalid dispatch id '$id'"
   local r; r=$(fleet_root 2>/dev/null) || die "no project root"
   local d="$r/.fleet/dispatch/$id"
   [ -d "$d" ] || die "no such dispatch $id"
@@ -3625,6 +3653,12 @@ gate_show() {
 # Every failure mode here fails towards "still parked", which is the safe direction.
 gate_deliver() { # deliver <id>
   local id="${1:-}"; [ -n "$id" ] || die "usage: fleet gate deliver <dispatch-id>"
+  # SHAPE-CHECK BEFORE INTERPOLATION (V1). `fleet gate deliver` is a CLI verb and the
+  # courier WRITES: `.deliver.lock`, `delivered`, `deliver_attempts`, `deliver_after`.
+  # A traversal id lands all of that outside every ledger. `return 1` rather than `die`
+  # — every other refusal in the courier is a deferral, and fleetd Popens this on a 2s
+  # tick where a die is just a nonzero rc anyway.
+  valid_dispatch_id "$id" || return 1
   local root; root=$(fleet_root 2>/dev/null) || return 1
   local d="$root/.fleet/dispatch/$id"; [ -d "$d" ] || return 1
   # ONE COURIER PER DISPATCH. fleetd `Popen`s a fresh `fleet gate deliver` every 2s

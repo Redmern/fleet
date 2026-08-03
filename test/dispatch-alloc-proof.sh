@@ -202,6 +202,34 @@ fi
 
 # ---------------------------------------------------------------------------
 section "A7 — cmd_dispatch_alloc never stamps a dir it did not create"
+# A7-pre — THE VACUITY GUARD FOR A7 AND A7b (V3). Both cases assert only
+# `chk_ne "0" "$rc"`, and an EMPTY `$rc` satisfies that — which is exactly what the
+# `$( ( … ) | tail -1 )` harness yields when `. "$FLEET"` cannot be sourced at all
+# (the `2>/dev/null` hides the reason). So a syntactically broken bin/fleet makes
+# A7/A7b pass without cmd_dispatch_alloc ever running: the silent-pass shape this
+# whole suite exists to stamp out, reproduced inside the suite itself.
+#
+# This runs the IDENTICAL harness — same FLEET_SOURCE_ONLY source, same subshell,
+# same `| tail -1` capture — with the real alloc_id, and demands a POSITIVE result:
+# rc exactly 0, a printed dir that exists, and an allocator-written `created` in it
+# (A1's own positive-control shape). Green here means the harness can execute the
+# function, so A7/A7b's refusals are genuine refusals and not silence.
+reset_led
+A7P=$(
+  (
+    FLEET_SOURCE_ONLY=1 . "$FLEET" 2>/dev/null
+    cmd_dispatch_alloc 2>/dev/null
+    echo "rc=$?"
+  ) | tail -2 | tr '\n' ' '
+)
+A7P_DIR=${A7P%% *}; A7P_RC=${A7P##*rc=}; A7P_RC=${A7P_RC%% *}
+chk "A7-pre: the harness can source bin/fleet and run cmd_dispatch_alloc (rc)" "0" "$A7P_RC"
+if [ -n "$A7P_DIR" ] && [ -d "$A7P_DIR" ]; then ok "A7-pre: a dir path was printed and exists ($A7P_DIR)"
+else no "A7-pre: no usable dir printed (got '$A7P') — A7/A7b would pass on an empty rc"; fi
+if grep -q '^created' "${A7P_DIR:-/nonexistent}/meta.tsv" 2>/dev/null
+then ok "A7-pre: the new dir carries an allocator-written 'created'"
+else no "A7-pre: new dir has no allocator-written 'created' — the harness never really ran the function"; fi
+
 # Drives the real function with FLEET_SOURCE_ONLY, overriding alloc_id to return a
 # colliding id WITHOUT the provenance the allocator sets on a successful create.
 reset_led
