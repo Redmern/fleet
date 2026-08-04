@@ -81,18 +81,25 @@
 # so a failed spawn FAILS instead of passing. The other six are a DEFERRED,
 # WRITTEN-DOWN RESIDUAL, not an oversight:
 #
-#   RESIDUAL R1 — C5, C6, C7, C8, C10 stay green when `reap_at` is stubbed;
-#   E4 stays green when its `gate popped` call is a no-op.
-#   FAILURE DIRECTION: these can report a pass having proven nothing. They do
-#   NOT report a false failure, and none of them is a verdict blocker.
-#   WHY NOT FIXED HERE: the only honest fix makes `reap_at` fail-closed, which
-#   rewrites a helper contract under ELEVEN cases in order to repair five —
-#   including C9 and C11, which are that group's only fail-closed anchors. The
-#   cheap alternative, pinning five rows to `bin/fleet`'s refusal wording,
-#   manufactures exactly the prose-rot this dispatch has already had to fix
-#   twice. E4's `-le 1` constant is additionally unmeasured.
-#   EVIDENCE: _reports/gate-anchor-occupancy/R2-failopen.md (per-case mutation
-#   output). Filed for its own dispatch.
+#   RESIDUAL R1 — CLOSED. The note that stood here said five cases stayed green
+#   when `reap_at` was stubbed (C5, C6, C7, C8, C10) and that C9 AND C11 were the
+#   group's fail-closed anchors. Re-measured, all three claims were wrong:
+#     * the fail-open set was SIX, not five — C3 was missing from it, and C3 is
+#       the case whose entire stated purpose is the `--force` pin;
+#     * the anchor was C9 ALONE — C11 is a substring grep for `disagree` and is
+#       satisfied by any output containing that word, including a printf;
+#     * killing the `--force` parse in `cmd_reap` alone (so `--force` is accepted
+#       and discarded) left C3/C6/C7/C8/C10/C11 GREEN and only C9 red.
+#   Both mutations were re-run on this tree; see
+#   _reports/reap-failopen-contract/IMPL-PROOF.md for the verbatim output.
+#   THE REPAIR is `reap_expect_refuse` / `reap_expect_reap` below: an EFFECT
+#   DELTA (a fresh bystander worktree the reap under test must destroy) plus an
+#   invocation witness. Deliberately wording-free — it cites no refusal text, so
+#   it does not manufacture the prose-rot the cheap alternative would.
+#   STILL OPEN, measured and filed rather than fixed: E4's fixture (repaired in
+#   this rung) aside, `cmd_reap`'s human-presence guard has ZERO coverage —
+#   deleting it leaves this suite fully green. Covering it needs a live tmux
+#   server, which this suite may not touch. See INVENTORY.md.
 #
 # Any case ADDED to this file must have its operation deleted and the case
 # observed going RED before it ships. A predicted red is not a red.
@@ -174,6 +181,24 @@ fail() { FAILED=$((FAILED+1)); printf '  FAIL %s: %s\n' "$1" "$2"; }
 skip() { SKIPPED=$((SKIPPED+1)); printf '  SKIP %s: %s\n' "$1" "${2:-}"; }
 ok()   { if [ "$1" = 0 ]; then pass "$2"; else fail "$2" "$3"; fi; }
 has()  { printf '%s' "$1" | grep -qF -- "$2"; }
+
+# EMITTED-COUNT GUARD (d39). A case that goes RED is visible; a case that
+# VANISHES is not. Measured: break the `smg:parknote` extraction and E7 fails
+# while E8 never runs at all — the suite prints `1 failed, 0 skipped` and the
+# total silently drops by one. Nobody reads a total. So a group can declare how
+# many rows it must emit, and the count itself becomes a row.
+# Deliberately PER-GROUP, never a global hard-coded suite total: a global number
+# taxes every future rung that legitimately adds a case, and a magic number that
+# has to be edited on every change gets edited without being read.
+GRP_AT=0; GRP_NAME=""; GRP_EXPECT=0
+_emitted() { printf '%s' $((PASS+FAILED+SKIPPED)); }
+grp_begin() { GRP_NAME="$1"; GRP_EXPECT="$2"; GRP_AT=$(_emitted); }
+grp_end() {
+  local got=$(( $(_emitted) - GRP_AT ))
+  [ "$got" = "$GRP_EXPECT" ]
+  ok $? "$GRP_NAME emitted exactly $GRP_EXPECT rows (a case that VANISHES is not a case that passed)" \
+    "emitted $got of $GRP_EXPECT — a case above ran no assertion at all"
+}
 
 INBOX="$FLEET_ROOT/.fleet/inbox"
 LEDGER="$FLEET_ROOT/.fleet/dispatch"
@@ -292,8 +317,21 @@ ok $? "A7 popped line 2 is byte-identical to the sentinel (header-drift pin)" \
 
 printf 'From x: t\n\n[FLEET-GATE:2 slug=s action=merge target=main]\n' \
   | "$FLEET" gate parse >/dev/null 2>&1
-[ $? != 0 ]; ok $? "A8 a sentinel on line 3 does NOT parse (the parser reads line 1 and line 2 only — characterisation, NOT a bound pin: no assertion here can detect the bound changing)" \
+[ $? != 0 ]; ok $? "A8 a sentinel on line 3 does NOT parse (the parser reads line 1 and line 2 only — a ONE-SIDED bound pin: catches a WIDENING, cannot catch a narrowing)" \
   "the bound is wider than the pop shape — pure widening of the forgery window"
+# The old wording said "no assertion here can detect the bound changing".
+# Measured false (d39), three ways:
+#   * STRUCTURAL WIDENING — teach `gate_parse`'s l1/l2 `case` to fall through to
+#     line 3 as well: A8 is the SOLE red in the suite (117 passed, 1 failed).
+#     That is the direction that opens the forgery window, and this row does
+#     catch it. So: a one-sided BOUND PIN, not characterisation.
+#   * NARROWING — head-read cut to line 1: A8 stays green (nothing reaches line
+#     2 to honour), and A1/A2/A2b/A2c/A11/A12/A12b/A14 go red instead. The other
+#     side is covered, just not here.
+#   * Editing the `sed -n '1,2p'` LITERAL alone changes nothing either way
+#     (118/0/0 with `1,3p`): only l1/l2 are ever examined, so the sed is a proxy
+#     and the `case` structure is the real bound. Anything pinning the literal is
+#     pinning the proxy.
 
 # The ANCHOR, not the count: a bare bound of 2 still honours line 2 after ANY
 # line 1. Line 2 is honoured ONLY when line 1 is a genuine pop header.
@@ -544,10 +582,18 @@ if git -C "$HERE" rev-parse --verify -q "$BASE_REF" >/dev/null 2>&1; then
   else
     fail "B bin/fleet-guard untouched" "the guard changed vs $BASE_REF — out of scope"
   fi
+elif [ -n "${SMG_BASE:-}" ]; then
+  # LOUD, not a skip (d39). A skip is honest about the DEFAULT ref going missing
+  # on someone's shallow clone. It is NOT honest about an operator who passed
+  # SMG_BASE explicitly and mistyped it: that silently DELETES this proof — the
+  # only thing asserting `bin/fleet-guard` was not touched — while the summary
+  # still reads clean. An overridden ref that does not resolve is an error in the
+  # invocation, and the invocation is the one thing the operator can fix.
+  fail "B guard byte-compare" "SMG_BASE='$SMG_BASE' does not resolve in $HERE — the guard byte-compare did NOT run; fix the ref or unset SMG_BASE"
 else
   # A SKIP IS NOT A PASS. Counting it as one inflated the suite's reported total,
   # which is itself a false claim — the exact class of defect this round exists to fix.
-  skip "B guard byte-compare" "no such ref $BASE_REF"
+  skip "B guard byte-compare" "no such ref $BASE_REF (built-in default; pass SMG_BASE=<ref> to pin another)"
 fi
 # No new fleet subcommand that performs a merge: `fleet` verbs are NEVER screened
 # by fleet-guard, so shipping one would be a free bypass sold as a feature.
@@ -597,51 +643,6 @@ add_integration_wt() { # <root> <sess> <branch> -> worktree dir
   printf '%s' "$wt"
 }
 
-C_ROOT="$TMPROOT/c"; C_SESS="smg_c"
-mkproject "$C_ROOT" "$C_SESS"
-IWT=$(add_integration_wt "$C_ROOT" "$C_SESS" main)
-FWT=$(addwt "$C_ROOT" "$C_SESS" feat/x main)
-
-reap_in() { # [--force] -> reap output, run with FLEET_ROOT/session pointed at C
-  FLEET_ROOT="$C_ROOT" FLEET_SESSION="$C_SESS" "$FLEET" reap "$@" 2>&1
-}
-
-out=$(reap_in)
-if has "$out" "main" && [ -d "$IWT" ] \
-   && git -C "$C_ROOT/repo" rev-parse --verify -q main >/dev/null 2>&1; then
-  pass "C1 reap refuses the integration-branch worktree; branch + worktree survive"
-else
-  fail "C1 reap refuses the integration branch" "out='$out' wt_exists=$([ -d "$IWT" ] && echo y || echo n)"
-fi
-has "$out" "integration branch"; ok $? "C2 the refusal NAMES the integration branch" "out='$out'"
-
-out=$(reap_in --force)
-{ [ -d "$IWT" ] && git -C "$C_ROOT/repo" rev-parse --verify -q main >/dev/null 2>&1; }
-ok $? "C3 --force does NOT override the integration-branch guard (pinned)" "out='$out'"
-
-# Narrowness: an ordinary feature worktree still reaps.
-git -C "$FWT" -c user.email=t@t -c user.name=t commit -q --allow-empty -m w 2>/dev/null
-git -C "$C_ROOT/repo" merge -q --no-edit feat/x 2>/dev/null   # bare container: no-op, harmless
-git -C "$IWT" -c user.email=t@t -c user.name=t merge -q --no-edit feat/x 2>/dev/null
-out=$(reap_in feat/x)
-{ has "$out" "reaped" || [ ! -d "$FWT" ]; }
-ok $? "C4 an ordinary merged feature worktree still reaps (the guard is narrow)" "out='$out'"
-
-# A project whose integration branch is NOT `main` is protected on its own name.
-D_ROOT="$TMPROOT/d"; D_SESS="smg_d"
-mkproject "$D_ROOT" "$D_SESS"
-git -C "$D_ROOT/repo" branch trunk main 2>/dev/null
-printf 'trunk\n' > "$D_ROOT/.fleet/integration-branch"
-TWT=$(add_integration_wt "$D_ROOT" "$D_SESS" trunk)
-out=$(FLEET_ROOT="$D_ROOT" FLEET_SESSION="$D_SESS" "$FLEET" reap 2>&1)
-{ [ -d "$TWT" ] && git -C "$D_ROOT/repo" rev-parse --verify -q trunk >/dev/null 2>&1; }
-ok $? "C5 a configured non-main integration branch (trunk) is protected too" "out='$out'"
-
-# --- the record is NOT the truth ----------------------------------------------
-# Both fixtures above happen to register a branch field that matches reality, which
-# is exactly why a stale record was never caught. The guard must key on the
-# CHECKED-OUT HEAD as well, because on this machine the worktree in question is
-# `fleet/main` — the live CLI every `fleet` command on the box runs from.
 reg() { # <sess> <dir> <recorded-branch> [base]
   printf '%s\trepo\t%s\t\t%s\tclaude\n' "$2" "$3" "${4:-main}" \
     >> "$XDG_CONFIG_HOME/fleet/sessions/$1.agents"
@@ -651,19 +652,237 @@ mkcase() { # <tag> -> echoes "<root> <sess>"; a fresh bare-container project
   mkproject "$root" "$sess"
   printf '%s %s' "$root" "$sess"
 }
-reap_at() { # <root> <sess> [args…]
-  local r="$1" s="$2"; shift 2
-  FLEET_ROOT="$r" FLEET_SESSION="$s" "$FLEET" reap "$@" 2>&1
+
+# ------------------------------------------------------------------------------
+# THE FAIL-CLOSED REAP CONTRACT (d39). Read this before touching any C case.
+#
+# The old helpers were `out=$(FLEET_ROOT=… "$FLEET" reap "$@" 2>&1)` and every
+# caller then asserted "the protected worktree is STILL THERE". It was still
+# there BEFORE the command ran, so a reap that never executed passed. Measured,
+# not inferred: stub both helpers to `return 0` and SIX cases stay green
+# (C3, C5, C6, C7, C8, C10). Only C9 notices.
+#
+# Neither rc nor output can be the witness — `cmd_reap` exits 0 on every refusal
+# and always prints something, and pinning rows to its refusal WORDING is the
+# prose-rot this file has already had to repair twice. So the contract is:
+#
+#   EFFECT DELTA (primary) — every reap under test is given a BYSTANDER: a
+#   second, ready worktree in the SAME root that this very reap MUST destroy.
+#   Protected subject survives AND bystander dies, or the row is red. A reap
+#   that did nothing leaves the bystander standing.
+#
+#   Two flavours, and the difference is the whole `--force` pin:
+#     * add_bystander        — merged + clean, so it reaps WITHOUT `--force`.
+#     * add_bystander_force  — one commit ahead of its base, so the unmerged
+#       guard refuses it and ONLY `--force` takes it. Give this one to every
+#       `--force` case: kill the `--force` parse in `cmd_reap` and the bystander
+#       survives, so the case that CLAIMS to test `--force` finally fails when
+#       `--force` is broken. It did not before — that mutation left
+#       C3/C6/C7/C8/C10/C11 green.
+#
+#   INVOCATION WITNESS (backstop) — `$SMG_SHIM` is a `$FLEET` wrapper that
+#   appends one line to a COUNT FILE and `exec`s the real binary. Call sites are
+#   command substitutions, i.e. SUBSHELLS, so a shell variable cannot carry the
+#   count out: it must be a file, and it must be compared BY VALUE (an existence
+#   test is true forever after the first call — fail-open again). The file lives
+#   OUTSIDE every FLEET_ROOT so it is not itself scannable. The shim prints
+#   nothing: C1/C2/C11 grep the captured output.
+#
+# BYSTANDERS MUST BE CREATED FRESH, IN THE CONSUMING CASE'S OWN ROOT. Reusing a
+# sibling's fixture is how this class of bug is born: `$FWT` (feat/x) looks like
+# a ready-made bystander for C3, but it is merged+clean and the UNTARGETED reap
+# at C1 consumes it, so `[ ! -d "$FWT" ]` at C3 would be true whatever C3 did —
+# a new fail-open conjunct wearing the costume of a fix. Measured: after C1 the
+# worktree list is `repo [container]` + `repo/main [main]` and nothing else.
+# ------------------------------------------------------------------------------
+SMG_W="$TMPROOT/witness/reapcalls"
+mkdir -p "$TMPROOT/witness" "$TMPROOT/shim"; : > "$SMG_W"
+cat > "$TMPROOT/shim/fleet" <<SHIM
+#!/bin/sh
+printf 'call\n' >> "$SMG_W"
+exec "$FLEET" "\$@"
+SHIM
+chmod +x "$TMPROOT/shim/fleet"
+SMG_SHIM="$TMPROOT/shim/fleet"
+_w_count() { local n; n=$(wc -l < "$SMG_W" 2>/dev/null || printf 0); printf '%s' "${n//[![:digit:]]/}"; }
+
+add_bystander() { # <root> <sess> <branch> -> ready, merged, clean: reaps with NO --force
+  addwt "$1" "$2" "$3"
 }
+add_bystander_force() { # <root> <sess> <branch> -> ready but UNMERGED: reaps ONLY with --force
+  local wt; wt=$(addwt "$1" "$2" "$3")
+  git -C "$wt" -c user.email=t@t -c user.name=t commit -q --allow-empty -m ahead 2>/dev/null
+  printf '%s' "$wt"
+}
+
+REAP_OUT=""; REAP_WHY=""; SMG_DELTA=0
+_reap_exec() { # <root> <sess> [args…] -> sets REAP_OUT and SMG_DELTA
+  local r="$1" s="$2"; shift 2
+  local before after
+  before=$(_w_count)
+  REAP_OUT=$(FLEET_ROOT="$r" FLEET_SESSION="$s" "$SMG_SHIM" reap "$@" 2>&1)
+  after=$(_w_count)
+  SMG_DELTA=$(( ${after:-0} - ${before:-0} ))
+}
+# The direction is in the NAME so the fail-open shape — call, then assert
+# something that was already true — is hard to write by accident.
+reap_expect_refuse() { # <root> <sess> <must-survive> <bystander-that-must-die|-> [args…]
+  local r="$1" s="$2" surv="$3" by="$4"; shift 4
+  _reap_exec "$r" "$s" "$@"
+  REAP_WHY=""
+  if [ "$SMG_DELTA" != 1 ]; then
+    REAP_WHY="reap was not invoked exactly once (witness delta=$SMG_DELTA)"
+  elif [ ! -d "$surv" ]; then
+    REAP_WHY="the PROTECTED worktree was destroyed: $surv"
+  elif [ "$by" != "-" ] && [ -d "$by" ]; then
+    REAP_WHY="the bystander SURVIVED ($by) — this reap did no work, so the refusal proves nothing"
+  fi
+  [ -z "$REAP_WHY" ]
+}
+reap_expect_reap() { # <root> <sess> <must-die> <bystander-that-must-survive|-> [args…]
+  local r="$1" s="$2" gone="$3" keep="$4"; shift 4
+  _reap_exec "$r" "$s" "$@"
+  REAP_WHY=""
+  if [ "$SMG_DELTA" != 1 ]; then
+    REAP_WHY="reap was not invoked exactly once (witness delta=$SMG_DELTA)"
+  elif [ -d "$gone" ]; then
+    REAP_WHY="the worktree that should have reaped SURVIVED: $gone"
+  elif [ "$keep" != "-" ] && [ ! -d "$keep" ]; then
+    REAP_WHY="an untargeted bystander was destroyed too ($keep) — the reap was not narrow"
+  fi
+  [ -z "$REAP_WHY" ]
+}
+_why() { printf "out='%s' why=%s" "$REAP_OUT" "${REAP_WHY:-?}"; }
+
+C_ROOT="$TMPROOT/c"; C_SESS="smg_c"
+mkproject "$C_ROOT" "$C_SESS"
+IWT=$(add_integration_wt "$C_ROOT" "$C_SESS" main)
+# C1's bystander: merged + clean, so an untargeted no-force reap must take it.
+FWT=$(add_bystander "$C_ROOT" "$C_SESS" feat/x)
+
+reap_expect_refuse "$C_ROOT" "$C_SESS" "$IWT" "$FWT"
+if [ -z "$REAP_WHY" ] && has "$REAP_OUT" "main" \
+   && git -C "$C_ROOT/repo" rev-parse --verify -q main >/dev/null 2>&1; then
+  pass "C1 reap refuses the integration-branch worktree; branch + worktree survive"
+else
+  fail "C1 reap refuses the integration branch" "$(_why)"
+fi
+has "$REAP_OUT" "integration branch"; ok $? "C2 the refusal NAMES the integration branch" "out='$REAP_OUT'"
+
+# C3 — the `--force` pin. Its bystander is UNMERGED, so it is removable ONLY on
+# the `--force` path: if `--force` stops working the bystander survives and this
+# row goes red, which is the property C3 has always claimed and never had.
+C3BY=$(add_bystander_force "$C_ROOT" "$C_SESS" force/only)
+reap_expect_refuse "$C_ROOT" "$C_SESS" "$IWT" "$C3BY" --force
+{ [ -z "$REAP_WHY" ] && git -C "$C_ROOT/repo" rev-parse --verify -q main >/dev/null 2>&1; }
+ok $? "C3 --force does NOT override the integration-branch guard (pinned)" "$(_why)"
+
+# C3b — the SECOND channel on the same property, also wording-free: it compares
+# `reap`'s output to `reap --force`'s output on an integration-only root. If
+# `--force` reached the integration guard at all the two would differ; they must
+# be identical after normalising the run-varying root path. No refusal text is
+# quoted, so a reword cannot redden this.
+read -r K_ROOT K_SESS <<<"$(mkcase k)"
+KWT=$(add_integration_wt "$K_ROOT" "$K_SESS" main)
+KBY=$(add_bystander "$K_ROOT" "$K_SESS" feat/x)
+read -r K2_ROOT K2_SESS <<<"$(mkcase k2)"
+K2WT=$(add_integration_wt "$K2_ROOT" "$K2_SESS" main)
+K2BY=$(add_bystander "$K2_ROOT" "$K2_SESS" feat/x)
+_norm() { printf '%s' "$1" | sed "s#$K_ROOT#<root>#g; s#$K2_ROOT#<root>#g"; }
+#
+# C3b READS THE WITNESS (d39 round 2). Without the two `SMG_DELTA` conjuncts this
+# was the ONLY group-C row that bypassed `reap_expect_*`, i.e. it carried all
+# three of d36's fail-open ingredients in material added by the rung that exists
+# to retire them: `[ -d "$KWT" ]` was true BEFORE the command ran, `[ -n
+# "$c3_plain" ]` is satisfied by any output at all, and the equality is trivially
+# satisfied when both invocations do nothing. Measured, not inferred: a `cmd_reap`
+# that merely `echo`s a plausible refusal line and returns kept this row GREEN,
+# and a lossy `_norm(){ printf 'x'; }` kept it green while the real M5 output
+# divergence was live. `SMG_DELTA` is overwritten by each `_reap_exec`, so BOTH
+# calls must be captured — a single post-hoc read would only ever witness the
+# second.
+#
+# `SMG_DELTA` alone is NOT enough and the measurement says so: it is an
+# INVOCATION witness (the shim counts `fleet` calls and `exec`s the real binary),
+# so a `cmd_reap` whose body is deleted still scores delta=1. Measured: with both
+# delta conjuncts in place and nothing else, the printing no-op left C3b GREEN.
+# The two invocations therefore each get their OWN merged bystander, in their own
+# root, which that very invocation must destroy — the same effect contract
+# `reap_expect_*` carries, expressed for a row that compares two runs rather than
+# one. The comparison stays wording-free: both roots are normalised to `<root>`
+# and the bystander branch name is the same on each side, so the two outputs are
+# byte-equal iff `--force` never reached the integration guard.
+_reap_exec "$K_ROOT" "$K_SESS";           c3_plain=$(_norm "$REAP_OUT"); c3_d1=$SMG_DELTA
+_reap_exec "$K2_ROOT" "$K2_SESS" --force; c3_force=$(_norm "$REAP_OUT"); c3_d2=$SMG_DELTA
+# …and the normaliser itself is pinned. It is the one unguarded transform in this
+# row: `_norm(){ printf 'x'; }` maps every output to a constant, which greens the
+# equality while the real `--force` output divergence is live (measured). A canary
+# through the same function catches any normaliser that is not "substitute the
+# root, change nothing else".
+c3_canary=$(_norm "$K_ROOT/zz reaped repo/feat_x")
+{ [ "$c3_d1" = 1 ] && [ "$c3_d2" = 1 ] \
+  && [ "$c3_canary" = "<root>/zz reaped repo/feat_x" ] \
+  && [ -d "$KWT" ] && [ -d "$K2WT" ] \
+  && [ ! -d "$KBY" ] && [ ! -d "$K2BY" ] \
+  && [ -n "$c3_plain" ] && [ "$c3_plain" = "$c3_force" ]; }
+ok $? "C3b reap and reap --force are byte-equivalent on the integration branch" \
+  "delta=$c3_d1/$c3_d2 canary='$c3_canary' plain='$c3_plain' force='$c3_force'"
+
+# C3c — the FIXTURE PREMISE of `add_bystander_force`, asserted rather than
+# assumed. Everything the `--force` pin buys at C3/C6/C7/C8 rests on one line in
+# that helper: the `commit -q --allow-empty -m ahead` that leaves the bystander
+# UNMERGED, hence removable only on the `--force` path. Delete that one line and
+# all four rows go green again under a killed `--force` parse — the d36 defect
+# restored by a plausible test-side "simplification", with nothing complaining.
+# So: a PLAIN reap (no `--force`) must leave that bystander standing. The merged
+# bystander in the same root must die in the same run, so this row cannot be
+# satisfied by a reap that did no work.
+read -r L_ROOT L_SESS <<<"$(mkcase l)"
+LFBY=$(add_bystander_force "$L_ROOT" "$L_SESS" force/only)
+LMBY=$(add_bystander       "$L_ROOT" "$L_SESS" feat/x)
+reap_expect_refuse "$L_ROOT" "$L_SESS" "$LFBY" "$LMBY"
+ok $? "C3c add_bystander_force is genuinely UNMERGED: a plain reap leaves it standing" "$(_why)"
+
+# C4 — narrowness of the POSITIONAL <target>, on its OWN root. It used to run on
+# C_ROOT against `$FWT`, which C1 had already consumed — so its `[ ! -d "$FWT" ]`
+# disjunct was true before it ran. Two ready+merged worktrees here: the named one
+# must go, the unnamed one must stay, which pins the target filter in both
+# directions.
+read -r J_ROOT J_SESS <<<"$(mkcase j)"
+JWT=$(add_bystander "$J_ROOT" "$J_SESS" feat/x)
+JKEEP=$(add_bystander "$J_ROOT" "$J_SESS" feat/keep)
+reap_expect_reap "$J_ROOT" "$J_SESS" "$JWT" "$JKEEP" feat/x
+ok $? "C4 an ordinary merged feature worktree still reaps, and only the named one" "$(_why)"
+
+# A project whose integration branch is NOT `main` is protected on its own name.
+D_ROOT="$TMPROOT/d"; D_SESS="smg_d"
+mkproject "$D_ROOT" "$D_SESS"
+git -C "$D_ROOT/repo" branch trunk main 2>/dev/null
+printf 'trunk\n' > "$D_ROOT/.fleet/integration-branch"
+TWT=$(add_integration_wt "$D_ROOT" "$D_SESS" trunk)
+# C5 called `$FLEET reap` INLINE, 18 lines before the helper it was assumed to
+# use was even defined — which is exactly why it survived every stub of that
+# helper. It routes through the contract now.
+DBY=$(add_bystander "$D_ROOT" "$D_SESS" feat/y)
+reap_expect_refuse "$D_ROOT" "$D_SESS" "$TWT" "$DBY"
+{ [ -z "$REAP_WHY" ] && git -C "$D_ROOT/repo" rev-parse --verify -q trunk >/dev/null 2>&1; }
+ok $? "C5 a configured non-main integration branch (trunk) is protected too" "$(_why)"
+
+# --- the record is NOT the truth ----------------------------------------------
+# Both fixtures above happen to register a branch field that matches reality, which
+# is exactly why a stale record was never caught. The guard must key on the
+# CHECKED-OUT HEAD as well, because on this machine the worktree in question is
+# `fleet/main` — the live CLI every `fleet` command on the box runs from.
 
 # C6 — THE BLOCKER: record says `feat`, HEAD is `main`, and --force is used.
 read -r E_ROOT E_SESS <<<"$(mkcase e)"
 git -C "$E_ROOT/repo" worktree add -q "$E_ROOT/repo/wt" main 2>/dev/null
 mkdir -p "$E_ROOT/repo/wt/.fleet"; : > "$E_ROOT/repo/wt/.fleet/ready"
 reg "$E_SESS" "$E_ROOT/repo/wt" feat
-out=$(reap_at "$E_ROOT" "$E_SESS" --force)
-{ [ -d "$E_ROOT/repo/wt" ] && git -C "$E_ROOT/repo" rev-parse --verify -q main >/dev/null 2>&1; }
-ok $? "C6 a STALE record (feat) over a HEAD of main is still refused, even with --force" "out='$out'"
+EBY=$(add_bystander_force "$E_ROOT" "$E_SESS" force/only)
+reap_expect_refuse "$E_ROOT" "$E_SESS" "$E_ROOT/repo/wt" "$EBY" --force
+{ [ -z "$REAP_WHY" ] && git -C "$E_ROOT/repo" rev-parse --verify -q main >/dev/null 2>&1; }
+ok $? "C6 a STALE record (feat) over a HEAD of main is still refused, even with --force" "$(_why)"
 
 # C7 — the observed real record was `'main '`, with a trailing space, which the
 # case-pattern compare misses entirely. Registered branch differs from HEAD too,
@@ -672,9 +891,9 @@ read -r F_ROOT F_SESS <<<"$(mkcase f)"
 git -C "$F_ROOT/repo" worktree add -q -b feat2 "$F_ROOT/repo/wt" main 2>/dev/null
 mkdir -p "$F_ROOT/repo/wt/.fleet"; : > "$F_ROOT/repo/wt/.fleet/ready"
 reg "$F_SESS" "$F_ROOT/repo/wt" 'main '
-out=$(reap_at "$F_ROOT" "$F_SESS" --force)
-[ -d "$F_ROOT/repo/wt" ]
-ok $? "C7 a record with trailing whitespace ('main ') is trimmed and still refused" "out='$out'"
+FBY=$(add_bystander_force "$F_ROOT" "$F_SESS" force/only)
+reap_expect_refuse "$F_ROOT" "$F_SESS" "$F_ROOT/repo/wt" "$FBY" --force
+ok $? "C7 a record with trailing whitespace ('main ') is trimmed and still refused" "$(_why)"
 
 # C8 — detached AT the target's tip: symbolic-ref fails, so the name is
 # undeterminable; fall back to commit equality and refuse.
@@ -682,9 +901,9 @@ read -r G_ROOT G_SESS <<<"$(mkcase g)"
 git -C "$G_ROOT/repo" worktree add -q --detach "$G_ROOT/repo/wt" main 2>/dev/null
 mkdir -p "$G_ROOT/repo/wt/.fleet"; : > "$G_ROOT/repo/wt/.fleet/ready"
 reg "$G_SESS" "$G_ROOT/repo/wt" feat3
-out=$(reap_at "$G_ROOT" "$G_SESS" --force)
-[ -d "$G_ROOT/repo/wt" ]
-ok $? "C8 a worktree detached AT the integration branch's tip is refused" "out='$out'"
+GBY=$(add_bystander_force "$G_ROOT" "$G_SESS" force/only)
+reap_expect_refuse "$G_ROOT" "$G_SESS" "$G_ROOT/repo/wt" "$GBY" --force
+ok $? "C8 a worktree detached AT the integration branch's tip is refused" "$(_why)"
 
 # C9 — NARROWNESS: detached somewhere ELSE must stay reapable. A guard that
 # refuses every detached worktree is a guard nobody can work around.
@@ -694,9 +913,8 @@ git -C "$H_ROOT/repo/wt" -c user.email=t@t -c user.name=t commit -q --allow-empt
 git -C "$H_ROOT/repo/wt" checkout -q --detach HEAD 2>/dev/null
 mkdir -p "$H_ROOT/repo/wt/.fleet"; : > "$H_ROOT/repo/wt/.fleet/ready"
 reg "$H_SESS" "$H_ROOT/repo/wt" feat4
-out=$(reap_at "$H_ROOT" "$H_SESS" --force)
-[ ! -d "$H_ROOT/repo/wt" ]
-ok $? "C9 a worktree detached ELSEWHERE still reaps (the HEAD guard is narrow)" "out='$out'"
+reap_expect_reap "$H_ROOT" "$H_SESS" "$H_ROOT/repo/wt" - --force
+ok $? "C9 a worktree detached ELSEWHERE still reaps (the HEAD guard is narrow)" "$(_why)"
 
 # C10 — `branch -D` used the RECORDED name, so on a record/HEAD disagreement reap
 # force-deleted an UNRELATED real branch, silently. Neither name is the
@@ -707,11 +925,30 @@ git -C "$I_ROOT/repo" worktree add -q -b real/head "$I_ROOT/repo/wt" main 2>/dev
 git -C "$I_ROOT/repo" branch bystander main 2>/dev/null
 mkdir -p "$I_ROOT/repo/wt/.fleet"; : > "$I_ROOT/repo/wt/.fleet/ready"
 reg "$I_SESS" "$I_ROOT/repo/wt" bystander
-out=$(reap_at "$I_ROOT" "$I_SESS" --force)
-git -C "$I_ROOT/repo" rev-parse --verify -q bystander >/dev/null 2>&1
-ok $? "C10 reap does NOT branch -D the RECORDED name when it disagrees with HEAD" "out='$out'"
-has "$out" "disagree"
-ok $? "C11 the disagreement is printed rather than swallowed" "out='$out'"
+reap_expect_reap "$I_ROOT" "$I_SESS" "$I_ROOT/repo/wt" - --force
+{ [ -z "$REAP_WHY" ] && git -C "$I_ROOT/repo" rev-parse --verify -q bystander >/dev/null 2>&1; }
+ok $? "C10 reap does NOT branch -D the RECORDED name when it disagrees with HEAD" "$(_why)"
+has "$REAP_OUT" "disagree"
+ok $? "C11 the disagreement is printed rather than swallowed" "out='$REAP_OUT'"
+
+# C12 — STALENESS PIN. Group C's coverage claims (which refusals are pinned by an
+# effect delta, which are grep-only, and the ones INVENTORY.md records as having
+# no coverage at all — the human-presence guard) were audited against one exact
+# version of `cmd_reap`. Nothing else forces that audit to be redone, and a
+# coverage claim nobody re-checks is the artefact class this whole group exists
+# to retire. So stamp it and compare.
+#
+# Scoped to `cmd_reap`'s BODY, not to `bin/fleet` as a whole: a whole-file stamp
+# reddens on every unrelated commit and would be disabled within a week. The cost
+# is stated plainly — a genuine change to `cmd_reap` DOES turn this red, on
+# purpose. The fix is to re-run the mutation audit, update
+# _reports/reap-failopen-contract/INVENTORY.md, and re-stamp with:
+#   sed -n '/^cmd_reap()/,/^}/p' bin/fleet | sha256sum
+CMD_REAP_AUDITED=01747b9cbb8c3dc5fa82d492f7f4182bd1a754e851aaf236a365fa040259dabc
+_cr_now=$(sed -n '/^cmd_reap()/,/^}/p' "$FLEET" | sha256sum 2>/dev/null | cut -d' ' -f1)
+{ [ -n "$_cr_now" ] && [ "$_cr_now" = "$CMD_REAP_AUDITED" ]; }
+ok $? "C12 cmd_reap is byte-identical to the version group C's coverage was audited against" \
+  "cmd_reap changed (now $_cr_now, audited $CMD_REAP_AUDITED) — re-run the mutation audit, update INVENTORY.md, re-stamp"
 
 # ==============================================================================
 echo "== D. the shipped contract: pointer prompt, merge-only, terminate (S2/S3/S5) =="
@@ -743,6 +980,9 @@ ok $? "D10 no tamper-resistance claim in the shipped prose" \
 # ==============================================================================
 echo "== E. audit + observability — explicitly NOT a security control (S7) =="
 # ==============================================================================
+# E1-E8. E8 is the reason this guard exists: it does not redden when broken, it
+# DISAPPEARS (kill the parknote markers and E7 fails, E8 never runs).
+grp_begin "E" 8
 
 mkdir -p "$LEDGER/d99"
 printf 'state\tqueued\n' > "$LEDGER/d99/meta.tsv"
@@ -760,11 +1000,26 @@ grep -q '^gate2_popped	' "$LEDGER/d99/meta.tsv"
 ok $? "E3 popping a GATE 2 message records gate2_popped on disk (audit fact)" \
   "meta: $(cat "$LEDGER/d99/meta.tsv")"
 # A non-gate message must NOT stamp anything.
-before=$(cat "$LEDGER/d99/meta.tsv")
-printf 'from: bob\ntitle: hi\ndispatch: d99\n--\njust a status note\n' > "$TMPROOT/plain.msg"
+# TWO FIXTURE BUGS, both repaired (d39), and the second only became visible once
+# the first was fixed:
+#  (1) it wrote `dispatch: d99`, but envelopes are `key=value` and `inbox_field`
+#      parses them as such — so `gate_record_pop` saw an EMPTY dispatch and
+#      returned at its very first guard, before any gate logic ran at all. The
+#      row passed because nothing happened, not because the non-gate body was
+#      rejected.
+#  (2) it then pointed at d99, which E3 had ALREADY stamped `gate2_popped`. A
+#      recorder that wrongly re-stamps writes the same `date -Is` value within
+#      the same second, so the whole-file compare saw no change and stayed green.
+#      Measured: with (1) fixed but not (2), deleting the recorder's non-gate
+#      rejection still left this row GREEN.
+# Hence a VIRGIN ledger entry with a known, complete meta of its own.
+mkdir -p "$LEDGER/d97"; printf 'state\tqueued\n' > "$LEDGER/d97/meta.tsv"
+before=$(cat "$LEDGER/d97/meta.tsv")
+printf 'from=bob\ntitle=hi\ndispatch=d97\n--\njust a status note\n' > "$TMPROOT/plain.msg"
 "$FLEET" gate popped "$TMPROOT/plain.msg" >/dev/null 2>&1
-[ "$(cat "$LEDGER/d99/meta.tsv")" = "$before" ]
-ok $? "E4 a non-gate message stamps nothing" "meta changed on a plain message"
+[ "$(cat "$LEDGER/d97/meta.tsv")" = "$before" ]
+ok $? "E4 a non-gate message stamps nothing" \
+  "meta changed on a plain message: '$(cat "$LEDGER/d97/meta.tsv" | tr '\n' ' ')'"
 
 # The recorder must actually be WIRED into the pop path, not merely present.
 grep -q 'gate_record_pop' "$FLEET"
@@ -785,6 +1040,7 @@ else
   [ -z "$out" ]
   ok $? "E8 a non-parked card renders no park note" "got='$out'"
 fi
+grp_end
 
 # ==============================================================================
 echo "== F. --name survives restore; the ready marker survives a live sibling =="
@@ -1245,6 +1501,23 @@ done
 [ "$d11d" = 0 ]
 ok $? "D11d all three prose files state the same-branch restart limitation and no longer deny it" \
   "BLOCK-1: prose asserts a durability property persist_agent does not have"
+
+# D11g — FLEET.md is the file `fleet up` INSTALLS as a project's CLAUDE.md, so it
+# is the only one an orchestrator in another project ever reads. It had exactly
+# ONE covering check (D11d): delete FLEET.md outright and the suite reported
+# 116/1. Group C's whole subject is that the integration branch is refused *and
+# that `--force` does not override that* — the operator-facing statement of the
+# property these eleven cases prove. Pin it where the operator reads it. One
+# more check, deliberately: five would be prose-rot with extra steps.
+# Two independent greps would NOT do it: FLEET.md says "not even with `--force`"
+# about the HUMAN-PRESENCE refusal as well, so an unanchored conjunction stays
+# green while the integration-branch sentence is reworded to "unless --force" —
+# measured, it did. The lines are joined and the two halves must appear in ONE
+# span, which is the actual claim.
+_flmd=$(tr '\n' ' ' < "$HERE/FLEET.md" | tr -s ' ')
+printf '%s' "$_flmd" | grep -qiE 'integration branch[^.]{0,200}refused \*\*even with[^.]{0,20}--force'
+ok $? "D11g FLEET.md states the integration branch is refused EVEN WITH --force" \
+  "the file 'fleet up' installs as a project CLAUDE.md omits the one reap refusal --force cannot override"
 
 # D11e — R15. The guard-defect rationale is DEAD on current main (cb4a42b); the
 # auto-mode-classifier rationale is the one that survives. Both halves pinned.
